@@ -20,9 +20,10 @@ class HealthServerMixin:
                 {
                     "status": "healthy",
                     "hotkey": getattr(self, "hotkey", "N/A"),
-                    "layer": getattr(self, "state_manager.layer", "N/A"),
-                    "uid": getattr(self, "uid", "N/A"),
-                    "registered": getattr(self, "registered_on_metagraph", True),
+                    "run_id": getattr(self.state_manager, "run_id", "N/A"),
+                    "layer": getattr(self.state_manager, "layer", "N/A"),
+                    "backwards_since_reset": getattr(self.training_phase, "backwards_since_reset", "N/A"),
+                    "training_epoch_when_registered": getattr(self.state_manager, "training_epoch_when_registered", 0),
                     "timestamp": time.time(),
                     "spec_version": common_settings.__SPEC_VERSION__,
                 }
