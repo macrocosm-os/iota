@@ -685,7 +685,7 @@ class Validator(BaseNeuron, HealthServerMixin, BaseValidator):
     async def reset_validator(self) -> ValidationTaskResponse:
         """
         reset_validator is a generic function that can be called to clear the validator state, but
-        is typically called when the validator needs to start tracking a new miner, change layer, ect..
+        is typically called when the validator needs to start tracking a new miner, change layer, etc..
 
         Upon reset, the validator will submit its current miner scores to the orchestrator, and then clear its state.
         """
