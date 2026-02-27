@@ -1,10 +1,11 @@
 import math
-
-from subnet.utils.partition_utils import load_model_weights
 import torch
+from loguru import logger
+
+from common.models.run_flags import RunFlags
 from common import settings as common_settings
 from common.utils.exceptions import NanInfException
-from loguru import logger
+from subnet.utils.partition_utils import load_model_weights
 from subnet.model.loaders import load_model_split
 from subnet.model.tokenizer import load_tokenizer
 from subnet.model.utils import _clean_gpu_memory, log_gpu_memory_usage
@@ -12,7 +13,36 @@ from subnet.utils.vector_utils import add_artificial_gradients, check_for_nans_a
 
 
 class MockModel(torch.nn.Module):
-    """Mock model for local development testing.
+    """Mock model for local development testing."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer1 = torch.nn.Linear(100, 64).to(torch.bfloat16)
+        self.layer2 = torch.nn.Linear(64, 32).to(torch.bfloat16)
+        self.layer3 = torch.nn.Linear(32, 100).to(torch.bfloat16)
+        self.activation = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.activation(self.layer1(x))
+        x = self.activation(self.layer2(x))
+        x = self.layer3(x)
+        return x, {}
+
+    def backward(
+        self,
+        output_activations: torch.Tensor,
+        activation_grads: torch.Tensor,
+        state: dict,
+    ):
+        # Pass in activation_grads to backward() to avoid implicit scalar gradient error
+        output_activations.backward(activation_grads)
+
+    def parameters(self):
+        return super().parameters()
+
+
+class TestModel(torch.nn.Module):
+    """Test model for local development testing.
 
     Handles both layer 0 (receives token IDs) and other layers (receive float activations).
     Uses a simple architecture that mimics the real model's input/output patterns.
@@ -97,6 +127,7 @@ class ModelManager:
         self.layer: int | None = None
         self.device: str | None = None
         self.logger_attributes: dict | None = None
+        self.run_flags: RunFlags | None = None
         self.optimizer_step_count: int = 0
         self.epoch_on_registration: int = 0
         self.epoch_counter: int = 0
@@ -297,11 +328,17 @@ class ModelManager:
         """
         if common_settings.NETWORK == "local":
             # Use bottleneck_dim from config (or emb_dim if not set) to match activation dimensions
-            hidden_dim = self.model_config.get("bottleneck_dim") or self.model_config.get("emb_dim", 128)
-            vocab_size = self.model_config.get("vocab_size", 128256)
-            n_splits = self.model_metadata.get("n_splits", 3)
-            logger.info(f"Local network - loading mock model for layer {layer}/{n_splits} with hidden_dim={hidden_dim}")
-            self.model = MockModel(layer_idx=layer, n_splits=n_splits, hidden_dim=hidden_dim, vocab_size=vocab_size)
+            if common_settings.MOCK:
+                logger.info("Local network - loading mock model")
+                self.model = MockModel()
+            else:
+                hidden_dim = self.model_config.get("bottleneck_dim") or self.model_config.get("emb_dim", 128)
+                vocab_size = self.model_config.get("vocab_size", 128256)
+                n_splits = self.model_metadata.get("n_splits", 3)
+                logger.info(
+                    f"Local network - loading test model for layer {layer}/{n_splits} with hidden_dim={hidden_dim}"
+                )
+                self.model = TestModel(layer_idx=layer, n_splits=n_splits, hidden_dim=hidden_dim, vocab_size=vocab_size)
             self.model.train()
             return
 
@@ -416,20 +453,21 @@ class ModelManager:
 
             log_gpu_memory_usage(note="after stepping optimizer")
 
-            # TODO: Remove this once we have a better way to handle local optimization step.
-            # If a miner registers at a later epoch that epoch = 1, their local optimizer can be completely bogus.
-            # This is a "warm up" period, where a miner can continue to do work, but we just *dont* up date their local weights.
-            if self.epoch_counter <= 2 and self.epoch_on_registration > 1:
-                # load our previous weights into memory
-                logger.info(
-                    f"Keeping previous weights for miner {self.logger_attributes['hotkey'][:8]} with epoch counter {self.epoch_counter} and epoch on registration {self.epoch_on_registration}"
-                )
-                loaded_weights = load_model_weights(
-                    hotkey=self.logger_attributes["hotkey"],
-                    run_id=self.logger_attributes["run_id"],
-                    layer_idx=self.layer,
-                )
-                torch.nn.utils.vector_to_parameters(loaded_weights, self.model.parameters())
+            if self.run_flags is not None and self.run_flags.upload_optimizer_state.isOff():
+                # TODO: Remove this once we have a better way to handle local optimization step.
+                # If a miner registers at a later epoch that epoch = 1, their local optimizer can be completely bogus.
+                # This is a "warm up" period, where a miner can continue to do work, but we just *dont* up date their local weights.
+                if self.epoch_counter <= 2 and self.epoch_on_registration > 1:
+                    # load our previous weights into memory
+                    logger.info(
+                        f"Keeping previous weights for miner {self.logger_attributes['hotkey'][:8]} with epoch counter {self.epoch_counter} and epoch on registration {self.epoch_on_registration}"
+                    )
+                    loaded_weights = load_model_weights(
+                        hotkey=self.logger_attributes["hotkey"],
+                        run_id=self.logger_attributes["run_id"],
+                        layer_idx=self.layer,
+                    )
+                    torch.nn.utils.vector_to_parameters(loaded_weights, self.model.parameters())
 
             logger.info(f"{self.logger_attributes['hotkey'][:8]} completed local optimization step")
             log_gpu_memory_usage(note="after local optimization step")

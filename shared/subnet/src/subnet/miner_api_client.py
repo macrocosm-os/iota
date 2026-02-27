@@ -1,6 +1,7 @@
 from typing import Any, Literal
 from common.models.api_models import (
     GetActivationRequest,
+    LayerOptimizerStateResponse,
     RunInfo,
     ActivationResponse,
     CompleteFileUploadResponse,
@@ -8,22 +9,33 @@ from common.models.api_models import (
     FileUploadRequest,
     LossReportRequest,
     MinerRegistrationResponse,
+    OptimizerStateUpdate,
     RegisterMinerRequest,
     FileUploadResponse,
     SubmitActivationRequest,
     SubmittedWeightsAndOptimizerPresigned,
     SyncActivationAssignmentsRequest,
+    WeightSubmitResponse,
     WeightUpdate,
     AttestationChallengeRequest,
     RequestAttestationChallengeResponse,
     SubmitMergedPartitionsRequest,
     MinerAttestationPayload,
 )
-from common.models.error_models import LayerStateError, EntityNotRegisteredError, RunFullError, SpecVersionError
+from common.models.error_models import (
+    LayerStateError,
+    EntityNotRegisteredError,
+    MinerFrozenError,
+    MinerInitializingError,
+    RunFullError,
+    SpecVersionError,
+)
 
 from common.utils.exceptions import (
     APIException,
     LayerStateException,
+    MinerFrozenException,
+    MinerInitializingException,
     MinerNotRegisteredException,
     RunFullException,
     SpecVersionException,
@@ -122,8 +134,14 @@ class MinerAPIClient(CommonAPIClient):
     async def submit_weights(
         self,
         weight_update: WeightUpdate,
-    ) -> dict:
-        """Attempts to submit weights to the orchestrator"""
+    ) -> WeightSubmitResponse:
+        """Attempts to submit weights to the orchestrator.
+
+        Returns:
+            WeightSubmitResponse: Contains message and should_upload_optimizer_state flag.
+                If should_upload_optimizer_state is True, the miner should upload their
+                optimizer state and call submit_optimizer_state.
+        """
         try:
             response = await CommonAPIClient.orchestrator_request(
                 method="POST",
@@ -133,9 +151,49 @@ class MinerAPIClient(CommonAPIClient):
                 is_mounted=self.is_mounted,
                 electron_version=self.electron_version,
             )
-            return self.parse_response(response)
+            parsed_response = self.parse_response(response)
+            return WeightSubmitResponse.model_validate(parsed_response)
         except Exception as e:
             logger.error(f"Error submitting weights: {e}")
+            raise
+
+    async def submit_optimizer_state(
+        self,
+        optimizer_state_path: str,
+    ) -> dict:
+        """Submit optimizer state path to the orchestrator.
+
+        This should only be called when submit_weights returns
+        should_upload_optimizer_state=True.
+        """
+        try:
+            response = await CommonAPIClient.orchestrator_request(
+                method="POST",
+                path="/miner/submit_optimizer_state",
+                hotkey=self.hotkey,
+                body=OptimizerStateUpdate(optimizer_state_path=optimizer_state_path).model_dump(),
+            )
+            return self.parse_response(response)
+        except Exception as e:
+            logger.error(f"Error submitting optimizer state: {e}")
+            raise
+
+    async def get_layer_optimizer_state(self) -> LayerOptimizerStateResponse:
+        """Get the layer optimizer state presigned URL for the miner's current layer.
+
+        This is used by new miners joining a layer to download the optimizer state
+        from one of the first miners who submitted weights.
+        """
+        try:
+            response = await CommonAPIClient.orchestrator_request(
+                method="GET",
+                path="/miner/get_layer_optimizer_state",
+                hotkey=self.hotkey,
+            )
+            parsed = self.parse_response(response)
+            return LayerOptimizerStateResponse.model_validate(parsed)
+        except Exception as e:
+            logger.error(f"Error getting layer-based optimizer state: {e}")
             raise
 
     async def report_loss(self, loss_report: LossReportRequest) -> None:
@@ -369,12 +427,19 @@ class MinerAPIClient(CommonAPIClient):
             raise
 
     def parse_response(self, response: Any) -> Any:
+        """Parse the response from the orchestrator.
+        If the response is a dictionary, check for error_name and handle the error accordingly.
+        If the response is not a dictionary, return the response.
+        """
+
         if not isinstance(response, dict):
             return response
+
         if (error_name := response.get("error_name")) is not None:
             if error_name == RunFullError.__name__:
                 logger.error(f"Run is full: {response['error_dict']}")
                 raise RunFullException(response["error_dict"]["message"])
+
             if error_name == LayerStateError.__name__:
                 logger.warning(f"Layer state change: {response['error_dict']}")
                 error_dict = LayerStateError(**response["error_dict"])
@@ -382,17 +447,29 @@ class MinerAPIClient(CommonAPIClient):
                 raise LayerStateException(
                     f"Miner is moving state from {error_dict.expected_status} to {error_dict.actual_status}"
                 )
+
             if error_name == EntityNotRegisteredError.__name__:
                 logger.error(f"Miner not registered error: {response['error_dict']}")
                 raise MinerNotRegisteredException("Miner not registered")
+
             if error_name == SpecVersionError.__name__:
                 logger.error(f"Spec version mismatch: {response['error_dict']}")
                 raise SpecVersionException(
                     expected_version=response["error_dict"]["expected_version"],
                     actual_version=response["error_dict"]["actual_version"],
                 )
+
+            if error_name == MinerFrozenError.__name__:
+                logger.warning(f"Miner is frozen: {response['error_dict']}")
+                raise MinerFrozenException(response["error_dict"]["message"])
+
+            if error_name == MinerInitializingError.__name__:
+                logger.warning(f"Miner is initializing: {response['error_dict']}")
+                raise MinerInitializingException(response["error_dict"]["message"])
+
             else:
                 raise Exception(f"Unexpected error from orchestrator. Response: {response}")
+
         else:
             return response
 

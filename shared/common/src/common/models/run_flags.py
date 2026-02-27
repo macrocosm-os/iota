@@ -23,6 +23,10 @@ class RunFlags(BaseModel):
     compress_s3_files: RunFlag = RunFlag()
     attest: RunFlag = RunFlag()
     keep_cache_on_local_step: RunFlag = RunFlag()
+    upload_optimizer_state: RunFlag = RunFlag()
+    enforce_min_local_optimizer_steps: RunFlag = RunFlag()
+    weighted_partition_averaging: RunFlag = RunFlag(enabled=True)
+    clip_pseudo_gradients: RunFlag = RunFlag()
 
 
 RUN_FLAGS = RunFlags()

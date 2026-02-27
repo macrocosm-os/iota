@@ -67,6 +67,9 @@ MIN_FORWARD_ACTIVATIONS_IN_QUEUE = int(
 VISUALIZATION_API_URL = os.getenv("VISUALIZATION_API_URL", "http://localhost:8009")
 VISUALIZATION_AUTO_OPEN = os.getenv("VISUALIZATION_AUTO_OPEN", "true").lower() in ("1", "true", "yes", "on")
 
+# Miner contribution filtering - minimum local optimizer steps required for contribution to be included
+MIN_LOCAL_OPTIMIZER_STEPS = int(os.getenv("MIN_LOCAL_OPTIMIZER_STEPS", "5"))
+
 # Training settings
 LOCAL_BATCH_SIZE = int(
     os.getenv("LOCAL_BATCH_SIZE", "8")
@@ -76,3 +79,8 @@ PSEUDO_GRADIENTS_BATCH_SIZE = int(os.getenv("PSEUDO_GRADIENTS_BATCH_SIZE", "100"
 # Determines whether the miner is mounted within a host electron app
 IS_MOUNTED = os.getenv("IS_MOUNTED") == "true"
 ELECTRON_VERSION = os.getenv("ELECTRON_VERSION")
+
+# Telemetry settings
+TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+TELEMETRY_FLUSH_INTERVAL_SEC = float(os.getenv("TELEMETRY_FLUSH_INTERVAL_SEC", "15"))
+TELEMETRY_MAX_BUFFER_SIZE = int(os.getenv("TELEMETRY_MAX_BUFFER_SIZE", "1000"))

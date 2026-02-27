@@ -13,6 +13,7 @@ dependencies = [
     "blessed>=1.23.0",
     "bittensor-cli>=9.13.1",
     "platformdirs>=4.5.0",
+    "prometheus_client>=0.20.0",
 ]
 
 [tool.uv]

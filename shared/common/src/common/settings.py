@@ -9,6 +9,7 @@ if _dotenv_path.exists():
     load_dotenv(dotenv_path=_dotenv_path)
 
 # Generic settings
+MOCK = os.getenv("MOCK") == "True"
 LOG_FILE_ENABLED = os.getenv("LOG_FILE_ENABLED") == "True"
 
 # Bittensor settings

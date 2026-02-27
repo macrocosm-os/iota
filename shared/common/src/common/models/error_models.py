@@ -56,6 +56,14 @@ class EntityNotOnMetagraphError(BaseModel):
     name: Optional[str] = None
 
 
+class MinerFrozenError(BaseModel):
+    message: str = "Miner is frozen and cannot perform work until further notice"
+
+
+class MinerInitializingError(BaseModel):
+    message: str = "Miner is initializing and cannot perform work until the next epoch"
+
+
 class BaseErrorModel(BaseModel):
     error_name: str | None = None
     error_dict: dict | None = None

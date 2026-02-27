@@ -30,10 +30,19 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, HTTPExceptio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from common.models.api_models import (
+    TrainingStateRequest,
+    TrainingStateResponse,
+    NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES,
     EnclaveGetKeyIdRequest,
     EnclaveGetKeyIdResponse,
     EnclaveSignRequest,
     EnclaveSignResponse,
+    RegisterSetBestRunRequest,
+    RegisterSetBestRunResponse,
+    RegisterSetStatusRequest,
+    RegisterSetStatusResponse,
+    RegisterStatus,
+    ServerCapability,
 )
 
 # -----------------------------
@@ -41,7 +50,8 @@ from common.models.api_models import (
 # -----------------------------
 
 PROTOCOL_VERSION = 1
-Kind = Literal["hello", "welcome", "request", "response", "event", "error", "ping", "pong"]
+KIND = Literal["hello", "welcome", "request", "response", "event", "error", "ping", "pong"]
+
 
 # Electron would connect with: ws://127.0.0.1:8010/ws?token=...
 # Currently not used
@@ -65,7 +75,7 @@ class ErrorObj(BaseModel):
 
 class Envelope(BaseModel):
     v: int = Field(default=PROTOCOL_VERSION)
-    kind: Kind
+    kind: KIND
     id: str = Field(default_factory=lambda: str(uuid4()))
     ts: str = Field(default_factory=now_iso)
     name: str
@@ -121,15 +131,7 @@ class ProtocolServer:
 
         self._last_pong: float = 0.0
 
-        self.server_capabilities = [
-            "control.start",
-            "control.stop",
-            "control.configure",
-            "enclave.get_key_id",
-            "enclave.sign",
-            "enclave.doctor",
-            "enclave.reset",
-        ]
+        self.server_capabilities = NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES
 
     def register_handler(self, name: str, handler: Handler) -> None:
         self._handlers[name] = handler
@@ -143,7 +145,9 @@ class ProtocolServer:
         client = self._ensure_connected()
         await client.websocket.send_json(env.model_dump())
 
-    async def request(self, name: str, data: Dict[str, Any], timeout_s: Optional[float] = None) -> Envelope:
+    async def request(
+        self, name: ServerCapability, data: Dict[str, Any], timeout_s: Optional[float] = None
+    ) -> Envelope:
         """
         Server -> Host request. Returns host response envelope (kind="response") or raises on error/timeout.
         """
@@ -166,6 +170,27 @@ class ProtocolServer:
             raise RuntimeError(f"{code}: {msg}")
 
         return resp
+
+    # --- registration helpers ---
+
+    async def register_set_status(self, *, status: RegisterStatus) -> RegisterSetStatusResponse:
+        req = RegisterSetStatusRequest(status=status)
+        resp_env = await self.request("register.status", req.model_dump())
+
+        return RegisterSetStatusResponse(status=resp_env.data["status"])
+
+    async def register_set_best_run(self, *, run_id: str) -> RegisterSetBestRunResponse:
+        req = RegisterSetBestRunRequest(run_id=run_id)
+        resp_env = await self.request("register.best_run", req.model_dump(by_alias=True))
+
+        return RegisterSetBestRunResponse(status=resp_env.data["status"])
+
+    async def training_set_state(
+        self, *, state: str, detail: Optional[str] = None, run_id: Optional[str] = None, layer: Optional[int] = None
+    ) -> TrainingStateResponse:
+        req = TrainingStateRequest(state=state, detail=detail, run_id=run_id, layer=layer)
+        resp_env = await self.request("training.state", req.model_dump(by_alias=True, exclude_none=True))
+        return TrainingStateResponse(status=resp_env.data["status"])
 
     # --- enclave helpers (KeySigner-aligned) ---
 
@@ -462,7 +487,7 @@ class ProtocolServer:
 # FastAPI app wiring
 # -----------------------------
 
-app = FastAPI(title="Miner Control Protocol Server (WS, ES256 KeySigner-aligned)")
+app = FastAPI(title="Node Protocol of Control Server (WS, ES256 KeySigner-aligned)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -517,6 +542,33 @@ async def http_enclave_sign(req: EnclaveSignRequest) -> Dict[str, Any]:
             payload=req.payloadBase64,
             dp_keychain=req.dpKeychain,
         )
+        return resp.model_dump()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/register/status")
+async def http_register_set_status(req: RegisterSetStatusRequest) -> Dict[str, Any]:
+    try:
+        resp = await protocol.register_set_status(status=req.status)
+        return resp.model_dump()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/register/best_run")
+async def http_register_set_best_run(req: RegisterSetBestRunRequest) -> Dict[str, Any]:
+    try:
+        resp = await protocol.register_set_best_run(run_id=req.run_id)
+        return resp.model_dump()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/training/state")
+async def http_training_set_state(req: TrainingStateRequest) -> Dict[str, Any]:
+    try:
+        resp = await protocol.training_set_state(state=req.state, detail=req.detail, run_id=req.run_id, layer=req.layer)
         return resp.model_dump()
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

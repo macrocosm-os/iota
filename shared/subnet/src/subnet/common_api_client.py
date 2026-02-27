@@ -46,8 +46,6 @@ class CommonAPIClient:
         if electron_version is not None:
             headers["X-Host-Version"] = electron_version
 
-        logger.warning(f"ALL HEADERS: {headers}")
-
         for i in range(common_settings.REQUEST_RETRY_COUNT):
             try:
                 if i:

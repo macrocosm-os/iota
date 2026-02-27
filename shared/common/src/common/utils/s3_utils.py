@@ -175,7 +175,7 @@ async def upload_part(urls: list[str], data: bytes, upload_id: str, max_retries:
                     # Calculate exponential backoff delay (1s, 2s, 4s, ...)
                     delay = 2**attempt
                     logger.warning(
-                        f"Upload failed (attempt {attempt + 1}/{max_retries + 1}): {e}. " f"Retrying in {delay}s..."
+                        f"Upload failed (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {delay}s..."
                     )
                     await asyncio.sleep(delay)
                 else:

@@ -22,6 +22,7 @@ from common.utils.exceptions import LayerStateException, MinerNotRegisteredExcep
 from miner import settings as miner_settings
 
 from miner.utils.stats import StatsTracker, tensor_num_bytes
+from miner.telemetry.metric_registry import S3_DOWNLOAD_SPEED_BYTES_PER_SEC
 from common.models.run_flags import RunFlags
 
 
@@ -389,6 +390,11 @@ class ActivationQueue:
                         stats.timing.download.start = start_time
                         stats.timing.download.end = end_time
                         stats.timing.download.duration = end_time - start_time
+                    download_duration = end_time - start_time
+                    if download_duration > 0 and total_bytes > 0:
+                        S3_DOWNLOAD_SPEED_BYTES_PER_SEC.labels(layer_idx=str(self._state_manager.layer)).set(
+                            total_bytes / download_duration
+                        )
                     return DownloadedData(
                         activation_response=activation_response,
                         input_activations=input_activations,
