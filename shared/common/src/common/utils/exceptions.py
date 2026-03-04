@@ -58,3 +58,17 @@ class RateLimitException(Exception):
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
+
+
+class MinerBlockedException(Exception):
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
+
+
+class MinerFrozenException(MinerBlockedException):
+    """Raised when orchestrator reports miner is frozen."""
+
+
+class MinerInitializingException(MinerBlockedException):
+    """Raised when orchestrator reports miner is still initializing."""

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Final, Literal, Optional
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from common import settings
 from common.models.ml_models import ModelConfig, ModelMetadata
@@ -58,6 +58,24 @@ class WeightUpdate(BaseModel):
     weights_path: str
     weights_metadata_path: str
     attestation: "MinerAttestationPayload | EnclaveSignResponse | None" = None
+
+
+class WeightSubmitResponse(BaseModel):
+    message: str
+    should_upload_optimizer_state: bool = False
+
+
+class OptimizerStateUpdate(BaseModel):
+    """Request to update optimizer state path after weight submission."""
+
+    optimizer_state_path: str
+
+
+class LayerOptimizerStateResponse(BaseModel):
+    """Response containing the presigned URL for layer-based optimizer state download."""
+
+    optimizer_state_url: str | None = None
+    available: bool = False
 
 
 class SubmitMergedPartitionsRequest(BaseModel):
@@ -265,6 +283,77 @@ class RunInfo(BaseModel):
     authorized: bool
     run_flags: RunFlags
     max_miners: int
+
+
+############################################################
+#
+# NODE PROTOCOL CONTROL MODELS
+#
+############################################################
+
+ServerCapability = Literal[
+    "control.start",
+    "control.stop",
+    "control.configure",
+    "training.state",
+    "register.status",
+    "register.best_run",
+    "enclave.get_key_id",
+    "enclave.sign",
+    "enclave.doctor",
+    "enclave.reset",
+]
+
+NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES: Final[tuple[ServerCapability, ...]] = (
+    # Currently not hooked up control messages
+    "control.start",
+    "control.stop",
+    "control.configure",
+    "training.state",
+    # Registration messages
+    "register.status",
+    "register.best_run",
+    # Secure enclave messages
+    "enclave.get_key_id",
+    "enclave.sign",
+    "enclave.doctor",
+    "enclave.reset",
+)
+
+# --- Register payloads ---
+
+RegisterStatus = Literal["initializing", "initialized", "frozen", "registered"]
+
+
+class RegisterSetStatusRequest(BaseModel):
+    status: RegisterStatus
+
+
+class RegisterSetStatusResponse(BaseModel):
+    status: int
+
+
+class RegisterSetBestRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    run_id: str = Field(alias="runId", serialization_alias="runId")
+
+
+class RegisterSetBestRunResponse(BaseModel):
+    status: int
+
+
+class TrainingStateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    state: str
+    detail: str | None = None
+    run_id: str | None = Field(default=None, alias="runId", serialization_alias="runId")
+    layer: int | None = None
+
+
+class TrainingStateResponse(BaseModel):
+    status: int
 
 
 # --- KeySigner-aligned enclave payloads ---

@@ -22,6 +22,7 @@ from common.utils.exceptions import LayerStateException, MinerNotRegisteredExcep
 from miner import settings as miner_settings
 
 from miner.utils.stats import StatsTracker, tensor_num_bytes
+from miner.telemetry.metric_registry import S3_DOWNLOAD_SPEED_BYTES_PER_SEC
 from common.models.run_flags import RunFlags
 
 
@@ -67,6 +68,35 @@ class ActivationQueue:
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker for dashboard metrics."""
         self._stats_tracker = tracker
+
+    def _reshape_mock_activations(self, input_activations: torch.Tensor) -> torch.Tensor:
+        """Normalize downloaded activations to the configured mock input width."""
+        batch_size = common_settings.MINI_BATCH_SIZE
+        target_dim = common_settings.MOCK_MODEL_INPUT_DIM
+
+        if input_activations.numel() % batch_size != 0:
+            raise ValueError(
+                "Mock activation size is not divisible by MINI_BATCH_SIZE. "
+                f"numel={input_activations.numel()}, mini_batch_size={batch_size}"
+            )
+
+        input_activations = input_activations.reshape(batch_size, -1)
+        current_dim = input_activations.shape[-1]
+
+        if current_dim == target_dim:
+            return input_activations
+
+        if current_dim > target_dim:
+            logger.warning("Mock activation width mismatch; truncating features " f"from {current_dim} to {target_dim}")
+            return input_activations[:, :target_dim].contiguous()
+
+        logger.warning("Mock activation width mismatch; right-padding features " f"from {current_dim} to {target_dim}")
+        padding = torch.zeros(
+            (batch_size, target_dim - current_dim),
+            dtype=input_activations.dtype,
+            device=input_activations.device,
+        )
+        return torch.cat([input_activations, padding], dim=1).contiguous()
 
     def __len__(self) -> int:
         """Get the number of activations in the queue."""
@@ -355,10 +385,7 @@ class ActivationQueue:
                                 or self._model_manager.model_config["emb_dim"],
                             )
                         else:
-                            input_activations = input_activations.reshape(
-                                common_settings.MINI_BATCH_SIZE,
-                                100,
-                            )
+                            input_activations = self._reshape_mock_activations(input_activations)
 
                     # Download the sample for last layer miners as well
                     sample_activations = None
@@ -389,6 +416,11 @@ class ActivationQueue:
                         stats.timing.download.start = start_time
                         stats.timing.download.end = end_time
                         stats.timing.download.duration = end_time - start_time
+                    download_duration = end_time - start_time
+                    if download_duration > 0 and total_bytes > 0:
+                        S3_DOWNLOAD_SPEED_BYTES_PER_SEC.labels(layer_idx=str(self._state_manager.layer)).set(
+                            total_bytes / download_duration
+                        )
                     return DownloadedData(
                         activation_response=activation_response,
                         input_activations=input_activations,

@@ -22,6 +22,7 @@ from miner.utils.utils import upload_tensor
 from subnet.miner_api_client import MinerAPIClient
 
 from miner.utils.stats import StatsTracker, tensor_num_bytes
+from miner.telemetry.metric_registry import S3_UPLOAD_SPEED_BYTES_PER_SEC
 
 
 class ActivationPublisher:
@@ -31,6 +32,7 @@ class ActivationPublisher:
         self._stats_tracker: StatsTracker | None = None
         self._run_flags: RunFlags = run_flags or RUN_FLAGS
         self.miner = miner
+        self.layer_idx: str | None = None
 
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker for dashboard metrics."""
@@ -142,6 +144,13 @@ class ActivationPublisher:
                     stats.timing.upload.start = start_time
                     stats.timing.upload.end = end_time
                     stats.timing.upload.duration = end_time - start_time
+                upload_duration = end_time - start_time
+                if upload_duration > 0 and self.layer_idx is not None:
+                    bytes_uploaded = tensor_num_bytes(tensor)
+                    if bytes_uploaded > 0:
+                        S3_UPLOAD_SPEED_BYTES_PER_SEC.labels(layer_idx=self.layer_idx).set(
+                            bytes_uploaded / upload_duration
+                        )
 
             async with TimerLoggerMiner(
                 name="submit_activation",
