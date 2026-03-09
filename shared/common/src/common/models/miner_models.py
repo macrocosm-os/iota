@@ -13,6 +13,8 @@ class MinerStatus(str, Enum):
     IDLE = "idle"
     UPLOADING_WEIGHTS = "uploading_weights"
     MERGING_PARTITIONS = "merging_partitions"
+    INITIALIZING = "initializing"
+    FROZEN = "frozen"
 
 
 class ChunkMetadata(BaseModel):

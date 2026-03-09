@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from PyInstaller.utils.hooks import collect_dynamic_libs
 
 load_dotenv()
 
@@ -11,13 +12,14 @@ ENTITLEMENTS_PATH = MONOREPO_ROOT / "scripts" / "entitlements.plist"
 ENTITLEMENTS_PATH = Path(os.getcwd()).parents[1] / "scripts" / "entitlements.plist"
 
 SIGNING_IDENTITY = os.getenv("MACOS_SIGNING_IDENTITY")
+IROH_BINARIES = collect_dynamic_libs("iroh", destdir="iroh")
 
 a = Analysis(
     ["main_pool.py"],
     pathex=[],
-    binaries=[(str(ATTEST_SO_PATH), "common")],
+    binaries=[(str(ATTEST_SO_PATH), "common"), *IROH_BINARIES],
     datas=[],
-    hiddenimports=["platformdirs.macos"],
+    hiddenimports=["platformdirs.macos", "iroh.iroh_ffi"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

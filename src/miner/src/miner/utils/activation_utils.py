@@ -36,7 +36,10 @@ async def download_sample(
             raise Exception(f"Failed to decode sample as utf-8 (and gzip fallback failed): {e}")
 
     if mock:
-        return torch.randn(size=(common_settings.MINI_BATCH_SIZE, 100), dtype=torch.bfloat16).to("cpu")
+        return torch.randn(
+            size=(common_settings.MINI_BATCH_SIZE, 100),
+            dtype=torch.bfloat16,
+        ).to("cpu")
 
     sample = torch.tensor(tokenizer.encode(text)).to(device)
     if len(sample) < common_settings.SEQUENCE_LENGTH * common_settings.MINI_BATCH_SIZE:

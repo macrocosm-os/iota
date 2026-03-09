@@ -6,13 +6,20 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 from loguru import logger
-from common.models.api_models import EnclaveGetKeyIdResponse, EnclaveSignResponse
+from common.models.api_models import (
+    TrainingStateResponse,
+    EnclaveGetKeyIdResponse,
+    EnclaveSignResponse,
+    RegisterSetBestRunResponse,
+    RegisterSetStatusResponse,
+    RegisterStatus,
+)
 from miner import settings as miner_settings
-from miner.utils.miner_control_protocol_api import start_protocol_server
+from miner.utils.node_protocol_control_api import start_protocol_server
 
 
-class MinerControlMixin:
-    miner_control_port: int
+class NodeControlMixin:
+    node_control_port: int
 
     _enclave_key_cache: Optional[Dict[str, Any]] = None
     _is_mounted: bool = (
@@ -21,40 +28,40 @@ class MinerControlMixin:
     _electron_version: str | None = miner_settings.ELECTRON_VERSION
 
     async def _start_control_protocol_server_process(self, port: int | None = None):
-        """Start the Miner Control Protocol server in a separate process"""
+        """Start the Node Protocol Control server in a separate process"""
         if self._is_mounted:
             try:
-                target_port = port or self.miner_control_port
-                self.miner_control_process = multiprocessing.Process(
-                    target=start_protocol_server, args=(target_port,), daemon=True, name="MinerControlServer"
+                target_port = port or self.node_control_port
+                self.node_control_process = multiprocessing.Process(
+                    target=start_protocol_server, args=(target_port,), daemon=True, name="NodeControlServer"
                 )
-                self.miner_control_process.start()
-                logger.info(f"✅ Protocol server started in separate process (PID: {self.miner_control_process.pid})")
+                self.node_control_process.start()
+                logger.info(f"✅ Protocol server started in separate process (PID: {self.node_control_process.pid})")
             except Exception as e:
                 logger.exception(f"Error starting protocol server process: {e}")
         else:
-            print("Miner Control Protocol not enabled")
+            print("Node Protocol Control not enabled")
 
     async def _stop_control_protocol_server_process(self):
-        """Stop the Miner Control Protocol server."""
+        """Stop the Node Protocol Control server."""
         if self._is_mounted:
-            if self.miner_control_process and self.miner_control_process.is_alive():
-                logger.info("Stoppping miner control protocol server process")
-                self.miner_control_process.terminate()
-                self.miner_control_process.join(timeout=5)
+            if self.node_control_process and self.node_control_process.is_alive():
+                logger.info("Stoppping node control protocol server process")
+                self.node_control_process.terminate()
+                self.node_control_process.join(timeout=5)
 
-                if self.miner_control_process.is_alive():
-                    logger.warning("Miner Control Protocol server did not terminate gracefully, force killing")
-                    self.miner_control_process.kill()
-                    self.miner_control_process.join()
+                if self.node_control_process.is_alive():
+                    logger.warning("Node Protocol Control server did not terminate gracefully, force killing")
+                    self.node_control_process.kill()
+                    self.node_control_process.join()
 
-                logger.info("✅ Miner Control Protocol server stopped")
-            self.miner_control_process = None
+                logger.info("✅ Node Protocol Control server stopped")
+            self.node_control_process = None
         else:
-            print("Miner Control Protocol not enabled")
+            print("Node Protocol Control not enabled")
 
     def _control_base_url(self) -> str:
-        return f"http://127.0.0.1:{self.miner_control_port}"
+        return f"http://127.0.0.1:{self.node_control_port}"
 
     async def _control_get_json(self, path: str, timeout_s: float = 2.0) -> Dict[str, Any]:
         url = self._control_base_url() + path
@@ -86,7 +93,7 @@ class MinerControlMixin:
                 return
             except Exception:
                 await asyncio.sleep(0.5)
-        raise RuntimeError("Miner control server not reachable (/health)")
+        raise RuntimeError("Node control server not reachable (/health)")
 
     async def wait_for_host_connected(self, timeout_s: float = 120.0, require_hello: bool = False) -> Dict[str, Any]:
         if not self._is_mounted:
@@ -117,6 +124,90 @@ class MinerControlMixin:
         await self.wait_for_control_server_up(timeout_s=20.0)
         health = await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
         logger.info(f"✅ Control host connected: sessionId={health.get('sessionId')}")
+
+    async def register_set_status(
+        self,
+        *,
+        status: RegisterStatus,
+        timeout_s: float = 20.0,
+        retries: int = 3,
+    ) -> RegisterSetStatusResponse:
+        if not self._is_mounted:
+            return RegisterSetStatusResponse(status=200)
+
+        payload = {"status": status}
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
+                res = await self._control_post_json("/register/status", payload, timeout_s=timeout_s)
+                return RegisterSetStatusResponse(**res)
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(2 * attempt)
+
+        logger.warning(f"register_set_status exhausted retries ({retries}): {last_err}")
+        return RegisterSetStatusResponse(status=503)
+
+    async def register_set_best_run(
+        self,
+        *,
+        run_id: str,
+        timeout_s: float = 20.0,
+        retries: int = 3,
+    ) -> RegisterSetBestRunResponse:
+        if not self._is_mounted:
+            return RegisterSetBestRunResponse(status=200)
+
+        payload = {"run_id": run_id}
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
+                res = await self._control_post_json("/register/best_run", payload, timeout_s=timeout_s)
+                return RegisterSetBestRunResponse(**res)
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(2 * attempt)
+
+        logger.warning(f"register_set_best_run exhausted retries ({retries}): {last_err}")
+        return RegisterSetBestRunResponse(status=503)
+
+    async def report_training_state(
+        self,
+        *,
+        state: str,
+        detail: Optional[str] = None,
+        run_id: Optional[str] = None,
+        layer: Optional[int] = None,
+        timeout_s: float = 10.0,
+        retries: int = 2,
+    ) -> TrainingStateResponse:
+        if not self._is_mounted:
+            return TrainingStateResponse(status=200)
+
+        payload: Dict[str, Any] = {"state": state}
+        if detail is not None:
+            payload["detail"] = detail
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if layer is not None:
+            payload["layer"] = layer
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
+                res = await self._control_post_json("/training/state", payload, timeout_s=timeout_s)
+                return TrainingStateResponse(**res)
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(2 * attempt)
+
+        logger.warning(f"report_training_state exhausted retries ({retries}): {last_err}")
+        return TrainingStateResponse(status=503)
 
     async def enclave_get_key_id(
         self, *, purpose: str, preferred_algorithms=None, dp_keychain=None, cache: bool = True
@@ -165,7 +256,7 @@ class MinerControlMixin:
           { "keyId": "...", "signatureDerBase64": "...", "alg": "ES256", "publicKeyX963Base64": optional }
         """
         if not self._is_mounted:
-            raise RuntimeError("Miner control disabled; enclave_sign unavailable")
+            raise RuntimeError("Node control disabled; enclave_sign unavailable")
 
         await self.wait_for_host_connected(timeout_s=120.0, require_hello=require_hello)
 

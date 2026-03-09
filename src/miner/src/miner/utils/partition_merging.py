@@ -27,7 +27,9 @@ import torch
 
 
 async def get_chunk_metadata_for_all_partitions(
-    submitted_weights_and_optimizer: SubmittedWeightsAndOptimizerPresigned, partitions: list[MinerPartition]
+    submitted_weights_and_optimizer: SubmittedWeightsAndOptimizerPresigned,
+    partitions: list[MinerPartition],
+    run_flags: RunFlags = RUN_FLAGS,
 ) -> dict[int, ChunkMetadata]:
     """
     Returns a dictionary of chunk numbers to ChunkMetadata objects as follows:
@@ -47,6 +49,11 @@ async def get_chunk_metadata_for_all_partitions(
             raise Exception(
                 f"No weight or optimizer state metadata found | {submitted_weights_and_optimizer.weights_path_presigned}"
             )
+
+        if run_flags.enforce_min_local_optimizer_steps.isOn():
+            if weight_metadata.get("local_optimization_steps", 0) < miner_settings.MIN_LOCAL_OPTIMIZER_STEPS:
+                return None
+
         if (
             "weight" not in submitted_weights_and_optimizer.weight_metadata_path_presigned
             and "weight" not in submitted_weights_and_optimizer.weights_path_presigned
@@ -119,6 +126,7 @@ def metadata_matches(meta1: dict[int, ChunkMetadata], meta2: dict[int, ChunkMeta
 async def filter_bad_metadata(
     partitions: list[MinerPartition],
     submitted_weights_and_optimizers: list[SubmittedWeightsAndOptimizerPresigned],
+    run_flags: RunFlags = RUN_FLAGS,
 ) -> dict[str, dict[int, ChunkMetadata]]:
     """Filter out packets with bad metadata and return valid metadata info objects.
 
@@ -153,7 +161,9 @@ async def filter_bad_metadata(
     valid_metadata: dict[str, dict[int, ChunkMetadata]] = {}
     results = await asyncio.gather(
         *[
-            get_chunk_metadata_for_all_partitions(submitted_weights_and_optimizer=s, partitions=partitions)
+            get_chunk_metadata_for_all_partitions(
+                submitted_weights_and_optimizer=s, partitions=partitions, run_flags=run_flags
+            )
             for s in submitted_weights_and_optimizers
         ]
     )
@@ -320,6 +330,7 @@ async def merge_partition_batch(
     num_partitions: int,
     weights_length: int,
     device: str,
+    run_flags: RunFlags = RUN_FLAGS,
 ) -> dict[int, tuple[torch.Tensor, torch.Tensor, MinerPartition]]:
     # merge_results: dict[MinerPartition, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -345,14 +356,16 @@ async def merge_partition_batch(
 
                     weights_metadata: ChunkMetadata = metadata[partition.new_partition.chunk_number]
 
+                    weight_factor = (
+                        weights_metadata.weighting_factor if run_flags.weighted_partition_averaging.isOn() else 1.0
+                    )
+                    weighted_weights = weights.to(torch.float32) * weight_factor
                     if weight_average is None:
-                        weight_average = weights.to(torch.float32) * weights_metadata.weighting_factor
-
+                        weight_average = weighted_weights
                     else:
-                        # create a running sum of weights weighted by the weighting factor
-                        weight_average += weights.to(torch.float32) * weights_metadata.weighting_factor
+                        weight_average += weighted_weights
 
-                    weight_counter += weights_metadata.weighting_factor
+                    weight_counter += weight_factor
 
                 except Exception as e:
                     logger.exception(

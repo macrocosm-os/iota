@@ -11,6 +11,8 @@ import logging
 import warnings
 from loguru import logger
 
+from common.utils.gpu_process_utils import kill_stale_gpu_processes, cleanup_stale_shared_memory
+
 _ORIGINAL_LOGURU_ADD = logger.add
 _ORIGINAL_LOGURU_REMOVE = logger.remove
 
@@ -91,6 +93,9 @@ def main():
     )
     parser.set_defaults(auto_start=False, show_dashboard=True, use_btcli=True)
     args = parser.parse_args()
+
+    kill_stale_gpu_processes()
+    cleanup_stale_shared_memory()
 
     payout_override: str | None = None
     if args.payout_coldkey is not None:
