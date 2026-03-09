@@ -6,6 +6,7 @@ from loguru import logger
 from miner.new_miner import Miner
 from miner import settings as miner_settings
 from common import settings as common_settings
+from common.utils.gpu_process_utils import kill_stale_gpu_processes, cleanup_stale_shared_memory
 
 # Setup logging
 logger.remove()
@@ -28,6 +29,8 @@ if common_settings.LOG_FILE_ENABLED:
 
 def main():
     """Main entry point for the miner."""
+    kill_stale_gpu_processes()
+    cleanup_stale_shared_memory()
     logger.info("Starting miner")
     logger.info(f"Wallet: {miner_settings.WALLET_NAME}")
     logger.info(f"Hotkey: {miner_settings.WALLET_HOTKEY}")

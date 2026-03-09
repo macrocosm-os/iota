@@ -7,10 +7,14 @@ readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
   "aiohttp>=3.9.0",
+  "blake3>=1.0.0",
   "dotenv>=0.9.9",
   "fastapi>=0.110.1",
   "httpx>=0.27.0",
+  "iroh>=0.35.0",
   "loguru>=0.7.3",
+  "msgpack>=1.0.0",
+  "numpy>=2.2.6",
   "pydantic>=2.11.3",
   "requests>=2.31.0",
   "uvicorn>=0.30.0",
@@ -19,7 +23,6 @@ dependencies = [
   "pytest-mock>=3.14.1",
   "cryptography>=46.0.3",
   "substrate-interface >=1.7, <1.8",
-
 ]
 
 [build-system]

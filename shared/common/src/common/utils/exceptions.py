@@ -58,3 +58,31 @@ class RateLimitException(Exception):
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
+
+
+class ActivationHashMismatchError(Exception):
+    """Raised when received activation hash doesn't match expected."""
+
+    def __init__(self, activation_id: str, expected_hash: str, received_hash: str):
+        self.activation_id = activation_id
+        self.expected_hash = expected_hash
+        self.received_hash = received_hash
+        self.message = (
+            f"Hash mismatch for activation {activation_id}: "
+            f"expected {expected_hash[:16]}..., got {received_hash[:16]}..."
+        )
+        super().__init__(self.message)
+
+
+class MinerBlockedException(Exception):
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
+
+
+class MinerFrozenException(MinerBlockedException):
+    """Raised when orchestrator reports miner is frozen."""
+
+
+class MinerInitializingException(MinerBlockedException):
+    """Raised when orchestrator reports miner is still initializing."""

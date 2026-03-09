@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from typing import Any
 from common.utils.verify_enclave_signature import payload_base64_from_obj
@@ -10,7 +11,6 @@ import torch
 import time
 from common.models.api_models import (
     AttestationChallengeResponse,
-    CompleteFileUploadResponse,
     LossReportRequest,
     MinerAttestationPayload,
     SubmitActivationRequest,
@@ -18,10 +18,10 @@ from common.models.api_models import (
 from common.models.run_flags import RunFlags, RUN_FLAGS
 from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
 from miner.utils.attestation_utils import AttestationUnavailableError, collect_attestation_payload
-from miner.utils.utils import upload_tensor
+from miner.utils.activation_hash import compute_activation_hash
 from subnet.miner_api_client import MinerAPIClient
 
-from miner.utils.stats import StatsTracker, tensor_num_bytes
+from miner.utils.stats import StatsTracker
 
 
 class ActivationPublisher:
@@ -31,6 +31,7 @@ class ActivationPublisher:
         self._stats_tracker: StatsTracker | None = None
         self._run_flags: RunFlags = run_flags or RUN_FLAGS
         self.miner = miner
+        self.layer_idx: str | None = None
 
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker for dashboard metrics."""
@@ -78,30 +79,48 @@ class ActivationPublisher:
         upload_url: list[str] | None,
         activation_path: str | None,
     ):
-        """Upload an activation to the orchestrator."""
+        """Upload an activation to the orchestrator and cache for P2P retrieval."""
         try:
+            publish_start = time.time()
+
+            # Serialize tensor to bytes for hashing and P2P caching
+            buffer = io.BytesIO()
+            torch.save(tensor, buffer)
+            tensor_bytes = buffer.getvalue()
+
+            # Compute hash of output activation
+            output_hash = compute_activation_hash(tensor_bytes)
+
+            # Cache locally for P2P requests from other miners
+            if self.miner:
+                await self.miner.cache_activation(activation_id, tensor_bytes)
+                logger.debug(f"Cached activation {activation_id} for P2P retrieval, hash={output_hash[:16]}...")
+
+            # Get input hash from when we received this activation's input
+            input_hash = None
+            if self.miner:
+                input_hash = self.miner.get_input_hash(activation_id)
+
+            # Spot-check: upload activation to S3 if the orchestrator selected it
+            if upload_url is not None:
+                logger.info(f"Spot-check: uploading activation {activation_id} to S3 ({len(tensor_bytes)} bytes)")
+                try:
+                    await MinerAPIClient.upload_to_s3(urls=upload_url, data=tensor_bytes, upload_id=None)
+                    logger.success(f"Spot-check upload complete for {activation_id}")
+                except Exception as e:
+                    logger.error(f"Spot-check upload failed for {activation_id}: {e}")
+                    # Don't raise -- spot-check failure must not block normal activation flow
+
+            logger.debug(f"Activation {activation_id} ready for P2P serving (tensor shape: {tensor.shape})")
+
             async with TimerLoggerMiner(
-                name="upload_activation",
+                name="upload_activation",  # Name kept for metrics compatibility (no actual S3 upload)
                 metadata={
                     "activation_id": activation_id,
                     "direction": direction,
                 },
                 hotkey=self._miner_api_client.hotkey.ss58_address[:8],
             ):
-                start_time = time.time()
-                upload_response: CompleteFileUploadResponse = await upload_tensor(
-                    miner_api_client=self._miner_api_client,
-                    tensor=tensor,
-                    hotkey=self._miner_api_client.hotkey,
-                    upload_urls=upload_url,
-                    object_name=activation_path,
-                    run_flags=self._run_flags,
-                )
-                logger.debug(f"tensor shape before upload:{tensor.shape}")
-                if self._stats_tracker is not None:
-                    bytes_uploaded = tensor_num_bytes(tensor)
-                    self._stats_tracker.record_upload(bytes_uploaded)
-
                 attestation_payload: MinerAttestationPayload | None = None
                 if self._run_flags.attest.isOn():
                     try:
@@ -136,38 +155,41 @@ class ActivationPublisher:
                         logger.exception(
                             f"Error collecting attestation for activation {activation_id}: {exc}",
                         )
-                end_time = time.time()
-                if self._stats_tracker is not None:
-                    stats = self._stats_tracker.ensure_activation_stats(activation_id, direction=direction)
-                    stats.timing.upload.start = start_time
-                    stats.timing.upload.end = end_time
-                    stats.timing.upload.duration = end_time - start_time
+
+            # Record publish timing BEFORE fetching the stats payload so that
+            # publish timing is included in the data sent to the orchestrator.
+            publish_end = time.time()
+            if self._stats_tracker is not None:
+                stats = self._stats_tracker.ensure_activation_stats(activation_id, direction=direction)
+                stats.timing.publish.start = publish_start
+                stats.timing.publish.end = publish_end
+                stats.timing.publish.duration = publish_end - publish_start
 
             async with TimerLoggerMiner(
                 name="submit_activation",
                 metadata={"activation_id": activation_id, "direction": direction},
                 hotkey=self._miner_api_client.hotkey.ss58_address[:8],
             ):
-                start_time
                 activation_stats = None
                 if self._stats_tracker is not None:
                     activation_stats = self._stats_tracker.get_activation_stats_payload(activation_id)
                 await self._miner_api_client.submit_activation_request(
                     submit_activation_request=SubmitActivationRequest(
                         activation_id=activation_id,
-                        activation_path=upload_response.object_path,
+                        activation_path=activation_path,  # Non-None when spot-check upload occurred
                         direction=direction,
                         activation_stats=activation_stats,
                         attestation=attestation_payload,
+                        input_activation_hash=input_hash,
+                        output_activation_hash=output_hash,
                     ),
                 )
                 logger.success(f"✅ Successfully published activation {activation_id} direction {direction}")
-                end_time = time.time()
-                if self._stats_tracker is not None:
-                    stats = self._stats_tracker.ensure_activation_stats(activation_id, direction=direction)
-                    stats.timing.publish.start = start_time
-                    stats.timing.publish.end = end_time
-                    stats.timing.publish.duration = end_time - start_time
+
+            # Clean up input hash after submission
+            if self.miner:
+                await self.miner.clear_input_hash(activation_id)
+
         except (LayerStateException, MinerNotRegisteredException) as e:
             # Swallow expected exceptions
             logger.warning(f"Anticipated exception has occurred while publishing activations (swallowed): {e}")

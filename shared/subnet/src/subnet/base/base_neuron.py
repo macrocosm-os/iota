@@ -68,9 +68,7 @@ class BaseNeuron:
             return False
         return True
 
-    async def download_and_set_global_weights(
-        self, client: CommonAPIClient, device: str, download_local_optimizer_state: bool = False
-    ) -> torch.Tensor | None:
+    async def download_and_set_global_weights(self, client: CommonAPIClient, device: str) -> torch.Tensor | None:
         """
         Downloads the weights and optimizer state from the db and sets them to the model
 
@@ -90,7 +88,7 @@ class BaseNeuron:
                 logger.error(
                     f"Error getting merged partitions {merged_partitions.error_name}: {merged_partitions.error_dict}"
                 )
-                return
+                raise RuntimeError(f"Failed to get merged partitions: {merged_partitions.error_name}") from None
 
             # Download new weights
             new_weights = await download_merged_partitions(
@@ -104,7 +102,7 @@ class BaseNeuron:
 
             if new_weights is None:
                 logger.warning("No new weights or optimizer state downloaded")
-                return
+                raise RuntimeError("Failed to download global weights: no weights returned")
 
             # Set new weights and optimizer state to model
             await self.model_manager.set_model_weights_and_optimizer_state(

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Final, Literal, Optional
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from common import settings
 from common.models.ml_models import ModelConfig, ModelMetadata
@@ -60,6 +60,24 @@ class WeightUpdate(BaseModel):
     attestation: "MinerAttestationPayload | EnclaveSignResponse | None" = None
 
 
+class WeightSubmitResponse(BaseModel):
+    message: str
+    should_upload_optimizer_state: bool = False
+
+
+class OptimizerStateUpdate(BaseModel):
+    """Request to update optimizer state path after weight submission."""
+
+    optimizer_state_path: str
+
+
+class LayerOptimizerStateResponse(BaseModel):
+    """Response containing the presigned URL for layer-based optimizer state download."""
+
+    optimizer_state_url: str | None = None
+    available: bool = False
+
+
 class SubmitMergedPartitionsRequest(BaseModel):
     partitions: list[MinerPartition]
     attestation: "MinerAttestationPayload | EnclaveSignResponse | None" = None
@@ -102,6 +120,10 @@ class ActivationResponse(BaseModel):
     presigned_upload_url: list[str] | None = None
     activation_upload_path: str | None = None
     target_download_url: str | None = None
+    # P2P routing fields
+    source_node_id: str | None = None  # P2P node ID of the miner that has this activation
+    source_activation_id: str | None = None  # Original activation_id the producer cached (use for P2P requests)
+    expected_input_hash: str | None = None  # Sampled hash to verify received data integrity
 
 
 class SubmittedWeightsAndOptimizerPresigned(BaseModel):
@@ -240,6 +262,9 @@ class SubmitActivationRequest(BaseModel):
     activation_path: str | None = None
     activation_stats: dict[str, Any] | None = None
     attestation: MinerAttestationPayload | EnclaveSignResponse | None = None
+    # P2P hash verification fields
+    input_activation_hash: str | None = None  # Sampled hash of the input activation we received
+    output_activation_hash: str | None = None  # Sampled hash of the output activation we're sending
 
 
 class RegisterMinerRequest(BaseModel):
@@ -248,6 +273,7 @@ class RegisterMinerRequest(BaseModel):
     coldkey: str | None = None
     register_as_metagraph_miner: bool = True
     enclave_payload: EnclaveGetKeyIdResponse | None = None
+    p2p_node_id: str  # P2P node ID for direct peer communication (required)
 
 
 class PayoutColdkeyRequest(BaseModel):
@@ -265,6 +291,77 @@ class RunInfo(BaseModel):
     authorized: bool
     run_flags: RunFlags
     max_miners: int
+
+
+############################################################
+#
+# NODE PROTOCOL CONTROL MODELS
+#
+############################################################
+
+ServerCapability = Literal[
+    "control.start",
+    "control.stop",
+    "control.configure",
+    "training.state",
+    "register.status",
+    "register.best_run",
+    "enclave.get_key_id",
+    "enclave.sign",
+    "enclave.doctor",
+    "enclave.reset",
+]
+
+NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES: Final[tuple[ServerCapability, ...]] = (
+    # Currently not hooked up control messages
+    "control.start",
+    "control.stop",
+    "control.configure",
+    "training.state",
+    # Registration messages
+    "register.status",
+    "register.best_run",
+    # Secure enclave messages
+    "enclave.get_key_id",
+    "enclave.sign",
+    "enclave.doctor",
+    "enclave.reset",
+)
+
+# --- Register payloads ---
+
+RegisterStatus = Literal["initializing", "initialized", "frozen", "registered"]
+
+
+class RegisterSetStatusRequest(BaseModel):
+    status: RegisterStatus
+
+
+class RegisterSetStatusResponse(BaseModel):
+    status: int
+
+
+class RegisterSetBestRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    run_id: str = Field(alias="runId", serialization_alias="runId")
+
+
+class RegisterSetBestRunResponse(BaseModel):
+    status: int
+
+
+class TrainingStateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    state: str
+    detail: str | None = None
+    run_id: str | None = Field(default=None, alias="runId", serialization_alias="runId")
+    layer: int | None = None
+
+
+class TrainingStateResponse(BaseModel):
+    status: int
 
 
 # --- KeySigner-aligned enclave payloads ---

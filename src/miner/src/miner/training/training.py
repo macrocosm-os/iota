@@ -22,6 +22,12 @@ from subnet.model.utils import compute_loss, log_gpu_memory_usage
 from subnet.model import gpu_device
 
 from miner.utils.stats import StatsTracker
+from miner.telemetry.metric_registry import (
+    ACTIVATIONS_PROCESSED_TOTAL,
+    BACKWARD_PASS_DURATION_SECONDS,
+    FORWARD_PASS_DURATION_SECONDS,
+    TRAINING_LOSS,
+)
 
 
 class TrainingPhase:
@@ -50,6 +56,7 @@ class TrainingPhase:
             activation_cache=self._cache,
             mock=self._mock,
             run_flags=self._run_flags,
+            miner=miner,
         )
         self._publisher = ActivationPublisher(
             miner_api_client=self._miner_api_client, run_flags=self._run_flags, miner=miner
@@ -59,6 +66,8 @@ class TrainingPhase:
         self.backwards_since_last_optim = 0
         self.local_optimization_steps = 0
         self.is_mounted = is_mounted
+        self.miner = miner
+        self._loss_on_cpu: bool = False
 
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker and propagate to child components."""
@@ -77,6 +86,7 @@ class TrainingPhase:
                     self._stats_tracker.set_phase(self._miner_api_client.layer_state)
                     self._stats_tracker.set_layer(self._state_manager.layer)
                     self._stats_tracker.set_local_epoch(getattr(self._model_manager, "epoch_counter", None))
+                self._publisher.layer_idx = str(self._state_manager.layer)
 
                 # Check if training phase is complete
                 await self._queue.check_if_training_is_complete()
@@ -104,6 +114,10 @@ class TrainingPhase:
                     time_since_last_activation=time.time() - last_activation_time,
                 ):
                     last_activation_time = time.time()
+                    # initialisation completed
+                    if self.miner and self.is_mounted:
+                        await self.miner.register_set_status(status="initialized")
+
                     if activation.direction == "forward":
                         await self.forward(activation)
                     elif activation.direction == "backward":
@@ -171,10 +185,22 @@ class TrainingPhase:
                     logger.debug(
                         f"Last layer miner, performing backward pass for activation {activation_data.activation_id}"
                     )
+                    end_time = time.time()
+                    if self._stats_tracker is not None:
+                        stats = self._stats_tracker.ensure_activation_stats(
+                            activation_data.activation_id,
+                            direction=activation_data.direction,
+                        )
+                        stats.timing.forward.start = start_time
+                        stats.timing.forward.end = end_time
+                        stats.timing.forward.duration = end_time - start_time
+                        stats.timing.forward.cache_len = len(self._cache)
+                        stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
+                        stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
                     return await self.backward(activation_data=activation_data)
 
                 logger.debug(f"Forwarding activation of size {activation_data.input_activations.shape}")
-                output_activations_gpu, state = await self._model_manager._forward_no_intermittent_activations(
+                output_activations_gpu, _ = await self._model_manager._forward_no_intermittent_activations(
                     input_activations=input_activations_gpu, processing_batch_size=miner_settings.LOCAL_BATCH_SIZE
                 )
 
@@ -200,6 +226,10 @@ class TrainingPhase:
                     stats.timing.forward.cache_len = len(self._cache)
                     stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
                     stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
+
+                layer_idx = str(self._state_manager.layer)
+                FORWARD_PASS_DURATION_SECONDS.labels(layer_idx=layer_idx).observe(end_time - start_time)
+                ACTIVATIONS_PROCESSED_TOTAL.labels(direction="forward", layer_idx=layer_idx).inc()
 
                 self._publisher.publish_activation(
                     tensor=output_activations_cpu,
@@ -233,6 +263,14 @@ class TrainingPhase:
                 last_layer = self._state_manager.layer == self._model_manager.model_metadata["n_splits"] - 1
                 all_input_activations_grads = []
                 losses = []
+
+                # Sub-phase timing accumulators (accumulated across local batch iterations)
+                gpu_setup_total = 0.0
+                bwd_fwd_total = 0.0
+                bwd_loss_total = 0.0
+                bwd_pass_total = 0.0
+                grad_extract_total = 0.0
+
                 for i in range(0, len(activation_data.input_activations), miner_settings.LOCAL_BATCH_SIZE):
                     log_gpu_memory_usage(
                         note=f"after training forward pass cleaning on last layer miner with cach size of {len(self._cache)}"
@@ -240,6 +278,7 @@ class TrainingPhase:
                     logger.info(
                         f"🔄 Starting BACKWARD pass for activation {activation_data.activation_id} | Layer: {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
                     )
+                    gpu_setup_start = time.time()
                     async with TimerLoggerMiner(name="moving to gpu", hotkey=self._hotkey[:8]):
                         log_gpu_memory_usage(note="starting training backward pass")
 
@@ -276,25 +315,29 @@ class TrainingPhase:
 
                         if self._state_manager.layer > 0:
                             sliced_cached_input_activation.requires_grad_(True)
+                    gpu_setup_total += time.time() - gpu_setup_start
 
-                        output_activations_gpu, state = await self._model_manager._forward(
-                            layer=self._state_manager.layer,
-                            input_activations=sliced_cached_input_activation,
-                        )
+                    bwd_fwd_start = time.time()
+                    output_activations_gpu, state = await self._model_manager._forward(
+                        layer=self._state_manager.layer,
+                        input_activations=sliced_cached_input_activation,
+                    )
+                    bwd_fwd_total += time.time() - bwd_fwd_start
 
-                        log_gpu_memory_usage(note="after preparing activations on training backward pass")
+                    log_gpu_memory_usage(note="after preparing activations on training backward pass")
 
-                        logger.info(
-                            f"output activations before backward with shape {output_activations_gpu.shape} for {self._hotkey[:8]} on layer {self._state_manager.layer}"
-                        )
+                    logger.info(
+                        f"output activations before backward with shape {output_activations_gpu.shape} for {self._hotkey[:8]} on layer {self._state_manager.layer}"
+                    )
 
                     # Compute loss; if targets download or loss computation fails, skip backward gracefully
                     if last_layer:
                         try:
+                            bwd_loss_start = time.time()
                             logger.debug(
                                 f"Computing loss for last layer miner with shape {output_activations_gpu.shape} and targets shape {sliced_targets.shape} on local batch {i} of {len(activation_data.input_activations)/miner_settings.LOCAL_BATCH_SIZE}"
                             )
-                            logger.debug(f"Targets (shape: {sliced_targets.shape}): {sliced_targets}")
+                            # logger.debug(f"Targets (shape: {sliced_targets.shape}): {sliced_targets}")
                             loss = await self.compute_last_layer_loss(
                                 activation_data=activation_data, logits=output_activations_gpu, targets=sliced_targets
                             )
@@ -304,6 +347,7 @@ class TrainingPhase:
                             )
                             # output_activations_gpu = loss
                             losses.append(loss.item())
+                            bwd_loss_total += time.time() - bwd_loss_start
                         except Exception as e:
                             logger.exception(
                                 f"Skipping backward for activation {activation_data.activation_id} due to loss/target fetch error: {e}"
@@ -311,6 +355,7 @@ class TrainingPhase:
                             return
 
                     logger.debug(f"State: {state}")
+                    bwd_pass_start = time.time()
                     async with TimerLoggerMiner(name="backward pass", hotkey=self._hotkey[:8]):
                         await self._model_manager._backward(
                             layer=self._state_manager.layer,
@@ -318,9 +363,11 @@ class TrainingPhase:
                             activation_grads=sliced_backwards_grads_from_previous_miner,
                             state=state,
                         )
+                    bwd_pass_total += time.time() - bwd_pass_start
                     log_gpu_memory_usage(note="after backward pass")
 
                     # Handle different cases for input activation gradients
+                    grad_extract_start = time.time()
                     if self._mock:
                         input_activation_grads = sliced_cached_input_activation.detach().to(torch.bfloat16).cpu()
 
@@ -341,6 +388,7 @@ class TrainingPhase:
                         ]
                     else:
                         input_activation_grads = sliced_cached_input_activation.grad.detach().cpu()
+                    grad_extract_total += time.time() - grad_extract_start
 
                     log_gpu_memory_usage(note="after moving input activation grads to GPU")
                     all_input_activations_grads.append(input_activation_grads)
@@ -356,6 +404,17 @@ class TrainingPhase:
                     stats.timing.backward.cache_len = len(self._cache)
                     stats.timing.backward.forward_queue_len = len(self._queue._forward_queue)
                     stats.timing.backward.backward_queue_len = len(self._queue._backward_queue)
+
+                    # Sub-phase durations (accumulated across local batch iterations)
+                    stats.timing.backward_gpu_setup.duration = gpu_setup_total
+                    stats.timing.backward_forward.duration = bwd_fwd_total
+                    stats.timing.backward_loss.duration = bwd_loss_total
+                    stats.timing.backward_pass.duration = bwd_pass_total
+                    stats.timing.backward_grad_extract.duration = grad_extract_total
+                layer_idx = str(self._state_manager.layer)
+                BACKWARD_PASS_DURATION_SECONDS.labels(layer_idx=layer_idx).observe(end_time - start_time)
+                ACTIVATIONS_PROCESSED_TOTAL.labels(direction="backward", layer_idx=layer_idx).inc()
+
                 async with TimerLoggerMiner(name="publishing_backwards", hotkey=self._hotkey[:8]):
                     logger.debug(f"Backwards since reset for miner {self._hotkey[:8]}: {self.backwards_since_reset}")
 
@@ -364,6 +423,7 @@ class TrainingPhase:
                     mean_loss: float | None = None
                     if losses:
                         mean_loss = sum(losses) / len(losses)
+                        TRAINING_LOSS.labels(layer_idx=layer_idx).set(mean_loss)
                         self._publisher.publish_loss(loss=mean_loss, activation_id=activation_data.activation_id)
                         if self._stats_tracker is not None:
                             self._stats_tracker.record_loss(mean_loss)
@@ -430,28 +490,20 @@ class TrainingPhase:
             # NOTE: targets are on the CPU at this point
             # the problem is that loss calculation is very heavy on the GPU memory
             # on A4000 a 1B, when on GPU, it took 0.03s to compute the loss - on the CPU performance it took 0.5s
-            device = self._device
-            if device != "cpu":
-                gpu_device.synchronize()
-                gpu_device.empty_cache()
-                proxy_bytes_needed = logits.numel() * logits.element_size() * 5
-                avail_memory = gpu_device.available_memory()
-                if proxy_bytes_needed > avail_memory:
-                    device = "cpu"
-                    logger.warning(
-                        "Not enough memory available to compute loss on GPU"
-                        f" - needed {proxy_bytes_needed / 1024**3:.2f}GB, available {avail_memory / 1024**3:.2f}GB"
-                    )
-
-            loss: torch.Tensor = compute_loss(
-                mock=self._mock,
-                logits=logits,
-                targets=targets,
-                vocab_size=self._model_manager.vocab_size,
-                pad_token_id=self._model_manager.eos_token_id,
-                pack=miner_settings.PACK_SAMPLES,
-                device=device,
-            )
+            if self._loss_on_cpu:
+                device = "cpu"  # If I failed on the gpu once, just calculate on the cpu from now on
+            else:
+                device = self._device
+            try:
+                loss: torch.Tensor = self._compute_loss_on_device(logits, targets, device)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.exception(f"Out of memory error while computing loss on GPU: {e}")
+                    gpu_device.empty_cache()
+                    self._loss_on_cpu = True
+                    loss = self._compute_loss_on_device(logits, targets, "cpu")
+                else:
+                    raise e
 
             check_for_nans_and_infs(
                 tensor=loss, name=f"Loss for miner {self._hotkey[:8]}", exception_type=NanInfException
@@ -463,10 +515,25 @@ class TrainingPhase:
 
             return loss
 
+    def _compute_loss_on_device(self, logits: torch.Tensor, targets: torch.Tensor, device: str) -> torch.Tensor:
+        """Compute loss on the CPU regardless of current device setting."""
+        loss: torch.Tensor = compute_loss(
+            mock=self._mock,
+            logits=logits,
+            targets=targets,
+            vocab_size=self._model_manager.vocab_size,
+            pad_token_id=self._model_manager.eos_token_id,
+            pack=miner_settings.PACK_SAMPLES,
+            device=device,
+        )
+        return loss
+
     async def reset(self):
         """Reset the training phase."""
         logger.debug("🗑️ Performing full reset of training")
         self.backwards_since_reset = 0
+        self.local_optimization_steps = 0
+        self._loss_on_cpu = False
         await self.optimization_reset()
         await self._publisher.reset()
 

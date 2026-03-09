@@ -121,6 +121,56 @@ def generate_header(
     return headers
 
 
+def sign_p2p_request(hotkey: Keypair, body: bytes) -> tuple[int, str, bytes]:
+    """Sign a P2P request using the same message format as epistula.
+
+    Args:
+        hotkey: The keypair used for signing.
+        body: The request body bytes.
+
+    Returns:
+        Tuple of (timestamp_ms, ss58_address, raw_signature_bytes).
+    """
+    timestamp_ms = round(time.time() * 1000)
+    message = f"{sha256(body).hexdigest()}.{timestamp_ms}."
+    signature = hotkey.sign(message)
+    return timestamp_ms, hotkey.ss58_address, signature
+
+
+def verify_p2p_request(
+    body: bytes,
+    timestamp_ms: int,
+    ss58_address: str,
+    signature: bytes,
+    timeout_ms: int,
+) -> tuple[bool, str]:
+    """Verify a P2P request signature.
+
+    Args:
+        body: The request body bytes.
+        timestamp_ms: The timestamp from the request (milliseconds).
+        ss58_address: The signer's SS58 address.
+        signature: The raw signature bytes.
+        timeout_ms: Maximum age of the request in milliseconds.
+
+    Returns:
+        Tuple of (is_valid, error_reason). error_reason is empty string when valid.
+    """
+    try:
+        now_ms = round(time.time() * 1000)
+        if timestamp_ms + timeout_ms < now_ms:
+            return False, "request is too stale"
+
+        message = f"{sha256(body).hexdigest()}.{timestamp_ms}."
+        keypair = Keypair(ss58_address=ss58_address)
+        if not keypair.verify(message, signature):
+            return False, "signature mismatch"
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def create_message_body(data: dict) -> bytes:
     """Utility method to create message body from dictionary data"""
     return json.dumps(data, default=str, sort_keys=True).encode("utf-8")

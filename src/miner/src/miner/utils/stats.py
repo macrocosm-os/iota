@@ -13,10 +13,13 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Deque, Iterable
+from typing import TYPE_CHECKING, Deque, Iterable
 
 import torch
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from common.iroh.timings import P2POperationTimings
 
 
 @dataclass(slots=True)
@@ -44,13 +47,73 @@ class ActivationTimingStage(BaseModel):
     backward_queue_len: int | None = None
 
 
+class P2PTimingDetail(BaseModel):
+    """Per-phase timing breakdown for a single P2P operation.
+
+    Populated from ``P2POperationTimings`` (which lives in the iroh
+    package and is transport-layer aware).  This Pydantic mirror is what
+    gets persisted as JSON inside ``activation_stats``.
+    """
+
+    # per-phase durations (seconds)
+    connection_duration: float | None = None
+    stream_open_duration: float | None = None
+    send_duration: float | None = None
+    receive_duration: float | None = None
+
+    # overall span
+    total_start: float | None = None
+    total_end: float | None = None
+    total_duration: float | None = None
+
+    # retry metadata
+    attempt_count: int = 0
+    retry_count: int = 0
+    total_backoff_time: float = 0.0
+    errors: list[str] = Field(default_factory=list)
+
+    # payload metadata
+    bytes_sent: int | None = None
+    bytes_received: int | None = None
+
+    @classmethod
+    def from_operation_timings(cls, timings: "P2POperationTimings") -> "P2PTimingDetail":
+        """Create from the mutable dataclass produced by the iroh Sender."""
+        return cls(
+            connection_duration=timings.connection_duration,
+            stream_open_duration=timings.stream_open_duration,
+            send_duration=timings.send_duration,
+            receive_duration=timings.receive_duration,
+            total_start=timings.total_start,
+            total_end=timings.total_end,
+            total_duration=timings.total_duration,
+            attempt_count=timings.attempt_count,
+            retry_count=timings.retry_count,
+            total_backoff_time=timings.total_backoff_time,
+            errors=list(timings.errors),
+            bytes_sent=timings.bytes_sent,
+            bytes_received=timings.bytes_received,
+        )
+
+
 class ActivationTiming(BaseModel):
     queue: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
     download: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
     forward: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
     backward: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
-    upload: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+    epistula: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+    p2p: P2PTimingDetail = Field(default_factory=P2PTimingDetail)
     publish: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+
+    # Sub-phases of backward() for last-layer bottleneck analysis
+    backward_gpu_setup: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+    backward_forward: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+    backward_loss: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+    backward_pass: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+    backward_grad_extract: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
+
+    # Sub-phase of download: S3 sample/target download (last layer only)
+    sample_download: ActivationTimingStage = Field(default_factory=ActivationTimingStage)
 
 
 class ActivationStats(BaseModel):
@@ -74,7 +137,7 @@ class StatsTracker:
     _forward_count: int = 0
     _backward_count: int = 0
     _download_bytes: int = 0
-    _upload_bytes: int = 0
+    _p2p_bytes: int = 0
     _activations: Deque[ActivationSample] = field(default_factory=deque)
     _loss_history: Deque[LossSample] = field(default_factory=lambda: deque(maxlen=50))
 
@@ -101,11 +164,35 @@ class StatsTracker:
             raise ValueError("byte_count must be non-negative")
         self._download_bytes += byte_count
 
-    def record_upload(self, byte_count: int) -> None:
-        """Add bytes uploaded."""
+    def record_p2p_transfer(self, byte_count: int) -> None:
+        """Add bytes transferred via P2P."""
         if byte_count < 0:
             raise ValueError("byte_count must be non-negative")
-        self._upload_bytes += byte_count
+        self._p2p_bytes += byte_count
+
+    def record_p2p_operation(
+        self,
+        activation_id: str,
+        timings: "P2POperationTimings",
+        *,
+        direction: str | None = None,
+    ) -> None:
+        """Record detailed P2P timing for an activation.
+
+        Populates the ``timing.p2p`` field on the activation's
+        ``ActivationStats`` with a full per-phase breakdown and also
+        updates the aggregate ``_p2p_bytes`` counter.
+
+        Args:
+            activation_id: The activation this operation belongs to.
+            timings: The mutable timing record filled by the Sender.
+            direction: Optional direction hint forwarded to
+                ``ensure_activation_stats``.
+        """
+        stats = self.ensure_activation_stats(activation_id, direction=direction)
+        stats.timing.p2p = P2PTimingDetail.from_operation_timings(timings)
+        if timings.bytes_received is not None:
+            self.record_p2p_transfer(timings.bytes_received)
 
     def record_loss(self, loss_value: float, *, timestamp: float | None = None) -> None:
         """Record a loss metric for last-layer miners."""
@@ -150,7 +237,7 @@ class StatsTracker:
         self._forward_count = 0
         self._backward_count = 0
         self._download_bytes = 0
-        self._upload_bytes = 0
+        self._p2p_bytes = 0
 
         # Clear history collections (preserving maxlen for _loss_history)
         self._activations.clear()
@@ -176,8 +263,8 @@ class StatsTracker:
         return self._download_bytes
 
     @property
-    def upload_bytes(self) -> int:
-        return self._upload_bytes
+    def p2p_bytes(self) -> int:
+        return self._p2p_bytes
 
     def activation_rate(self, *, window_seconds: float | None = None) -> float:
         """

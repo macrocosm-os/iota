@@ -11,18 +11,25 @@ from pydantic import BaseModel
 
 from common.models.api_models import ActivationResponse, GetActivationRequest
 from common import settings as common_settings
-from common.utils.exceptions import RateLimitException
+from common.utils.exceptions import ActivationHashMismatchError, RateLimitException
 from subnet.miner_api_client import MinerAPIClient
 from miner.training.activation_cache import ActivationCache, ActivationData
 from miner.state_manager import StateManager
 from miner.utils.activation_utils import download_sample
-from subnet.utils.s3_torch import download_tensor
+from miner.utils.activation_hash import compute_activation_hash, verify_activation_hash
 from subnet.model.model_mixin import ModelManager
 from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
 from miner import settings as miner_settings
 
+from common.iroh.timings import P2POperationTimings
 from miner.utils.stats import StatsTracker, tensor_num_bytes
+from common.iroh.p2p_protocol import P2PRequestError
+from miner.telemetry.metric_registry import S3_DOWNLOAD_SPEED_BYTES_PER_SEC
 from common.models.run_flags import RunFlags
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from miner.new_miner import Miner
 
 
 class DownloadedData(BaseModel):
@@ -48,6 +55,7 @@ class ActivationQueue:
         activation_cache: ActivationCache,
         mock: bool,
         run_flags: RunFlags,
+        miner: "Miner | None" = None,
     ):
         self._miner_api_client: MinerAPIClient = miner_api_client
         self._state_manager: StateManager = state_manager
@@ -55,6 +63,7 @@ class ActivationQueue:
         self._stats_tracker: StatsTracker | None = None
         self._mock = mock
         self._run_flags = run_flags
+        self._miner = miner  # Reference to miner for P2P operations
 
         self._queue_lock: asyncio.Lock = asyncio.Lock()
         self._forward_queue: deque[ActivationData] = deque()
@@ -67,6 +76,35 @@ class ActivationQueue:
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker for dashboard metrics."""
         self._stats_tracker = tracker
+
+    def _reshape_mock_activations(self, input_activations: torch.Tensor) -> torch.Tensor:
+        """Normalize downloaded activations to the configured mock input width."""
+        batch_size = common_settings.MINI_BATCH_SIZE
+        target_dim = common_settings.MOCK_MODEL_INPUT_DIM
+
+        if input_activations.numel() % batch_size != 0:
+            raise ValueError(
+                "Mock activation size is not divisible by MINI_BATCH_SIZE. "
+                f"numel={input_activations.numel()}, mini_batch_size={batch_size}"
+            )
+
+        input_activations = input_activations.reshape(batch_size, -1)
+        current_dim = input_activations.shape[-1]
+
+        if current_dim == target_dim:
+            return input_activations
+
+        if current_dim > target_dim:
+            logger.warning("Mock activation width mismatch; truncating features " f"from {current_dim} to {target_dim}")
+            return input_activations[:, :target_dim].contiguous()
+
+        logger.warning("Mock activation width mismatch; right-padding features " f"from {current_dim} to {target_dim}")
+        padding = torch.zeros(
+            (batch_size, target_dim - current_dim),
+            dtype=input_activations.dtype,
+            device=input_activations.device,
+        )
+        return torch.cat([input_activations, padding], dim=1).contiguous()
 
     def __len__(self) -> int:
         """Get the number of activations in the queue."""
@@ -275,12 +313,15 @@ class ActivationQueue:
                     logger.warning("Timeout downloading activation -- skipping")
                     continue
                 except asyncio.CancelledError:
-                    logger.warning("Download task cancelled -- skipping")
-                    continue
+                    logger.warning("Download task cancelled -- propagating for shutdown")
+                    raise
                 except (LayerStateException, MinerNotRegisteredException) as e:
                     logger.warning(f"Anticipated exception has occurred while downloading activations: {e}")
                     self._cancel_tasks(tasks=download_tasks, completed_tasks=completed_tasks)
                     raise
+                except P2PRequestError as e:
+                    logger.warning(f"P2P activation unavailable -- skipping: {e}")
+                    continue
                 except Exception as e:
                     logger.error(f"Error downloading activation -- skipping: {e}")
                     continue
@@ -315,9 +356,7 @@ class ActivationQueue:
                         self._forward_queue.append(entry)
 
     async def _download_activations(self, activation_response: ActivationResponse) -> DownloadedData:
-        """Download an activation from the API and return it."""
-        # TODO: check if we actually need to download samples and tensors DIRECT to CUDA since these are loaded to CUDA
-        # during their respective passes either way
+        """Download an activation from the API (via P2P or S3) and return it."""
         with logger.contextualize(activation_id=activation_response.activation_id):
             async with TimerLoggerMiner(
                 name="download_activations",
@@ -326,8 +365,11 @@ class ActivationQueue:
             ):
                 try:
                     start_time = time.time()
+                    input_hash = None
+
                     # Download the input activations
                     if activation_response.direction == "forward" and self._state_manager.layer == 0:
+                        # Layer 0 always downloads samples from S3 (no P2P for initial data)
                         input_activations = await asyncio.wait_for(
                             download_sample(
                                 download_url=activation_response.presigned_download_url,
@@ -339,34 +381,33 @@ class ActivationQueue:
                             timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
                         )
                     else:
-                        input_activations = await asyncio.wait_for(
-                            download_tensor(
-                                path=activation_response.presigned_download_url,
-                                device="cpu",
-                                run_flags=self._run_flags,
-                            ),
-                            timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
-                        )
-                        if not self._mock:
-                            input_activations = input_activations.reshape(
-                                common_settings.MINI_BATCH_SIZE,
-                                common_settings.SEQUENCE_LENGTH,
-                                self._model_manager.model_config.get("bottleneck_dim")
-                                or self._model_manager.model_config["emb_dim"],
+                        # P2P download for all inter-miner activations
+                        if not activation_response.source_node_id:
+                            raise RuntimeError(
+                                f"No source_node_id for activation {activation_response.activation_id} - "
+                                f"P2P routing required but orchestrator did not provide producer node ID"
                             )
-                        else:
-                            input_activations = input_activations.reshape(
-                                common_settings.MINI_BATCH_SIZE,
-                                100,
+                        if not self._miner:
+                            raise RuntimeError(
+                                f"P2P not initialized for activation {activation_response.activation_id} - "
+                                f"miner reference not set in activation queue"
                             )
+                        input_activations, input_hash = await self._download_activation_p2p(activation_response)
+
+                    # Store input hash for later submission (if we got one from P2P)
+                    if input_hash and self._miner:
+                        await self._miner.store_input_hash(activation_response.activation_id, input_hash)
 
                     # Download the sample for last layer miners as well
                     sample_activations = None
+                    sample_download_start = None
+                    sample_download_end = None
                     if (
                         activation_response.direction == "forward"
                         and self._state_manager.layer == self._model_manager.model_metadata["n_splits"] - 1
                     ):
                         logger.debug("Last layer miner, downloading sample activations")
+                        sample_download_start = time.time()
                         sample_activations = await asyncio.wait_for(
                             download_sample(
                                 download_url=activation_response.target_download_url,
@@ -377,6 +418,7 @@ class ActivationQueue:
                             ),
                             timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
                         )
+                        sample_download_end = time.time()
                     total_bytes = tensor_num_bytes(input_activations) + tensor_num_bytes(sample_activations)
                     if self._stats_tracker is not None:
                         self._stats_tracker.record_download(total_bytes)
@@ -389,6 +431,15 @@ class ActivationQueue:
                         stats.timing.download.start = start_time
                         stats.timing.download.end = end_time
                         stats.timing.download.duration = end_time - start_time
+                        if sample_download_start is not None:
+                            stats.timing.sample_download.start = sample_download_start
+                            stats.timing.sample_download.end = sample_download_end
+                            stats.timing.sample_download.duration = sample_download_end - sample_download_start
+                    download_duration = end_time - start_time
+                    if download_duration > 0 and total_bytes > 0:
+                        S3_DOWNLOAD_SPEED_BYTES_PER_SEC.labels(layer_idx=str(self._state_manager.layer)).set(
+                            total_bytes / download_duration
+                        )
                     return DownloadedData(
                         activation_response=activation_response,
                         input_activations=input_activations,
@@ -399,6 +450,8 @@ class ActivationQueue:
                     asyncio.CancelledError,
                     LayerStateException,
                     MinerNotRegisteredException,
+                    ActivationHashMismatchError,
+                    P2PRequestError,
                 ):
                     # Just raise these expected errors to be caught by the caller
                     raise
@@ -406,6 +459,75 @@ class ActivationQueue:
                     # For these unexpected errors, we want the stack trace
                     logger.exception(f"Failed downloading activation {activation_response.activation_id}: {e}")
                     raise
+
+    async def _download_activation_p2p(self, activation_response: ActivationResponse) -> tuple[torch.Tensor, str]:
+        """Download activation via P2P and verify hash."""
+        activation_id = activation_response.activation_id
+        # Use source_activation_id for P2P request - this is the ID the producer cached
+        # activation_id is the new ID assigned by orchestrator for this layer
+        source_activation_id = activation_response.source_activation_id or activation_id
+        source_node_id = activation_response.source_node_id
+        expected_hash = activation_response.expected_input_hash
+
+        logger.debug(
+            f"Downloading activation {activation_id} via P2P from {source_node_id[:16]}... "
+            f"(requesting as {source_activation_id})"
+        )
+
+        # Retry logic and per-phase timeouts live inside
+        # Sender.send_message_bi() — we just pass a timings record so
+        # the Sender can populate it for us.
+        p2p_timings = P2POperationTimings()
+        tensor_bytes = await self._miner.request_activation_p2p(
+            activation_id=source_activation_id,  # Use the ID the producer knows
+            source_node_id=source_node_id,
+            timings=p2p_timings,
+        )
+
+        # Feed the per-phase breakdown into the stats tracker
+        if self._stats_tracker is not None:
+            self._stats_tracker.record_p2p_operation(
+                activation_id,
+                p2p_timings,
+                direction=activation_response.direction,
+            )
+
+        # Compute hash of received bytes
+        received_hash = compute_activation_hash(tensor_bytes)
+
+        # Verify against expected hash if provided
+        if expected_hash:
+            if not verify_activation_hash(tensor_bytes, expected_hash):
+                logger.error(
+                    f"HASH MISMATCH for activation {activation_id}: "
+                    f"expected={expected_hash[:16]}... received={received_hash[:16]}..."
+                )
+                raise ActivationHashMismatchError(
+                    activation_id=activation_id,
+                    expected_hash=expected_hash,
+                    received_hash=received_hash,
+                )
+            logger.debug(f"Hash verified for activation {activation_id}")
+
+        # Deserialize tensor from bytes
+        import io
+
+        buffer = io.BytesIO(tensor_bytes)
+        input_activations = torch.load(buffer, map_location="cpu", weights_only=True)
+
+        if not self._mock:
+            input_activations = input_activations.reshape(
+                common_settings.MINI_BATCH_SIZE,
+                common_settings.SEQUENCE_LENGTH,
+                self._model_manager.model_config.get("bottleneck_dim") or self._model_manager.model_config["emb_dim"],
+            )
+        else:
+            input_activations = input_activations.reshape(
+                common_settings.MINI_BATCH_SIZE,
+                100,
+            )
+
+        return input_activations, received_hash
 
     async def _split_responses(
         self, response: list[ActivationResponse]

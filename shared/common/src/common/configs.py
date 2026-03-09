@@ -21,10 +21,10 @@ LLAMA32_CONFIG_100M = {
         "high_freq_factor": 4.0,
         "original_context_length": 8192,
     },
-    # "model_splits": [[-1, 3], [3, -1]],
-    "model_splits": [[-1, 2], [2, 4], [4, -1]],
-    # "miners_per_layer": [1, 1],
-    "miners_per_layer": [1, 1, 1],
+    "model_splits": [[-1, 3], [3, -1]],
+    # "model_splits": [[-1, 2], [2, 4], [4, -1]],
+    "miners_per_layer": [1, 1],
+    # "miners_per_layer": [1, 1, 1],
     "s3_download_timeout": 180,
     "s3_upload_timeout": 180,
     "activation_timeout": 60,
@@ -56,7 +56,7 @@ LLAMA32_CONFIG_1B = {
     # "model_splits": [[-1, 5], [5, 10], [10, -1]],
     "model_splits": [[-1, 4], [4, 12], [12, -1]],  # Even splits
     # "model_splits": [[-1, 2], [2, 6], [6, 10], [10, 14], [14, -1]], # even splits
-    "miners_per_layer": [1, 1, 3],
+    "miners_per_layer": [1, 1, 1],
     "s3_download_timeout": 300,
     "s3_upload_timeout": 300,
     "activation_timeout": 60,

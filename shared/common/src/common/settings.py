@@ -9,6 +9,7 @@ if _dotenv_path.exists():
     load_dotenv(dotenv_path=_dotenv_path)
 
 # Generic settings
+MOCK = os.getenv("MOCK") == "True"
 LOG_FILE_ENABLED = os.getenv("LOG_FILE_ENABLED") == "True"
 
 # Bittensor settings
@@ -58,7 +59,8 @@ SHUFFLE_DATASET = True
 WEIGHT_DECAY = 1e-1
 GRAD_CLIP_NORM = 1.0
 LEARNING_RATE = 2 * 1e-4
-BETAS = (0.9, 0.95)
+MOMENTUM_DECAY = 1.0
+BETAS = (0.9, 0.95)  # IMPORTANT: Beta1 is stage-dependent for NAdam, it will not be read from the settings.
 EPS = 1e-8
 TOTAL_TRAIN_STEPS = 100_000_000
 LR_WARMUP_START_FACTOR = 1  # 5e-3
@@ -77,6 +79,11 @@ MIN_FORWARD_ACTIVATIONS_IN_QUEUE = 2
 MINI_BATCH_SIZE = 32
 MINI_BATCH_ACCUMULATION_COUNT = 4
 SEQUENCE_LENGTH = 800
+
+# Local mock model settings
+MOCK_MODEL_INPUT_DIM = int(os.getenv("MOCK_MODEL_INPUT_DIM", "100"))
+MOCK_MODEL_HIDDEN_DIM = int(os.getenv("MOCK_MODEL_HIDDEN_DIM", "32"))
+MOCK_MODEL_BOTTLENECK_DIM = int(os.getenv("MOCK_MODEL_BOTTLENECK_DIM", "16"))
 
 # Epoch level sync settings
 DOWNLOAD_BATCH_SIZE = 50
