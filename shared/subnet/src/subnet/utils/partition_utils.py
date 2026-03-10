@@ -4,7 +4,7 @@ import os
 from typing import Literal
 
 from common import settings as common_settings
-from common.utils.exceptions import NanInfWarning
+from common.utils.exceptions import NanInfWarning, WeightPartitionException
 from common.utils.partitions import MinerPartition
 from common.utils.s3_utils import filter_exceptions
 from common.utils.partitions import get_start_and_end_indices
@@ -186,12 +186,24 @@ async def download_merged_partitions(
                 partition_download_error_counter += BATCH_DOWNLOAD_SIZE
                 continue
 
-        logger.debug(
-            f"Downloaded {total_parts - partition_download_error_counter} / {total_parts} partitions inside download_partitions"
+        successful_downloads = total_parts - partition_download_error_counter
+        logger.debug(f"Downloaded {successful_downloads} / {total_parts} partitions inside download_partitions")
+        download_pct = (
+            (total_shard_elements_downloaded / target_tensor.numel()) * 100 if target_tensor.numel() > 0 else 0
         )
         logger.info(
-            f"download_partitions downloaded {total_shard_elements_downloaded} / {target_tensor.numel()} ({(total_shard_elements_downloaded/target_tensor.numel())*100}%) {download_type}"
+            f"download_partitions downloaded {total_shard_elements_downloaded} / {target_tensor.numel()} ({download_pct}%) {download_type}"
         )
+
+        # Protect against partial downloads for weights: if any partition shards
+        # failed, the resulting tensor is a mix of old and new weights which causes
+        # the miner to diverge from the rest of the network.
+        if download_pct < common_settings.MIN_PARTITION_DOWNLOAD_SUCCESS_PCT and download_type == "weights":
+            raise WeightPartitionException(
+                f"Partial weight download: {partition_download_error_counter}/{total_parts} "
+                f"partition shards failed to download ({download_pct:.1f}% coverage). "
+                f"Refusing to apply incomplete weights to prevent miner divergence. Please check your network connection and try again."
+            )
 
         # Cast the model weights and optimizer state to the correct device.
         target_tensor: torch.Tensor = target_tensor.to(device)

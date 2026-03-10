@@ -38,11 +38,23 @@ T = TypeVar("T")
 # instead of tearing down the entire iroh node (which kills *all*
 # connections to healthy peers).
 _CONNECTION_SCOPED_PATTERNS = (
+    # quinn ConnectionError variants
     "connection lost",
     "closed by peer",
     "timed out",
-    "stream closed",
     "reset by peer",
+    "locally closed",
+    "application closed",
+    "version mismatch",
+    # quinn WriteError / ReadError variants
+    "stream closed",
+    "stopped by peer",
+    # Discovery/addressing failures are about a specific remote peer being
+    # unreachable, not a local node problem.  Resetting the entire node
+    # would needlessly kill connections to other healthy peers.
+    "no addressing information",
+    "discovery produced no results",
+    "discovery service failed",
 )
 
 

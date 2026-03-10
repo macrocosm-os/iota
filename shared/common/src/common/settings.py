@@ -95,3 +95,5 @@ CREATORS_PAYOUT_COLDKEY_PLACEHOLDER = (
     if NETWORK == "test"
     else "5DUS9gRskdxSLES9y4pF5iay2f8DWSFHe1ArT8CySGs36NMH"
 )
+
+MIN_PARTITION_DOWNLOAD_SUCCESS_PCT = 98.0  # TODO: Make this dynamic based on the model config?
