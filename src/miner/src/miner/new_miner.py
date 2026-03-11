@@ -32,6 +32,7 @@ from miner.utils.partition_merging import (
 from miner import settings as miner_settings
 from miner.state_manager import StateManager
 from miner.utils.utils import (
+    collect_system_data,
     create_metadata,
     upload_file,
     upload_tensor,
@@ -407,9 +408,17 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
             if self.miner_api_client.layer_state == LayerPhase.TRAINING:
                 if self.need_to_pull_weights:
-                    if self.model_manager.epoch_on_registration == 1:
+                    # Only skip weight download on the very first epoch for miners that
+                    # registered at epoch 1 (no prior merge has happened yet).
+                    # epoch_counter is 0 before the first merge completes; after that,
+                    # merged weights always exist and must be downloaded.
+                    first_epoch_no_weights = (
+                        self.model_manager.epoch_on_registration == 1 and self.model_manager.epoch_counter == 0
+                    )
+                    if first_epoch_no_weights:
                         logger.info(
-                            f"Miner {self.hotkey[:8]} registered on epoch 1 - no merged weights to download, proceeding with current model weights"
+                            f"Miner {self.hotkey[:8]} registered on epoch 1 and has not completed a merge yet"
+                            " - no merged weights to download, proceeding with current model weights"
                         )
                     else:
                         try:
@@ -642,6 +651,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             run_id=best_run.run_id,
             register_as_metagraph_miner=True,
             p2p_node_id=self.p2p_node_id,
+            system_data=collect_system_data(),
         )
         response: MinerRegistrationResponse = await self.miner_api_client.register_miner_request(
             register_miner_request=register_request

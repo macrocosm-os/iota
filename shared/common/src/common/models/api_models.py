@@ -274,6 +274,7 @@ class RegisterMinerRequest(BaseModel):
     register_as_metagraph_miner: bool = True
     enclave_payload: EnclaveGetKeyIdResponse | None = None
     p2p_node_id: str  # P2P node ID for direct peer communication (required)
+    system_data: str | None = None  # MinerSystemData JSON for non-attestation device info
 
 
 class PayoutColdkeyRequest(BaseModel):

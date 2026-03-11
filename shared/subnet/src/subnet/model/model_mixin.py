@@ -27,7 +27,8 @@ class MockModel(torch.nn.Module):
         self.activation = torch.nn.ReLU()
 
     def forward(self, x):
-        x = torch.rand(common_settings.MINI_BATCH_SIZE, 100).to(torch.bfloat16)
+        batch_size = x.shape[0] if x is not None else common_settings.MINI_BATCH_SIZE
+        x = torch.rand(batch_size, 100).to(torch.bfloat16)
         return x, {}
 
     def backward(

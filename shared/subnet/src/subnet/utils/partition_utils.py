@@ -4,7 +4,7 @@ import os
 from typing import Literal
 
 from common import settings as common_settings
-from common.utils.exceptions import NanInfWarning
+from common.utils.exceptions import NanInfWarning, WeightPartitionException
 from common.utils.partitions import MinerPartition
 from common.utils.s3_utils import filter_exceptions
 from common.utils.partitions import get_start_and_end_indices
@@ -85,6 +85,9 @@ async def download_merged_partitions(
         f"Downloading {download_type} for layer {layer}. Target tensor shape: {target_tensor.shape} with {num_partitions} partitions"
     )
     partition_download_error_counter: int = 0
+
+    # Total parts is the number of partitions that have been uploaded to the db,
+    # and will not always be equal to the expect number calculated from calculate_n_partitions
     total_parts: int = len(merged_partitions) if merged_partitions else 0
 
     if not merged_partitions:
@@ -95,7 +98,6 @@ async def download_merged_partitions(
         # Check for nans and infs in the weights
         check_for_nans_and_infs(target_tensor, "current weights", exception_type=NanInfWarning)
 
-        total_tensors_downloaded: int = 0
         total_shard_elements_downloaded: int = 0
 
         BATCH_DOWNLOAD_SIZE = (
@@ -177,8 +179,6 @@ async def download_merged_partitions(
                     target_tensor[start_idx:end_idx] = tensor_shard
 
                     total_shard_elements_downloaded += tensor_shard.numel()
-                    total_tensors_downloaded += 1
-
                     logger.debug(f"Applied partition {partition.chunk_number}: {download_type}[{start_idx}:{end_idx}]")
 
             except Exception as e:
@@ -186,12 +186,22 @@ async def download_merged_partitions(
                 partition_download_error_counter += BATCH_DOWNLOAD_SIZE
                 continue
 
-        logger.debug(
-            f"Downloaded {total_parts - partition_download_error_counter} / {total_parts} partitions inside download_partitions"
-        )
+        successful_downloads = total_parts - partition_download_error_counter
+        logger.debug(f"Downloaded {successful_downloads} / {total_parts} partitions inside download_partitions")
+        download_pct = (successful_downloads / total_parts) * 100
         logger.info(
-            f"download_partitions downloaded {total_shard_elements_downloaded} / {target_tensor.numel()} ({(total_shard_elements_downloaded/target_tensor.numel())*100}%) {download_type}"
+            f"download_partitions downloaded {total_shard_elements_downloaded} / {target_tensor.numel()} ({download_pct}%) {download_type}"
         )
+
+        # Protect against partial downloads for weights: if any partition shards
+        # failed, the resulting tensor is a mix of old and new weights which causes
+        # the miner to diverge from the rest of the network.
+        if download_pct < common_settings.MIN_PARTITION_DOWNLOAD_SUCCESS_PCT and download_type == "weights":
+            raise WeightPartitionException(
+                f"Partial weight download: {successful_downloads}/{total_parts} "
+                f"partition shards successfully downloaded ({download_pct:.1f}% coverage). "
+                f"Refusing to apply partial weights to prevent miner divergence. Please check your network connection and try again."
+            )
 
         # Cast the model weights and optimizer state to the correct device.
         target_tensor: torch.Tensor = target_tensor.to(device)
