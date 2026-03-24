@@ -53,6 +53,7 @@ class ModelMetadata(BaseModel):
     n_splits: int | None = None
     tokenizer_name: str | None = None
     effective_batch_size: int | None = None
+    mini_batch_accumulation_count: int | None = None
     grad_clip_norm: float | None = None
     total_train_steps: int | None = None
     lr: LearningRateMetadata | None = None

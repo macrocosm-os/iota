@@ -27,7 +27,8 @@ class MockModel(torch.nn.Module):
         self.activation = torch.nn.ReLU()
 
     def forward(self, x):
-        x = torch.rand(common_settings.MINI_BATCH_SIZE, 100).to(torch.bfloat16)
+        batch_size = x.shape[0] if x is not None else common_settings.MINI_BATCH_SIZE
+        x = torch.rand(batch_size, 100).to(torch.bfloat16)
         return x, {}
 
     def backward(
@@ -213,7 +214,7 @@ class ModelManager:
 
             output_activations, state = self.model(input_activations)
 
-            logger.info(
+            logger.debug(
                 f"output activations with shape {output_activations.shape} for {self.logger_attributes['hotkey'][:8]} on layer {layer}"
             )
 
@@ -508,6 +509,7 @@ class ModelManager:
             self.layer = None
             self.device = None
             self.logger_attributes = None
+            self.epoch_counter = 0
 
             # clear all the gpu memory and all torch related objects
             _clean_gpu_memory()

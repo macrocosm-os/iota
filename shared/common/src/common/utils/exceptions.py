@@ -86,3 +86,11 @@ class MinerFrozenException(MinerBlockedException):
 
 class MinerInitializingException(MinerBlockedException):
     """Raised when orchestrator reports miner is still initializing."""
+
+
+class MinerResetException(Exception):
+    """Raised when a miner needs to reset and re-register (e.g. persistent OOM)."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
