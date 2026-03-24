@@ -12,14 +12,14 @@ from common.utils.gpu_process_utils import kill_stale_gpu_processes, cleanup_sta
 logger.remove()
 logger.add(
     sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSSSSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level> | <magenta>{extra}</magenta>",
-    level="DEBUG",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <yellow><b>[MINER]</b></yellow> | <level>{level: <8}</level> | <cyan>{name}:{line}</cyan> | <level>{message}</level> | <magenta>{extra}</magenta>",
+    level=common_settings.LOG_LEVEL,
     colorize=True,
 )
 if common_settings.LOG_FILE_ENABLED:
     logger.add(
         f"../../logs/{miner_settings.WALLET_NAME}.log",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSSSSS} | {level: <8} | {name}:{function}:{line} | {message} | {extra}",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | [MINER] | {level: <8} | {name}:{line} | {message} | {extra}",
         level="DEBUG",
         rotation="10 MB",
         retention="10 days",

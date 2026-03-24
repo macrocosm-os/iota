@@ -349,7 +349,7 @@ def log_gpu_memory_usage(note: str):
     gpu_device.synchronize()
     total_memory = gpu_device.total_memory() / 1024**3  # GB
     allocated_memory = gpu_device.allocated_memory() / 1024**3  # GB
-    logger.info(f"GPU memory usage: {allocated_memory:.2f}GB / {total_memory:.2f}GB -- {note}")
+    logger.debug(f"GPU memory usage: {allocated_memory:.2f}GB / {total_memory:.2f}GB -- {note}")
 
     if allocated_memory > total_memory * 0.8:  # If more than 80% already used
         logger.warning(f"High GPU memory usage detected: {allocated_memory:.2f}GB -- {note}")

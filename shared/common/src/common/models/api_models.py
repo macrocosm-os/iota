@@ -33,7 +33,7 @@ class FileUploadResponse(BaseModel):
 
 class FileUploadRequest(BaseModel):
     num_parts: int
-    file_type: Literal["weights", "optimizer_state", "activation", "weights_metadata", "local_optimizer_state"]
+    file_type: Literal["weights", "optimizer_state", "activation", "weights_metadata"]
     multipart: bool = True
 
     @model_validator(mode="after")
@@ -57,7 +57,7 @@ class SyncActivationAssignmentsRequest(BaseModel):
 class WeightUpdate(BaseModel):
     weights_path: str
     weights_metadata_path: str
-    attestation: "MinerAttestationPayload | EnclaveSignResponse | None" = None
+    attestation: "MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None" = None
 
 
 class WeightSubmitResponse(BaseModel):
@@ -80,7 +80,7 @@ class LayerOptimizerStateResponse(BaseModel):
 
 class SubmitMergedPartitionsRequest(BaseModel):
     partitions: list[MinerPartition]
-    attestation: "MinerAttestationPayload | EnclaveSignResponse | None" = None
+    attestation: "MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None" = None
 
 
 class MinerRegistrationResponse(BaseModel):
@@ -238,8 +238,20 @@ class MinerAttestationPayload(BaseModel):
     encrypted_attestation: str | None = Field(default=None, repr=False)
 
 
+class MountedAttestationPayload(BaseModel):
+    schema_version: int
+    key_id: str
+    public_key_base64: str
+    payload_base64: str
+    signature_der_base64: str
+    payload_sha256_base64: str
+    alg: KeySignerAlg
+    challenge_id: str | None = None
+
+
 class AttestationChallengeRequest(BaseModel):
-    action: Literal["weights", "merged_partitions"]
+    action: Literal["registration", "weights", "merged_partitions"]
+    run_id: str | None = None
 
 
 class AttestationChallengeResponse(BaseModel):
@@ -249,7 +261,7 @@ class AttestationChallengeResponse(BaseModel):
 
 
 class RequestAttestationChallengeResponse(BaseModel):
-    action: Literal["weights", "merged_partitions"]
+    action: Literal["registration", "weights", "merged_partitions"]
     attestation_challenge_blob: str
     self_checks: list[str]
     crypto: str
@@ -261,7 +273,7 @@ class SubmitActivationRequest(BaseModel):
     activation_id: str | None = None
     activation_path: str | None = None
     activation_stats: dict[str, Any] | None = None
-    attestation: MinerAttestationPayload | EnclaveSignResponse | None = None
+    attestation: MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None = None
     # P2P hash verification fields
     input_activation_hash: str | None = None  # Sampled hash of the input activation we received
     output_activation_hash: str | None = None  # Sampled hash of the output activation we're sending
@@ -269,11 +281,12 @@ class SubmitActivationRequest(BaseModel):
 
 class RegisterMinerRequest(BaseModel):
     run_id: str
-    attestation: MinerAttestationPayload | EnclaveSignResponse | None = None
+    attestation: MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None = None
     coldkey: str | None = None
     register_as_metagraph_miner: bool = True
     enclave_payload: EnclaveGetKeyIdResponse | None = None
     p2p_node_id: str  # P2P node ID for direct peer communication (required)
+    system_data: str | None = None  # MinerSystemData JSON (gpus, chip_info, bandwidth, etc.)
 
 
 class PayoutColdkeyRequest(BaseModel):
@@ -306,6 +319,7 @@ ServerCapability = Literal[
     "training.state",
     "register.status",
     "register.best_run",
+    "attestation.collect",
     "enclave.get_key_id",
     "enclave.sign",
     "enclave.doctor",
@@ -321,6 +335,8 @@ NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES: Final[tuple[ServerCapability, ...]] =
     # Registration messages
     "register.status",
     "register.best_run",
+    # Rich host attestation messages
+    "attestation.collect",
     # Secure enclave messages
     "enclave.get_key_id",
     "enclave.sign",
@@ -393,4 +409,11 @@ class EnclaveSignResponse(BaseModel):
     signature_der_base64: str
     alg: KeySignerAlg
     challenge_id: Optional[str] = None
-    public_key_base64: Optional[str] = None
+    public_key_base64: Optional[str] = Field(default=None, exclude=True, repr=False)
+
+
+class MountedAttestationRequest(BaseModel):
+    challengeBase64: str
+    challengeId: Optional[str] = None
+    schemaVersion: Optional[int] = None
+    dpKeychain: Optional[bool] = None

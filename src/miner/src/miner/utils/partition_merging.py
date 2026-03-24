@@ -3,7 +3,7 @@ import copy
 from bittensor_wallet import Keypair
 from common import settings as common_settings
 from common.models.miner_models import ChunkMetadata
-from common.models.api_models import CompleteFileUploadResponse, SubmittedWeightsAndOptimizerPresigned
+from common.models.api_models import SubmittedWeightsAndOptimizerPresigned
 from common.utils.exceptions import WeightPartitionException
 from common.utils.partitions import MinerPartition
 from common.utils.s3_utils import filter_exceptions
@@ -157,6 +157,10 @@ async def filter_bad_metadata(
         }
     }
     """
+    logger.info(
+        f"filter_bad_metadata: fetching metadata from {len(submitted_weights_and_optimizers)} miners "
+        f"for {len(partitions)} partitions"
+    )
     # Collect valid metadata from all packets
     valid_metadata: dict[str, dict[int, ChunkMetadata]] = {}
     results = await asyncio.gather(
@@ -177,6 +181,9 @@ async def filter_bad_metadata(
         logger.warning("No valid metadata found")
         return {}
 
+    logger.info(
+        f"filter_bad_metadata: {len(valid_metadata)}/{len(submitted_weights_and_optimizers)} miners had valid metadata"
+    )
     # Compare all metadata objects to each other and find the most common pattern
     agreement_counts: dict[str, int] = {}
     for path1, meta1 in valid_metadata.items():
@@ -194,6 +201,7 @@ async def filter_bad_metadata(
     if filtered_count > 0:
         logger.warning(f"Filtered out {filtered_count} packets due to metadata disagreements")
 
+    logger.info(f"filter_bad_metadata: {len(filtered_metadata)} miners passed filter and will be used for merging")
     return filtered_metadata
 
 
@@ -326,7 +334,6 @@ async def merge_partition_batch(
     partition_batch: list[MergingPartition],
     filtered_metadata: dict[str, dict[int, dict[str, ChunkMetadata]]],
     old_model: torch.nn.Module,
-    local_optimizer_state: torch.optim.Optimizer,
     num_partitions: int,
     weights_length: int,
     device: str,
@@ -336,7 +343,6 @@ async def merge_partition_batch(
 
     optimizer_shapes = None
     valid_partitions = []
-    local_optimizer_total_states = get_total_optimizer_state_size(local_optimizer_state)
 
     for partition in partition_batch:
         old_model_copy = None
@@ -387,13 +393,9 @@ async def merge_partition_batch(
 
             if optimizer_shapes is None:
                 optimizer_shapes = get_optimizer_tensor_shapes(outer_optimizer)
+
             optimizer_start_idx, optimizer_end_idx = await get_start_and_end_indices(
                 tensor_length=total_states,
-                num_sections=num_partitions,
-                target_section=partition.new_partition.chunk_number,
-            )
-            local_optimizer_start_idx, local_optimizer_end_idx = await get_start_and_end_indices(
-                tensor_length=local_optimizer_total_states,
                 num_sections=num_partitions,
                 target_section=partition.new_partition.chunk_number,
             )
@@ -444,9 +446,6 @@ async def merge_partition_batch(
             partition.new_weights = torch.nn.utils.parameters_to_vector(old_model_copy.parameters())[
                 weight_start_idx:weight_end_idx
             ]
-            partition.local_optimizer_state = extract_optimizer_state_section(
-                local_optimizer_state, local_optimizer_start_idx, local_optimizer_end_idx
-            )
             partition.new_optimizer_state = extract_optimizer_state_section(
                 outer_optimizer, optimizer_start_idx, optimizer_end_idx
             )
@@ -504,6 +503,11 @@ def get_partition_batch(batch_index: int, partitions: list[MinerPartition]) -> l
 async def download_previous_optimizer_state_for_partition_batch(
     batch_partitions: list[MergingPartition],
 ) -> list[MergingPartition]:
+    n_with_old = sum(1 for p in batch_partitions if p.old_partition is not None)
+    logger.info(
+        f"download_optimizer_state: {n_with_old}/{len(batch_partitions)} partitions have a previous optimizer state to download"
+    )
+
     async def download_previous_optimizer_state_for_partition(partition: MergingPartition) -> MergingPartition:
         if partition.old_partition is None:
             logger.warning(f"No old partition found for partition {partition.new_partition.chunk_number}")
@@ -527,6 +531,12 @@ async def download_pseudograds_for_partition_batch(
 ) -> list[MergingPartition]:
     downloaded_partitions = []
 
+    n_downloads = len(batch_partitions) * len(filtered_metadata)
+    logger.info(
+        f"download_pseudograds: {len(batch_partitions)} partitions × {len(filtered_metadata)} miners "
+        f"= {n_downloads} S3 downloads"
+    )
+
     async def download_weights_for_partition(partition: MergingPartition) -> MergingPartition:
         weights: list[torch.Tensor] = await asyncio.gather(
             *[
@@ -544,6 +554,9 @@ async def download_pseudograds_for_partition_batch(
         return_exceptions=True,
     )
     downloaded_partitions: list[MergingPartition] = filter_exceptions(downloaded_partitions)
+    logger.info(
+        f"download_pseudograds: {len(downloaded_partitions)}/{len(batch_partitions)} partitions downloaded successfully"
+    )
     return downloaded_partitions
 
 
@@ -556,15 +569,12 @@ async def upload_partition_batch(
     weight_uploads = []
     optimizer_state_uploads = []
     final_partitions = []
-    local_optimizer_state_uploads = []
     try:
         for partition in merged_partitions:
             assert partition.new_weights is not None, "New weights are None"
             assert partition.new_optimizer_state is not None, "New optimizer state is None"
-            assert partition.local_optimizer_state is not None, "Local optimizer state is None"
             assert len(partition.new_weights) > 0, "New weights are empty"
             assert len(partition.new_optimizer_state) > 0, "New optimizer state is empty"
-            assert len(partition.local_optimizer_state) > 0, "Local optimizer state is empty"
             weight_uploads.append(
                 upload_tensor(
                     tensor=partition.new_weights.detach().cpu(),
@@ -583,41 +593,28 @@ async def upload_partition_batch(
                     run_flags=run_flags,
                 )
             )
-            logger.debug(f"Local optimizer state: {partition.local_optimizer_state.shape}")
-            local_optimizer_state_uploads.append(
-                upload_tensor(
-                    tensor=partition.local_optimizer_state.detach().cpu(),
-                    miner_api_client=miner_api_client,
-                    file_type="local_optimizer_state",
-                    hotkey=hotkey,
-                    run_flags=run_flags,
-                )
-            )
+        total_requests = len(weight_uploads) + len(optimizer_state_uploads)
+        logger.info(
+            f"upload_partition_batch: uploading {len(merged_partitions)} partitions "
+            f"= {total_requests} S3 uploads ({len(weight_uploads)} weights + {len(optimizer_state_uploads)} optimizer)"
+        )
         logger.debug(f"Weight uploads before upload: {len(weight_uploads)}")
         logger.debug(f"Optimizer state uploads before upload: {len(optimizer_state_uploads)}")
-        logger.debug(f"Local optimizer state uploads before upload: {len(local_optimizer_state_uploads)}")
 
-        # Upload all weights at once
-        weight_uploads: list[CompleteFileUploadResponse] = filter_exceptions(
-            await asyncio.gather(*weight_uploads, return_exceptions=True)
-        )
-        optimizer_state_uploads: list[CompleteFileUploadResponse] = filter_exceptions(
-            await asyncio.gather(*optimizer_state_uploads, return_exceptions=True)
-        )
-        local_optimizer_state_uploads: list[CompleteFileUploadResponse] = filter_exceptions(
-            await asyncio.gather(*local_optimizer_state_uploads, return_exceptions=True)
-        )
+        # Upload all tensors in parallel (weights, optimizer, local_optimizer all at once)
+        # filter_exceptions removes the same indices from all three lists jointly, so a failure
+        # in any one upload drops that partition from all three — no positional mismatch possible
+        n = len(merged_partitions)
+        raw_results = await asyncio.gather(*weight_uploads, *optimizer_state_uploads, return_exceptions=True)
+        weight_uploads, optimizer_state_uploads = filter_exceptions(raw_results[:n], raw_results[n : 2 * n])
         logger.debug(f"Weight uploads: {len(weight_uploads)}")
         logger.debug(f"Optimizer state uploads: {len(optimizer_state_uploads)}")
-        logger.debug(f"Local optimizer state uploads: {len(local_optimizer_state_uploads)}")
 
-        for weight_upload, optimizer_state_upload, local_optimizer_state_upload, partition in zip(
-            weight_uploads, optimizer_state_uploads, local_optimizer_state_uploads, merged_partitions
+        for weight_upload, optimizer_state_upload, partition in zip(
+            weight_uploads, optimizer_state_uploads, merged_partitions
         ):
             partition.new_partition.weight_path = weight_upload.object_path
             partition.new_partition.optimizer_state_path = optimizer_state_upload.object_path
-            partition.new_partition.local_optimizer_state_path = local_optimizer_state_upload.object_path
-
             final_partitions.append(partition.new_partition)
     except Exception as e:
         logger.exception(f"Error uploading partition batch: {e}")
