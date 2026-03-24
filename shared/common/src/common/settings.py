@@ -11,6 +11,7 @@ if _dotenv_path.exists():
 # Generic settings
 MOCK = os.getenv("MOCK") == "True"
 LOG_FILE_ENABLED = os.getenv("LOG_FILE_ENABLED") == "True"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
 
 # Bittensor settings
 __SPEC_VERSION__ = 30016
@@ -95,3 +96,5 @@ CREATORS_PAYOUT_COLDKEY_PLACEHOLDER = (
     if NETWORK == "test"
     else "5DUS9gRskdxSLES9y4pF5iay2f8DWSFHe1ArT8CySGs36NMH"
 )
+
+MIN_PARTITION_DOWNLOAD_SUCCESS_PCT = 90  # TODO: Make this dynamic based on the model config?

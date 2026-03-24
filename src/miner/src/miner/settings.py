@@ -78,8 +78,14 @@ LOCAL_BATCH_SIZE = int(
 PSEUDO_GRADIENTS_BATCH_SIZE = int(os.getenv("PSEUDO_GRADIENTS_BATCH_SIZE", "100"))
 
 # Determines whether the miner is mounted within a host electron app
-IS_MOUNTED = os.getenv("IS_MOUNTED") == "true"
+_electron_host_pid_raw = os.getenv("ELECTRON_HOST_PID")
+try:
+    ELECTRON_HOST_PID = int(_electron_host_pid_raw) if _electron_host_pid_raw else None
+except ValueError:
+    ELECTRON_HOST_PID = None
+IS_MOUNTED = ELECTRON_HOST_PID is not None or os.getenv("IS_MOUNTED") == "true"
 ELECTRON_VERSION = os.getenv("ELECTRON_VERSION")
+NODE_CONTROL_TOKEN = os.getenv("NODE_CONTROL_TOKEN")
 
 # Telemetry settings
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")

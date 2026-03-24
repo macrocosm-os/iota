@@ -56,7 +56,6 @@ class MinerPartition(BaseModel):
     weight_path: str | None = None
     optimizer_state_path: str | None = None
     other_miner_hotkey: str | None = None
-    local_optimizer_state_path: str | None = None
 
     def matches(self, other: "MinerPartition") -> bool:
         return (
