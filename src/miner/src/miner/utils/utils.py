@@ -1,6 +1,9 @@
 import asyncio
 import json
 import gzip
+import platform
+import subprocess
+import sys
 from urllib.parse import urlparse
 
 from typing import Literal, Optional
@@ -24,6 +27,94 @@ from loguru import logger
 from subnet.utils.vector_utils import check_for_nans_and_infs
 from subnet.miner_api_client import MinerAPIClient
 from common.models.run_flags import RUN_FLAGS, RunFlags
+
+
+def _sysctl(key: str) -> str | None:
+    """Read a single sysctl value, returning None on failure."""
+    try:
+        return subprocess.check_output(["sysctl", "-n", key], timeout=5).decode("utf-8").strip()
+    except Exception:
+        return None
+
+
+def run_speedtest() -> dict[str, float] | None:
+    """Run an upload/download speed test.
+
+    Returns ``{"download_mbps": ..., "upload_mbps": ...}`` or None on failure.
+    """
+    try:
+        import speedtest
+
+        logger.info("Running speedtest...")
+
+        st = speedtest.Speedtest(secure=True)
+        st.get_best_server()
+        download_bps = st.download()
+        upload_bps = st.upload()
+        bandwidth = {
+            "download_mbps": round(download_bps / 1_000_000, 2),
+            "upload_mbps": round(upload_bps / 1_000_000, 2),
+        }
+
+        logger.info(f"Speedtest completed with results: {bandwidth}")
+
+        return bandwidth
+    except Exception as e:
+        logger.debug(f"Failed to run speedtest: {e}")
+        return None
+
+
+def collect_system_data() -> str | None:
+    """Collect device info and return as MinerSystemData-compatible JSON."""
+    try:
+        machine = platform.machine()
+        gpus: list[str] = []
+        cpu_brand: str | None = None
+        cores: int | None = None
+        memory_gb: int | None = None
+
+        if sys.platform == "darwin":
+            cpu_brand = _sysctl("machdep.cpu.brand_string")
+            if not cpu_brand:
+                cpu_brand = platform.processor() or None
+            if cpu_brand:
+                gpus.append(cpu_brand)
+
+            ncpu = _sysctl("hw.ncpu")
+            if ncpu:
+                cores = int(ncpu)
+
+            memsize = _sysctl("hw.memsize")
+            if memsize:
+                memory_gb = int(memsize) // (1024**3)
+        else:
+            cpu_brand = platform.processor() or None
+
+        # CUDA: get GPU name
+        try:
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                if gpu_name:
+                    gpus.append(gpu_name)
+        except Exception:
+            pass
+
+        data: dict = {
+            "gpus": gpus,
+            "chip_info": {
+                "machine": machine,
+                "cpu": cpu_brand,
+                "cores": cores,
+                "memory_gb": memory_gb,
+            },
+        }
+        bandwidth = run_speedtest()
+        if bandwidth:
+            data["bandwidth"] = bandwidth
+        return json.dumps(data)
+    except Exception as e:
+        logger.debug(f"Failed to collect system data: {e}")
+        return None
 
 
 # OBSOLETE
@@ -213,7 +304,7 @@ async def upload_tensor(
     miner_api_client: MinerAPIClient,
     tensor: torch.Tensor,
     hotkey: Keypair,
-    file_type: Literal["activation", "weights", "optimizer_state", "local_optimizer_state"] = "activation",
+    file_type: Literal["activation", "weights", "optimizer_state"] = "activation",
     upload_urls: list[str] | None = None,
     object_name: str | None = None,
     run_flags: RunFlags = RUN_FLAGS,
@@ -226,7 +317,7 @@ async def upload_tensor(
         miner_api_client (MinerAPIClient): The miner API client.
         tensor (torch.Tensor): The tensor to upload.
         hotkey (Keypair): The hotkey of the miner.
-        file_type (Literal["activation", "weights", "optimizer_state", "local_optimizer_state"]): The type of file to upload.
+        file_type (Literal["activation", "weights", "optimizer_state"]): The type of file to upload.
         upload_urls (list[str] | None): The upload urls to use for the upload.
         object_name (str | None): The object name to use for the upload.
 
