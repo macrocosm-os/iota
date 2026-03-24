@@ -32,6 +32,7 @@ from miner.utils.partition_merging import (
 from miner import settings as miner_settings
 from miner.state_manager import StateManager
 from miner.utils.utils import (
+    collect_system_data,
     create_metadata,
     upload_file,
     upload_tensor,
@@ -56,8 +57,9 @@ from common.iroh import (
 from common.models.api_models import (
     AttestationChallengeResponse,
     EnclaveSignResponse,
-    MinerRegistrationResponse,
     MinerAttestationPayload,
+    MinerRegistrationResponse,
+    MountedAttestationPayload,
     RegisterMinerRequest,
     SubmittedWeightsAndOptimizerPresigned,
     WeightSubmitResponse,
@@ -70,6 +72,7 @@ from common.utils.exceptions import (
     LayerStateException,
     RateLimitException,
     MinerNotRegisteredException,
+    MinerResetException,
     RunFullException,
     NanInfException,
     NanInfWarning,
@@ -139,6 +142,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             electron_version=miner_settings.ELECTRON_VERSION,
         )
         self.need_to_pull_weights = True
+        self._weight_download_failures: int = 0
         self._needs_local_optimizer_state_download: bool = False
         self.training_phase: TrainingPhase = TrainingPhase(
             miner_api_client=self.miner_api_client,
@@ -152,7 +156,9 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         )
         self.stats_tracker = StatsTracker()
         self.training_phase.attach_stats_tracker(self.stats_tracker)
-        self._latest_attestation_payloads: dict[str, MinerAttestationPayload | EnclaveSignResponse] = {}
+        self._latest_attestation_payloads: dict[
+            str, MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse
+        ] = {}
         self.visualization_process: multiprocessing.Process | None = None
 
         # Telemetry
@@ -182,7 +188,9 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self._peer_semaphores_lock = asyncio.Lock()
         self._max_concurrent_per_peer = 2  # Based on benchmark: BI degrades at concurrency >= 5
 
-    async def _collect_attestation_payload(self, action: str) -> MinerAttestationPayload | EnclaveSignResponse | None:
+    async def _collect_attestation_payload(
+        self, action: str
+    ) -> MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None:
         if self.run_flags.attest.isOff():
             return None
 
@@ -200,12 +208,23 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
             if self.is_mounted:
                 challenge_id = json.loads(challenge_response.attestation_challenge_blob)["challenge_id"]
-                payload = await self.enclave_sign_with_purpose(
-                    purpose="attestation",
-                    payload=payload_base64_from_obj(challenge),
-                    challenge_id=challenge_id,
-                )
-                logger.debug(f"Signing attestation challenge {challenge_id} for action {action}")
+                challenge_base64 = payload_base64_from_obj(challenge)
+                try:
+                    payload = await self.collect_mounted_attestation(
+                        challenge_base64=challenge_base64,
+                        challenge_id=challenge_id,
+                    )
+                    logger.debug(f"Collecting mounted attestation challenge {challenge_id} for action {action}")
+                except Exception as mounted_exc:
+                    logger.warning(
+                        f"Mounted attestation collection failed for challenge {challenge_id}; falling back to enclave signature: {mounted_exc}"
+                    )
+                    payload = await self.enclave_sign_with_purpose(
+                        purpose="attestation",
+                        payload=challenge_base64,
+                        challenge_id=challenge_id,
+                    )
+                    logger.debug(f"Signing attestation challenge {challenge_id} for action {action}")
             else:
                 payload = await asyncio.to_thread(collect_attestation_payload, challenge)
 
@@ -407,9 +426,17 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
             if self.miner_api_client.layer_state == LayerPhase.TRAINING:
                 if self.need_to_pull_weights:
-                    if self.model_manager.epoch_on_registration == 1:
+                    # Only skip weight download on the very first epoch for miners that
+                    # registered at epoch 1 (no prior merge has happened yet).
+                    # epoch_counter is 0 before the first merge completes; after that,
+                    # merged weights always exist and must be downloaded.
+                    first_epoch_no_weights = (
+                        self.model_manager.epoch_on_registration == 1 and self.model_manager.epoch_counter == 0
+                    )
+                    if first_epoch_no_weights:
                         logger.info(
-                            f"Miner {self.hotkey[:8]} registered on epoch 1 - no merged weights to download, proceeding with current model weights"
+                            f"Miner {self.hotkey[:8]} registered on epoch 1 and has not completed a merge yet"
+                            " - no merged weights to download, proceeding with current model weights"
                         )
                     else:
                         try:
@@ -425,13 +452,34 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                         except MinerNotRegisteredException:
                             # Re-raise so training_loop can reset and re-register; do not retry download
                             raise
-                        except Exception as e:
-                            logger.exception(f"Error downloading and setting weights: {e}")
+                        except torch.cuda.OutOfMemoryError as e:
+                            self._weight_download_failures += 1
+                            torch.cuda.empty_cache()
+                            logger.error(
+                                f"Miner {self.hotkey[:8]} CUDA OOM downloading weights "
+                                f"(attempt {self._weight_download_failures}/3): {e}"
+                            )
+                            if self._weight_download_failures == 2:
+                                logger.error(
+                                    f"Miner {self.hotkey[:8]} hit {self._weight_download_failures} "
+                                    f"consecutive OOM failures — resetting to re-register"
+                                )
+                                self._weight_download_failures = 0
+                                raise MinerResetException("Persistent CUDA OOM during weight download") from e
+                            await asyncio.sleep(5)
+                            return
+
+                        except Exception:
+                            self._weight_download_failures += 1
                             logger.warning(
-                                f"Miner {self.hotkey[:8]} will NOT train until global weights are downloaded successfully... Retrying"
+                                f"Miner {self.hotkey[:8]} will NOT train until global weights "
+                                f"are downloaded successfully... Retrying "
+                                f"(attempt {self._weight_download_failures}/5)"
                             )
                             await asyncio.sleep(1)
                             return
+
+                        self._weight_download_failures = 0
 
                         # If miner is new to this layer, download global optimizer state (if feature enabled)
                         if self._needs_local_optimizer_state_download and self.run_flags.upload_optimizer_state.isOn():
@@ -485,6 +533,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     logger.info("🔄 Miner getting weight partition info")
                     weight_path_per_layer, partitions = await get_weight_partition_info(
                         layer=self.state_manager.layer, miner_api_client=self.miner_api_client
+                    )
+                    logger.info(
+                        f"🔄 Miner got weight partition info: {len(partitions)} partitions assigned, "
+                        f"{len(weight_path_per_layer)} miners submitted weights"
                     )
 
                     if not partitions:
@@ -540,6 +592,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 continue
             except MinerNotRegisteredException as e:
                 logger.info(f"🔄 Miner {self.hotkey[:8]} miner not registered error: {e}")
+                await self.reset_miner_state()
+                continue
+            except MinerResetException as e:
+                logger.warning(f"🔄 Miner {self.hotkey[:8]} needs reset: {e}")
                 await self.reset_miner_state()
                 continue
             except APIException as e:
@@ -619,6 +675,49 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         )
         await self.training_loop()
 
+    def _apply_registration_response(self, response: MinerRegistrationResponse) -> tuple[int, int]:
+        """
+        Validate and apply a registration response to miner state.
+
+        Returns:
+            (assigned_layer, current_epoch)
+        """
+        if response.layer is None:
+            raise Exception(f"Miner {self.hotkey[:8]} registered with no layer assigned, this should not happen")
+        if response.num_partitions is None:
+            raise Exception(f"Number of partitions is None for miner {self.hotkey[:8]}")
+
+        assigned_layer = int(response.layer)
+        current_epoch = int(response.current_epoch)
+
+        logger.debug(f"Number of partitions for miner {self.hotkey[:8]}: {response.num_partitions}")
+        self.model_manager.num_partitions = int(response.num_partitions)
+        self.num_partitions = int(response.num_partitions)
+
+        # TODO: clean these up
+        self.layer = assigned_layer
+        self.state_manager.layer = assigned_layer
+        self.state_manager.training_epoch_when_registered = current_epoch
+        self.state_manager.run_id = response.run_id
+        self.run_id = response.run_id
+        self.model_manager.epoch_on_registration = current_epoch
+        # Local merge-cycle count is per assignment; re-register / new run must not inherit the old value.
+        self.model_manager.epoch_counter = 0
+
+        self._update_run_flags(response.run_flags)
+
+        self.stats_tracker.reset()
+        self.stats_tracker.set_layer(assigned_layer)
+        self.stats_tracker.set_remote_epoch(current_epoch)
+        self.stats_tracker.set_run_id(response.run_id)
+
+        logger.success(
+            f"✅ Miner {self.hotkey[:8]} registered successfully in layer {assigned_layer} on training epoch {current_epoch}"
+        )
+        logger.debug(f"Run flags for miner {self.hotkey[:8]}: {self.run_flags}")
+
+        return assigned_layer, current_epoch
+
     async def register(self) -> tuple[dict, dict]:
         """Single registration attempt. Raises on failure for caller to retry."""
         logger.info(f"🔄 Attempting to fetch run info for miner {self.hotkey[:8]}...")
@@ -638,47 +737,36 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 "P2P must be initialized before registration."
             )
 
+        logger.info(f"Collecting system data (includes speedtest) for miner {self.hotkey[:8]}...")
+        system_data = collect_system_data()
+        if system_data:
+            try:
+                payload = json.loads(system_data)
+                if payload.get("bandwidth"):
+                    logger.info(f"Speedtest complete for miner {self.hotkey[:8]}: {payload['bandwidth']}")
+                else:
+                    logger.warning(
+                        f"No bandwidth in system data for miner {self.hotkey[:8]} (speedtest may have failed)"
+                    )
+            except json.JSONDecodeError:
+                pass
+        else:
+            logger.warning(f"Failed to collect system data for miner {self.hotkey[:8]}")
+
         register_request = RegisterMinerRequest(
             run_id=best_run.run_id,
             register_as_metagraph_miner=True,
             p2p_node_id=self.p2p_node_id,
+            system_data=system_data,
         )
         response: MinerRegistrationResponse = await self.miner_api_client.register_miner_request(
             register_miner_request=register_request
         )
         logger.info(f"Registered with P2P node ID: {self.p2p_node_id[:16]}...")
 
-        assigned_layer = int(response.layer)
-        current_epoch = int(response.current_epoch)
-
-        logger.debug(f"Number of partitions for miner {self.hotkey[:8]}: {response.num_partitions}")
-
-        self.model_manager.num_partitions = int(response.num_partitions)
-        self.num_partitions = int(response.num_partitions)
-
-        if response.layer is None:
-            raise Exception(f"Miner {self.hotkey[:8]} registered with no layer assigned, this should not happen")
-
-        # TODO: clean these up
-        self.layer = assigned_layer
-        self.state_manager.layer = assigned_layer
-        self.state_manager.training_epoch_when_registered = current_epoch
-        self.state_manager.run_id = response.run_id
-        self.run_id = response.run_id
-        self.model_manager.epoch_on_registration = current_epoch
-
-        self._update_run_flags(response.run_flags)
+        self._apply_registration_response(response)
         await self.register_set_status(status="registered")
 
-        self.stats_tracker.reset()
-        self.stats_tracker.set_layer(self.state_manager.layer)
-        self.stats_tracker.set_remote_epoch(current_epoch)
-        self.stats_tracker.set_run_id(response.run_id)
-
-        logger.success(
-            f"✅ Miner {self.hotkey[:8]} registered successfully in layer {self.state_manager.layer} on training epoch {current_epoch}"
-        )
-        logger.debug(f"Run flags for miner {self.hotkey[:8]}: {self.run_flags}")
         return response.model_cfg.model_dump(), response.model_metadata.model_dump()
 
     async def register_loop(self) -> tuple[dict, dict]:
@@ -823,6 +911,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 metadata: dict = create_metadata(tensor=pseudo_gradients, num_sections=self.num_partitions)
                 metadata["local_optimization_steps"] = self.training_phase.local_optimization_steps
 
+                logger.info(
+                    f"submit_weights: uploading weights for {self.num_partitions} partitions "
+                    f"(1 weights S3 upload + 1 metadata S3 upload + 1 API submit call)"
+                )
                 # Convert tensor to bytes, handling bfloat16 compatibility
                 path = await upload_tensor(
                     tensor=pseudo_gradients,
@@ -1073,9 +1165,31 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 submitted_weights_and_optimizers=weight_path_per_layer,
                 run_flags=self.run_flags,
             )
+            n_batches = min(miner_settings.N_PARTITION_BATCHES, len(partitions))
+            total_pseudograd_downloads = len(partitions) * len(filtered_metadata)
+            total_optimizer_downloads = len(partitions)
+            total_s3_uploads = len(partitions) * 3
+            logger.info(
+                f"merge_partitions: {len(partitions)} partitions across {n_batches} batches | "
+                f"{len(filtered_metadata)} miners contributing | "
+                f"expected requests: {len(weight_path_per_layer)} metadata + "
+                f"{total_pseudograd_downloads} pseudograd + "
+                f"{total_optimizer_downloads} optimizer downloads + "
+                f"{total_s3_uploads} S3 uploads + {n_batches} API submit calls"
+            )
+
+            async def submit_batch(final_partitions: list[MinerPartition]) -> None:
+                attestation_payload = await self._collect_attestation_payload(action="merged_partitions")
+                await self.miner_api_client.submit_merged_partitions(
+                    merged_partitions=final_partitions,
+                    attestation=attestation_payload,
+                )
+                logger.debug(f"{len(final_partitions)} batch partitions submitted")
+
+            submission_tasks: list[asyncio.Task] = []
             # Grab a batch of partitions to download the weights for
-            for batch in range(min(miner_settings.N_PARTITION_BATCHES, len(partitions))):
-                logger.debug(f"Merging batch {batch} of {min(miner_settings.N_PARTITION_BATCHES, len(partitions))}")
+            for batch in range(n_batches):
+                logger.debug(f"Merging batch {batch} of {n_batches}")
 
                 # Grab a batch of partitions to merge (no downloading yet)
                 batch_partitions: list[MergingPartition] = get_partition_batch(batch_index=batch, partitions=partitions)
@@ -1133,7 +1247,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     partition_batch=merging_partitions,
                     filtered_metadata=filtered_metadata,
                     old_model=old_model,
-                    local_optimizer_state=self.model_manager.optimizer,
                     weights_length=weights_length,
                     num_partitions=self.num_partitions,
                     device=device,
@@ -1142,7 +1255,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 logger.debug(f"{len(merged_partitions)} batch partitions merged")
                 log_gpu_memory_usage(note=f"after merging partitions on {device}")
 
-                # Upload the merged partitions to the database and return list of MinerPartition
+                # Upload the merged partitions to S3 and fire off submission in the background
                 final_partitions = await upload_partition_batch(
                     merged_partitions=merged_partitions,
                     hotkey=self.wallet.hotkey,
@@ -1150,18 +1263,15 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     run_flags=self.run_flags,
                 )
                 logger.debug(f"{len(final_partitions)} batch partitions uploaded")
-
-                # Submit the merged partitions to the database
-                attestation_payload = await self._collect_attestation_payload(action="merged_partitions")
-                await self.miner_api_client.submit_merged_partitions(
-                    merged_partitions=final_partitions,
-                    attestation=attestation_payload,
-                )
-                logger.debug(f"{len(final_partitions)} batch partitions submitted")
+                submission_tasks.append(asyncio.create_task(submit_batch(final_partitions)))
 
                 self.model_manager.model = self.model_manager.model.to(self.device)
 
                 del old_model
                 del merged_partitions  # TODO: @cassova: do a better job of cleaning this up
-                del final_partitions  # TODO: @cassova: do a better job of cleaning this up
+                del final_partitions
                 log_gpu_memory_usage(note="after merging partitions")
+
+            # Wait for all background submission tasks to complete
+            await asyncio.gather(*submission_tasks)
+            logger.debug(f"All {len(submission_tasks)} batch submission tasks completed")

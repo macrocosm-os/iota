@@ -13,6 +13,7 @@ from common.models.api_models import (
     AttestationChallengeResponse,
     LossReportRequest,
     MinerAttestationPayload,
+    MountedAttestationPayload,
     SubmitActivationRequest,
 )
 from common.models.run_flags import RunFlags, RUN_FLAGS
@@ -121,7 +122,7 @@ class ActivationPublisher:
                 },
                 hotkey=self._miner_api_client.hotkey.ss58_address[:8],
             ):
-                attestation_payload: MinerAttestationPayload | None = None
+                attestation_payload: MinerAttestationPayload | MountedAttestationPayload | None = None
                 if self._run_flags.attest.isOn():
                     try:
                         challenge = AttestationChallengeResponse(
@@ -132,11 +133,21 @@ class ActivationPublisher:
                         challenge_id = json.loads(attestation_challenge_blob)["challenge_id"]
 
                         if self.miner and self.miner.is_mounted:
-                            attestation_payload = await self.miner.enclave_sign_with_purpose(
-                                purpose="attestation",
-                                payload=payload_base64_from_obj(challenge),
-                                challenge_id=challenge_id,
-                            )
+                            challenge_base64 = payload_base64_from_obj(challenge)
+                            try:
+                                attestation_payload = await self.miner.collect_mounted_attestation(
+                                    challenge_base64=challenge_base64,
+                                    challenge_id=challenge_id,
+                                )
+                            except Exception as mounted_exc:
+                                logger.warning(
+                                    f"Mounted attestation collection failed for activation {activation_id}; falling back to enclave signature: {mounted_exc}"
+                                )
+                                attestation_payload = await self.miner.enclave_sign_with_purpose(
+                                    purpose="attestation",
+                                    payload=challenge_base64,
+                                    challenge_id=challenge_id,
+                                )
                         else:
                             attestation_payload = await asyncio.to_thread(
                                 collect_attestation_payload,

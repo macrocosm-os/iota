@@ -29,7 +29,7 @@ class CommonAPIClient:
         electron_version: str | None = None,
     ) -> dict:
         logger.opt(colors=True).debug(
-            f"\n<magenta>Making orchestrator request | method: {method} | path: {path}</magenta>"
+            f"<magenta>Making orchestrator request | method: {method} | path: {path}</magenta>"
         )
 
         headers = {}

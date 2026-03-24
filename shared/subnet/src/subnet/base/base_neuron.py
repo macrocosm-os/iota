@@ -83,12 +83,20 @@ class BaseNeuron:
             merged_partitions: list[MinerPartition] | BaseErrorModel = await client.get_merged_partitions(
                 hotkey=self.wallet.hotkey
             )
-            logger.debug(f"Merged partitions: {len(merged_partitions) if merged_partitions else 'None'}")
+
+            num_downloaded_partitions: int = len(merged_partitions) if merged_partitions else 0
+            logger.debug(f"Number of downloaded merged partitions: {num_downloaded_partitions}")
+
             if isinstance(merged_partitions, BaseErrorModel):
                 logger.error(
                     f"Error getting merged partitions {merged_partitions.error_name}: {merged_partitions.error_dict}"
                 )
                 raise RuntimeError(f"Failed to get merged partitions: {merged_partitions.error_name}") from None
+
+            if num_downloaded_partitions == 0:
+                # No merge artifact in cache yet (first epoch, new run, or layer cold start).
+                logger.info(f"No merged partitions for miner {self.hotkey[:8]} yet — keeping current model weights")
+                return None
 
             # Download new weights
             new_weights = await download_merged_partitions(

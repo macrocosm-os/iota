@@ -69,6 +69,20 @@ class TrainingPhase:
         self.miner = miner
         self._loss_on_cpu: bool = False
 
+    def _record_forward_timing(self, activation_data: ActivationData, start_time: float, end_time: float) -> None:
+        if self._stats_tracker is None:
+            return
+        stats = self._stats_tracker.ensure_activation_stats(
+            activation_data.activation_id,
+            direction=activation_data.direction,
+        )
+        stats.timing.forward.start = start_time
+        stats.timing.forward.end = end_time
+        stats.timing.forward.duration = end_time - start_time
+        stats.timing.forward.cache_len = len(self._cache)
+        stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
+        stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
+
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker and propagate to child components."""
         self._stats_tracker = tracker
@@ -92,7 +106,7 @@ class TrainingPhase:
                 await self._queue.check_if_training_is_complete()
 
                 if self._cache.is_full() and self._queue.next_activation_is_forward():
-                    logger.info(f"Activation cache is full. Waiting for backwards activations: {len(self._cache)}")
+                    logger.debug(f"Activation cache is full ({len(self._cache)}), waiting for backward activations")
                     await asyncio.sleep(1)
                     continue
 
@@ -161,8 +175,8 @@ class TrainingPhase:
                 if self._stats_tracker is not None:
                     self._stats_tracker.record_forward()
                 start_time = time.time()
-                logger.info(
-                    f"🚀 Starting FORWARD pass for layer {self._state_manager.layer} | Processing activation {activation_data.activation_id} | Miner: {self._hotkey[:8]}"
+                logger.debug(
+                    f"Starting FORWARD pass | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                 )
                 log_gpu_memory_usage(note="starting training forward pass")
                 if self._state_manager.layer == 0:
@@ -185,18 +199,7 @@ class TrainingPhase:
                     logger.debug(
                         f"Last layer miner, performing backward pass for activation {activation_data.activation_id}"
                     )
-                    end_time = time.time()
-                    if self._stats_tracker is not None:
-                        stats = self._stats_tracker.ensure_activation_stats(
-                            activation_data.activation_id,
-                            direction=activation_data.direction,
-                        )
-                        stats.timing.forward.start = start_time
-                        stats.timing.forward.end = end_time
-                        stats.timing.forward.duration = end_time - start_time
-                        stats.timing.forward.cache_len = len(self._cache)
-                        stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
-                        stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
+                    self._record_forward_timing(activation_data, start_time, end_time=time.time())
                     return await self.backward(activation_data=activation_data)
 
                 logger.debug(f"Forwarding activation of size {activation_data.input_activations.shape}")
@@ -210,22 +213,8 @@ class TrainingPhase:
                 logger.debug(f"Activation shape after forward: {output_activations_cpu.shape}")
                 log_gpu_memory_usage(note="after training forward pass")
 
-                # If we are not on the last layer, we just need to upload the activations
-                logger.info(
-                    f"output activations before upload with shape {output_activations_cpu.shape} for {self._hotkey[:8]} on layer {self._state_manager.layer}"
-                )
                 end_time = time.time()
-                if self._stats_tracker is not None:
-                    stats = self._stats_tracker.ensure_activation_stats(
-                        activation_data.activation_id,
-                        direction=activation_data.direction,
-                    )
-                    stats.timing.forward.start = start_time
-                    stats.timing.forward.end = end_time
-                    stats.timing.forward.duration = end_time - start_time
-                    stats.timing.forward.cache_len = len(self._cache)
-                    stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
-                    stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
+                self._record_forward_timing(activation_data, start_time, end_time)
 
                 layer_idx = str(self._state_manager.layer)
                 FORWARD_PASS_DURATION_SECONDS.labels(layer_idx=layer_idx).observe(end_time - start_time)
@@ -244,7 +233,7 @@ class TrainingPhase:
 
                 log_gpu_memory_usage(note="after training forward pass cleaning on non-last layer miner")
                 logger.success(
-                    f"✅ Successfully completed FORWARD pass for activation {activation_data.activation_id} on layer {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
+                    f"✅ FORWARD complete | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                 )
 
     async def backward(self, activation_data: ActivationData):
@@ -264,6 +253,10 @@ class TrainingPhase:
                 all_input_activations_grads = []
                 losses = []
 
+                logger.info(
+                    f"🔄 BACKWARD pass | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
+                )
+
                 # Sub-phase timing accumulators (accumulated across local batch iterations)
                 gpu_setup_total = 0.0
                 bwd_fwd_total = 0.0
@@ -273,10 +266,7 @@ class TrainingPhase:
 
                 for i in range(0, len(activation_data.input_activations), miner_settings.LOCAL_BATCH_SIZE):
                     log_gpu_memory_usage(
-                        note=f"after training forward pass cleaning on last layer miner with cach size of {len(self._cache)}"
-                    )
-                    logger.info(
-                        f"🔄 Starting BACKWARD pass for activation {activation_data.activation_id} | Layer: {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
+                        note=f"after training forward pass cleaning on last layer miner with cache size of {len(self._cache)}"
                     )
                     gpu_setup_start = time.time()
                     async with TimerLoggerMiner(name="moving to gpu", hotkey=self._hotkey[:8]):
@@ -326,10 +316,6 @@ class TrainingPhase:
 
                     log_gpu_memory_usage(note="after preparing activations on training backward pass")
 
-                    logger.info(
-                        f"output activations before backward with shape {output_activations_gpu.shape} for {self._hotkey[:8]} on layer {self._state_manager.layer}"
-                    )
-
                     # Compute loss; if targets download or loss computation fails, skip backward gracefully
                     if last_layer:
                         try:
@@ -354,7 +340,6 @@ class TrainingPhase:
                             )
                             return
 
-                    logger.debug(f"State: {state}")
                     bwd_pass_start = time.time()
                     async with TimerLoggerMiner(name="backward pass", hotkey=self._hotkey[:8]):
                         await self._model_manager._backward(
@@ -450,9 +435,13 @@ class TrainingPhase:
 
                         # Check if we need to perform a local optimization step
                         self.backwards_since_last_optim += 1
-                        if self.backwards_since_last_optim >= common_settings.MINI_BATCH_ACCUMULATION_COUNT:
+                        mini_batch_accumulation_count = (
+                            self._model_manager.model_metadata.get("mini_batch_accumulation_count")
+                            or common_settings.MINI_BATCH_ACCUMULATION_COUNT
+                        )
+                        if self.backwards_since_last_optim >= mini_batch_accumulation_count:
                             logger.info(
-                                f"🔄 Miner {self._hotkey[:8]} performing local optimization step after {common_settings.MINI_BATCH_ACCUMULATION_COUNT} backward passes"
+                                f"🔄 Local optimization step after {mini_batch_accumulation_count} backward passes | hotkey={self._hotkey[:8]}"
                             )
                             learning_rate = await self._miner_api_client.get_learning_rate()
                             await self._model_manager.local_optimization_step(learning_rate=learning_rate)
@@ -462,11 +451,11 @@ class TrainingPhase:
 
                             self.local_optimization_steps += 1
                             logger.success(
-                                f"✅ Miner {self._hotkey[:8]} completed local optimization step #{self.local_optimization_steps}"
+                                f"✅ Optimization step #{self.local_optimization_steps} | hotkey={self._hotkey[:8]}"
                             )
 
                         logger.success(
-                            f"✅ Successfully completed BACKWARD pass for activation {activation_data.activation_id} | Layer: {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
+                            f"✅ BACKWARD complete | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                         )
 
                 if self._stats_tracker is not None:
