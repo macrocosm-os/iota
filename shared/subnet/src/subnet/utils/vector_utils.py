@@ -68,7 +68,7 @@ def extract_optimizer_state_section(optimizer: torch.optim.Optimizer, start_idx:
             slice_end = min(end_idx - current_offset, flattened.numel())
 
             if slice_start < slice_end:
-                section_tensors.append(flattened[slice_start:slice_end])
+                section_tensors.append(flattened[slice_start:slice_end].cpu())
 
             current_offset = next_offset
 

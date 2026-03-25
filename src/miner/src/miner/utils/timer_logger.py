@@ -95,7 +95,7 @@ class TimerLoggerMiner(TimerLogger):
             _in_memory_events[self.hotkey].append(start_event)
 
         # Try to send to API (non-blocking)
-        logger.info(f"Sending start event to API: {start_event}")
+        logger.debug(f"Sending start event to API: {start_event}")
         await self._send_event_to_api(start_event)
 
         return self

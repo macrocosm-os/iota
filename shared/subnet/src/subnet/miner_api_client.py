@@ -331,7 +331,7 @@ class MinerAPIClient(CommonAPIClient):
             raise
 
     async def request_attestation_challenge(
-        self, action: Literal["weights", "merged_partitions"]
+        self, action: Literal["registration", "weights", "merged_partitions"], run_id: str | None = None
     ) -> RequestAttestationChallengeResponse | None:
         """Request a fresh attestation challenge for a specific action."""
         try:
@@ -339,7 +339,7 @@ class MinerAPIClient(CommonAPIClient):
                 method="POST",
                 path="/miner/request_attestation_challenge",
                 hotkey=self.hotkey,
-                body=AttestationChallengeRequest(action=action).model_dump(),
+                body=AttestationChallengeRequest(action=action, run_id=run_id).model_dump(),
                 is_mounted=self.is_mounted,
                 electron_version=self.electron_version,
             )

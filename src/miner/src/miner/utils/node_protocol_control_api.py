@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Literal, Optional
 from uuid import uuid4
 from loguru import logger
+from miner import settings as miner_settings
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +38,8 @@ from common.models.api_models import (
     EnclaveGetKeyIdResponse,
     EnclaveSignRequest,
     EnclaveSignResponse,
+    MountedAttestationPayload,
+    MountedAttestationRequest,
     RegisterSetBestRunRequest,
     RegisterSetBestRunResponse,
     RegisterSetStatusRequest,
@@ -54,8 +57,8 @@ KIND = Literal["hello", "welcome", "request", "response", "event", "error", "pin
 
 
 # Electron would connect with: ws://127.0.0.1:8010/ws?token=...
-# Currently not used
-ALLOWED_TOKEN: Optional[str] = None
+ALLOWED_TOKEN: Optional[str] = getattr(miner_settings, "NODE_CONTROL_TOKEN", None) or None
+EXPECTED_HOST_PID: Optional[int] = getattr(miner_settings, "ELECTRON_HOST_PID", None)
 
 
 def now_iso() -> str:
@@ -87,6 +90,7 @@ class Envelope(BaseModel):
 class HelloData(BaseModel):
     app: str
     appVersion: Optional[str] = None
+    pid: int
     capabilities: list[str] = Field(default_factory=list)
 
 
@@ -114,11 +118,13 @@ class ProtocolServer:
         self,
         *,
         allowed_token: Optional[str] = None,
+        expected_host_pid: Optional[int] = None,
         ping_interval_s: float = 10.0,
         ping_timeout_s: float = 20.0,
         request_timeout_s: float = 30.0,
     ):
         self.allowed_token = allowed_token
+        self.expected_host_pid = expected_host_pid
         self.ping_interval_s = ping_interval_s
         self.ping_timeout_s = ping_timeout_s
         self.request_timeout_s = request_timeout_s
@@ -253,6 +259,33 @@ class ProtocolServer:
         sig = await self.enclave_sign(key_id=init.key_id, payload=payload, dp_keychain=dp_keychain)
         return init, sig
 
+    async def attestation_collect(
+        self,
+        *,
+        challenge_base64: str,
+        challenge_id: Optional[str] = None,
+        schema_version: Optional[int] = None,
+        dp_keychain: Optional[bool] = None,
+    ) -> MountedAttestationPayload:
+        req = MountedAttestationRequest(
+            challengeBase64=challenge_base64,
+            challengeId=challenge_id,
+            schemaVersion=schema_version,
+            dpKeychain=dp_keychain,
+        ).model_dump(exclude_none=True)
+
+        resp_env = await self.request("attestation.collect", req)
+        return MountedAttestationPayload(
+            schema_version=resp_env.data["schemaVersion"],
+            key_id=resp_env.data["keyId"],
+            public_key_base64=resp_env.data["publicKeyX963Base64"],
+            payload_base64=resp_env.data["payloadBase64"],
+            signature_der_base64=resp_env.data["signatureDerBase64"],
+            payload_sha256_base64=resp_env.data["payloadSha256Base64"],
+            alg=resp_env.data["alg"],
+            challenge_id=challenge_id,
+        )
+
     # --- internal helpers ---
 
     async def _send_error(
@@ -294,17 +327,12 @@ class ProtocolServer:
             await ws.close(code=1008)  # policy violation
             return
 
-        await ws.accept()
-
         # Single active client
         async with self._client_lock:
             if self._client is not None:
-                try:
-                    await self._client.websocket.close(code=1012)  # service restart
-                except Exception:
-                    pass
-                self._client = None
-
+                await ws.close(code=1008)  # policy violation
+                return
+            await ws.accept()
             self._client = ClientState(websocket=ws, session_id=str(uuid4()))
 
         ping_task = asyncio.create_task(self._ping_loop(ws))
@@ -361,6 +389,29 @@ class ProtocolServer:
                     details={"validation": str(e)},
                 )
                 await ws.close(code=1003)
+                return
+
+            if hello.app != "macrocosmos-host":
+                await self._send_error(
+                    ws,
+                    name="hello",
+                    reply_to=env.id,
+                    code="forbidden",
+                    message="Unexpected host application identity",
+                )
+                await ws.close(code=1008)
+                return
+
+            if self.expected_host_pid is not None and hello.pid != self.expected_host_pid:
+                await self._send_error(
+                    ws,
+                    name="hello",
+                    reply_to=env.id,
+                    code="forbidden",
+                    message="Host PID did not match mounted parent PID",
+                    details={"expected_pid": self.expected_host_pid, "actual_pid": hello.pid},
+                )
+                await ws.close(code=1008)
                 return
 
             async with self._client_lock:
@@ -497,7 +548,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-protocol = ProtocolServer(allowed_token=ALLOWED_TOKEN)
+protocol = ProtocolServer(allowed_token=ALLOWED_TOKEN, expected_host_pid=EXPECTED_HOST_PID)
 
 
 @app.websocket("/ws")
@@ -517,7 +568,13 @@ async def health() -> Dict[str, Any]:
         session_id = c.session_id
     except Exception:
         pass
-    return {"ok": True, "connected": connected, "sessionId": session_id, "client": hello}
+    return {
+        "ok": True,
+        "connected": connected,
+        "sessionId": session_id,
+        "client": hello,
+        "expectedHostPid": protocol.expected_host_pid,
+    }
 
 
 @app.post("/enclave/get_key_id")
@@ -540,6 +597,20 @@ async def http_enclave_sign(req: EnclaveSignRequest) -> Dict[str, Any]:
         resp = await protocol.enclave_sign(
             key_id=req.keyId,
             payload=req.payloadBase64,
+            dp_keychain=req.dpKeychain,
+        )
+        return resp.model_dump()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/attestation/collect")
+async def http_attestation_collect(req: MountedAttestationRequest) -> Dict[str, Any]:
+    try:
+        resp = await protocol.attestation_collect(
+            challenge_base64=req.challengeBase64,
+            challenge_id=req.challengeId,
+            schema_version=req.schemaVersion,
             dp_keychain=req.dpKeychain,
         )
         return resp.model_dump()

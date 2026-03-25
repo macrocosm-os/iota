@@ -258,7 +258,7 @@ class ActivationQueue:
                 raise
 
             if len(response) == 0:
-                logger.warning("No activations received from orchestrator")
+                logger.debug("No activations received from orchestrator")
                 continue
 
             logger.debug(f"Response contains: {[(a.activation_id, a.direction) for a in response]}")
@@ -285,7 +285,7 @@ class ActivationQueue:
             forward_response = await self._filter_excess_forwards(forward_response=forward_response)
 
             if len(backward_response) == 0 and len(forward_response) == 0:
-                logger.warning("No activations to download")
+                logger.debug("No activations to download after filtering")
                 continue
 
             logger.debug(
