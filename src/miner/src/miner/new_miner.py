@@ -7,6 +7,8 @@ import sys
 import threading
 import time
 import webbrowser
+from common.snowpipe.messages.lifecycle_events import LifecycleEvent
+from common.utils.location_utils import resolve_node_location
 from common.utils.verify_enclave_signature import payload_base64_from_obj
 from loguru import logger
 from miner.utils.node_control_mixin import NodeControlMixin
@@ -58,6 +60,7 @@ from common.models.api_models import (
     EnclaveSignResponse,
     MinerRegistrationResponse,
     MinerAttestationPayload,
+    NodeLocation,
     RegisterMinerRequest,
     SubmittedWeightsAndOptimizerPresigned,
     WeightSubmitResponse,
@@ -169,6 +172,9 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.node_control_port = node_control_port or 8010
         self.node_control_process: multiprocessing.Process | None = None
         self.is_mounted = miner_settings.IS_MOUNTED
+
+        # Node location — resolved once at startup via IP geolocation
+        self._node_location: NodeLocation | None = None
 
         # P2P lifecycle manager (receiver subprocess + sender)
         self.p2p: P2PStack | None = None
@@ -642,6 +648,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             run_id=best_run.run_id,
             register_as_metagraph_miner=True,
             p2p_node_id=self.p2p_node_id,
+            location=self._node_location,
         )
         response: MinerRegistrationResponse = await self.miner_api_client.register_miner_request(
             register_miner_request=register_request
@@ -679,6 +686,23 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             f"✅ Miner {self.hotkey[:8]} registered successfully in layer {self.state_manager.layer} on training epoch {current_epoch}"
         )
         logger.debug(f"Run flags for miner {self.hotkey[:8]}: {self.run_flags}")
+
+        # Emit a location lifecycle event so geographic data is persisted to Snowflake
+        if self._node_location is not None and self.telemetry_service is not None:
+            location_event = LifecycleEvent(
+                type="node_location",
+                source_service="miner",
+                miner_hotkey=self.hotkey,
+                run_id=self.run_id,
+                event_category="node_location",
+                details=self._node_location.model_dump(),
+            )
+            self.telemetry_service.log(location_event)
+            logger.debug(
+                f"📍 Location event queued for telemetry: "
+                f"{self._node_location.city}, {self._node_location.country}"
+            )
+
         return response.model_cfg.model_dump(), response.model_metadata.model_dump()
 
     async def register_loop(self) -> tuple[dict, dict]:
@@ -900,6 +924,9 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         logger.info("🚀 Starting miner 🚀")
         try:
+            # Resolve node location from public IP (best-effort, non-blocking on failure)
+            self._node_location = await resolve_node_location()
+
             # Start P2P before registration so we have a node_id to register with
             await self._start_p2p()
             logger.info("P2P communication started")

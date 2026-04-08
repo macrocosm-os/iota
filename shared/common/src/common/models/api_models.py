@@ -10,6 +10,26 @@ from common.models.run_flags import RunFlags
 from common.utils.partitions import MinerPartition
 
 
+class NodeLocation(BaseModel):
+    """Geographic location of a node, resolved from its public IP address.
+
+    Populated at miner startup via IP geolocation (ip-api.com / ipinfo.io).
+    All fields are optional to ensure backward compatibility — if geolocation
+    fails, the miner still registers successfully; location is simply absent.
+    """
+
+    ip: str | None = None
+    country: str | None = None
+    country_code: str | None = None
+    region: str | None = None
+    city: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    timezone: str | None = None
+    isp: str | None = None
+    org: str | None = None
+
+
 class WeightsUploadResponse(BaseModel):
     urls: list[str]
     upload_id: str
@@ -274,6 +294,7 @@ class RegisterMinerRequest(BaseModel):
     register_as_metagraph_miner: bool = True
     enclave_payload: EnclaveGetKeyIdResponse | None = None
     p2p_node_id: str  # P2P node ID for direct peer communication (required)
+    location: NodeLocation | None = None  # Geographic location resolved from public IP at startup
 
 
 class PayoutColdkeyRequest(BaseModel):
