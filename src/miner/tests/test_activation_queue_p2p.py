@@ -7,6 +7,7 @@ from common.models.api_models import ActivationResponse
 from common.models.run_flags import RUN_FLAGS
 from common.settings import MINI_BATCH_SIZE
 from common.utils.exceptions import ActivationHashMismatchError
+from common.iroh.activation_push import ActivationPushMessage
 from miner.training.activation_cache import ActivationCache
 from miner.training.activation_queue import ActivationQueue
 from miner.utils.activation_hash import compute_activation_hash
@@ -22,7 +23,8 @@ class _DummyMinerAPIClient:
 
 
 class _DummyStateManager:
-    layer = 0
+    def __init__(self, layer: int = 0) -> None:
+        self.layer = layer
 
 
 class _FakeMiner:
@@ -57,7 +59,7 @@ async def test_download_activation_p2p_success():
     queue = ActivationQueue(
         miner_api_client=api_client,
         state_manager=_DummyStateManager(),
-        activation_cache=ActivationCache(api_client),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=fake_miner,
@@ -88,7 +90,7 @@ async def test_download_activation_p2p_uses_source_activation_id():
     queue = ActivationQueue(
         miner_api_client=api_client,
         state_manager=_DummyStateManager(),
-        activation_cache=ActivationCache(api_client),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=fake_miner,
@@ -119,7 +121,7 @@ async def test_download_activation_p2p_hash_mismatch():
     queue = ActivationQueue(
         miner_api_client=api_client,
         state_manager=_DummyStateManager(),
-        activation_cache=ActivationCache(api_client),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=fake_miner,
@@ -133,3 +135,61 @@ async def test_download_activation_p2p_hash_mismatch():
 
     with pytest.raises(ActivationHashMismatchError):
         await queue._download_activation_p2p(response)
+
+
+def test_validate_push_layer_accepts_matching_target() -> None:
+    queue = ActivationQueue(
+        miner_api_client=_DummyMinerAPIClient(),
+        state_manager=_DummyStateManager(layer=2),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        mock=True,
+        run_flags=RUN_FLAGS,
+        miner=None,
+    )
+    msg = ActivationPushMessage(
+        activation_id="a1",
+        direction="forward",
+        source_hotkey="hk",
+        tensor_bytes=b"",
+        target_layer=2,
+        source_layer=1,
+    )
+    assert queue._validate_push_layer_routing(msg) is True
+
+
+def test_validate_push_layer_rejects_mismatch() -> None:
+    queue = ActivationQueue(
+        miner_api_client=_DummyMinerAPIClient(),
+        state_manager=_DummyStateManager(layer=1),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        mock=True,
+        run_flags=RUN_FLAGS,
+        miner=None,
+    )
+    msg = ActivationPushMessage(
+        activation_id="a2",
+        direction="forward",
+        source_hotkey="hk",
+        tensor_bytes=b"",
+        target_layer=2,
+        source_layer=1,
+    )
+    assert queue._validate_push_layer_routing(msg) is False
+
+
+def test_validate_push_layer_legacy_without_target() -> None:
+    queue = ActivationQueue(
+        miner_api_client=_DummyMinerAPIClient(),
+        state_manager=_DummyStateManager(layer=5),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        mock=True,
+        run_flags=RUN_FLAGS,
+        miner=None,
+    )
+    msg = ActivationPushMessage(
+        activation_id="a3",
+        direction="forward",
+        source_hotkey="hk",
+        tensor_bytes=b"",
+    )
+    assert queue._validate_push_layer_routing(msg) is True

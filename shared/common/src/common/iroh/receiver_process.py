@@ -12,8 +12,6 @@ IPC design:
   - ``multiprocessing.Queue`` for child -> parent status messages
 """
 
-from __future__ import annotations
-
 import atexit
 import asyncio
 import hashlib
@@ -23,18 +21,12 @@ import signal
 import time
 from multiprocessing.managers import DictProxy, SyncManager
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
+from common.iroh.iroh_subprocess import IrohSubprocess, _mp_ctx
 from common.utils.gpu_process_utils import remove_shm_manifest, write_shm_manifest
-
-# Force 'spawn' to create a fresh Python interpreter for the child process.
-# The default 'fork' on Linux copies the parent's Rust tokio runtime and
-# iroh_ffi global state (already initialised by the PooledSender), which
-# causes Iroh.memory_with_options() to deadlock in the child.
-# freeze_support() in main_pool.py handles the frozen-binary case.
-_mp_ctx = multiprocessing.get_context("spawn")
 
 from common.iroh.p2p_protocol import (
     P2PResponseStatus,
@@ -62,9 +54,11 @@ def _receiver_worker(
     seed: str,
     max_message_size: int,
     metadata_dict: DictProxy,
-    status_queue: multiprocessing.Queue,
+    status_queue: "multiprocessing.Queue",
     cache_ttl: float,
     p2p_auth_timeout_ms: int = 30000,
+    peer_status_dict: DictProxy | None = None,
+    push_queue: "multiprocessing.Queue | None" = None,
 ) -> None:
     """Entry point for the receiver subprocess.
 
@@ -75,7 +69,18 @@ def _receiver_worker(
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
 
     try:
-        asyncio.run(_run_receiver(seed, max_message_size, metadata_dict, status_queue, cache_ttl, p2p_auth_timeout_ms))
+        asyncio.run(
+            _run_receiver(
+                seed,
+                max_message_size,
+                metadata_dict,
+                status_queue,
+                cache_ttl,
+                p2p_auth_timeout_ms,
+                peer_status_dict,
+                push_queue,
+            )
+        )
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -89,15 +94,50 @@ async def _run_receiver(
     seed: str,
     max_message_size: int,
     metadata_dict: DictProxy,
-    status_queue: multiprocessing.Queue,
+    status_queue: "multiprocessing.Queue",
     cache_ttl: float,
     p2p_auth_timeout_ms: int = 30000,
+    peer_status_dict: DictProxy | None = None,
+    push_queue: "multiprocessing.Queue | None" = None,
 ) -> None:
     """Async core of the receiver subprocess."""
     from common.iroh.receiver import Receiver
+    from common.iroh.router import P2PRouter
+    from common.iroh.activation_push import ActivationPushMessage
+    from common.models.peer_status import PeerStatusBroadcast
 
     receiver = Receiver(seed=seed, max_message_size=max_message_size)
+    router = P2PRouter()
 
+    @router.handler("/activation/push")
+    def handle_activation_push(msg: ActivationPushMessage, node_id: str) -> bytes:
+        """Forward incoming push activation to the parent process via queue.
+
+        Returns a single-byte ack (SUCCESS or ERROR) so the sender knows
+        whether the activation was enqueued.
+        """
+        from common.iroh.activation_push import encode_push_ack
+
+        if push_queue is not None:
+            try:
+                push_queue.put_nowait(msg)
+                logger.debug(f"Received /activation/push {msg.activation_id} from {node_id[:16]}...")
+                return encode_push_ack(P2PResponseStatus.SUCCESS)
+            except Exception as exc:
+                logger.warning(f"Failed to enqueue activation push {msg.activation_id}: {exc}")
+                return encode_push_ack(P2PResponseStatus.ERROR)
+        else:
+            logger.warning(f"Received /activation/push but no push_queue configured (from {node_id[:16]}...)")
+            return encode_push_ack(P2PResponseStatus.ERROR)
+
+    @router.handler("/peer/status")
+    def handle_peer_status(msg: PeerStatusBroadcast, node_id: str) -> None:
+        """Store incoming peer status broadcast in the shared dict."""
+        logger.debug(f"Received /peer/status from {msg.source_hotkey[:8]}... (node={node_id[:16]}...)")
+        if peer_status_dict is not None and msg.source_hotkey:
+            peer_status_dict[msg.source_hotkey] = (msg.model_dump(), time.time())
+
+    @router.default
     def handle_request(message: bytes, node_id: str) -> bytes:
         """Callback invoked by the Iroh protocol handler for each incoming request."""
         try:
@@ -152,7 +192,7 @@ async def _run_receiver(
         except Exception:
             pass
 
-    await receiver.start(callback_function=handle_request, on_unhealthy=on_unhealthy)
+    await receiver.start(router=router, on_unhealthy=on_unhealthy)
     status_queue.put(("started", receiver.node_id))
     await receiver.serve_forever()
 
@@ -162,13 +202,18 @@ async def _run_receiver(
 # ---------------------------------------------------------------------------
 
 
-class ReceiverProcess:
+class ReceiverProcess(IrohSubprocess):
     """Runs an Iroh Receiver in a child subprocess for fault isolation.
 
     The parent process owns the activation cache (SharedMemory blocks +
     metadata dict).  The subprocess only *reads* from them to serve
     incoming P2P requests.  When the subprocess becomes unhealthy we
     ``os.kill()`` it and spawn a fresh one — the cache is preserved.
+
+    When *external_metadata_dict* is provided the ReceiverProcess does **not**
+    create its own Manager or SharedMemory — it shares the caller-owned dict.
+    In that mode ``cache_activation`` must be called on the owner (e.g.
+    ``P2PStack``) rather than on this instance.
     """
 
     def __init__(
@@ -178,53 +223,53 @@ class ReceiverProcess:
         cache_ttl: float,
         max_cache_size: int = 100,
         p2p_auth_timeout_ms: int = 30000,
+        external_metadata_dict: DictProxy | None = None,
+        external_peer_status_dict: DictProxy | None = None,
+        push_queue: "multiprocessing.Queue | None" = None,
     ):
+        super().__init__(process_name="P2PReceiver")
         self._seed = seed
         self._max_message_size = max_message_size
         self._cache_ttl = cache_ttl
         self._max_cache_size = max_cache_size
         self._p2p_auth_timeout_ms = p2p_auth_timeout_ms
+        self._push_queue = push_queue
 
-        self._process: multiprocessing.Process | None = None
-        self._status_queue: multiprocessing.Queue = _mp_ctx.Queue()
+        # When external_metadata_dict is supplied we are NOT the owner: skip
+        # Manager creation and SharedMemory cleanup on stop().
+        self._owns_cache: bool = external_metadata_dict is None
         self._manager: SyncManager | None = None
-        self._metadata_dict: DictProxy | None = None
+        self._metadata_dict: DictProxy | None = external_metadata_dict
+        self._peer_status_dict: DictProxy | None = external_peer_status_dict
         self._shm_blocks: dict[str, SharedMemory] = {}
-        self._node_id: str | None = None
         self._atexit_registered: bool = False
 
-    # ── properties ────────────────────────────────────────────────
+    # ── abstract method implementations ──────────────────────────
 
-    @property
-    def node_id(self) -> str | None:
-        return self._node_id
+    def _worker_target(self) -> Callable[..., Any]:
+        return _receiver_worker
 
-    # ── lifecycle ─────────────────────────────────────────────────
+    def _build_process_args(self) -> tuple:
+        return (
+            self._seed,
+            self._max_message_size,
+            self._metadata_dict,
+            self._status_queue,
+            self._cache_ttl,
+            self._p2p_auth_timeout_ms,
+            self._peer_status_dict,
+            self._push_queue,
+        )
 
-    async def start(self) -> str:
+    # ── lifecycle (overrides) ────────────────────────────────────
+
+    async def start(self, timeout: float = 15.0) -> str:
         """Start the Manager, spawn the subprocess, and return the node_id."""
-        if self._manager is None:
+        if self._owns_cache and self._manager is None:
             self._manager = _mp_ctx.Manager()
             self._metadata_dict = self._manager.dict()
 
-        # Drain any leftover messages from a previous incarnation
-        self._drain_queue()
-
-        self._process = _mp_ctx.Process(
-            target=_receiver_worker,
-            args=(
-                self._seed,
-                self._max_message_size,
-                self._metadata_dict,
-                self._status_queue,
-                self._cache_ttl,
-                self._p2p_auth_timeout_ms,
-            ),
-            daemon=True,
-            name="P2PReceiver",
-        )
-        self._process.start()
-        logger.info(f"ReceiverProcess spawned (pid={self._process.pid})")
+        node_id = await super().start(timeout=timeout)
 
         # Register atexit handler so shared memory is cleaned up even if
         # the process exits without a graceful stop() (e.g. crash, SIGTERM).
@@ -232,32 +277,25 @@ class ReceiverProcess:
             atexit.register(self._atexit_cleanup)
             self._atexit_registered = True
 
-        # Wait for the subprocess to report its node_id
-        node_id = await self._wait_for_started(timeout=15.0)
-        self._node_id = node_id
-        logger.info(f"ReceiverProcess ready (node_id={node_id[:16]}...)")
         return node_id
 
     async def stop(self) -> None:
         """Terminate the subprocess and clean up all SharedMemory."""
-        self._kill_subprocess()
-        self._cleanup_all_shm()
+        await super().stop()
 
-        if self._manager is not None:
-            try:
-                self._manager.shutdown()
-            except Exception:
-                pass
-            self._manager = None
-            self._metadata_dict = None
-
-        self._node_id = None
-
-        # Clean up manifest and atexit handler
-        remove_shm_manifest()
-        if self._atexit_registered:
-            atexit.unregister(self._atexit_cleanup)
-            self._atexit_registered = False
+        if self._owns_cache:
+            self._cleanup_all_shm()
+            if self._manager is not None:
+                try:
+                    self._manager.shutdown()
+                except Exception:
+                    pass
+                self._manager = None
+                self._metadata_dict = None
+            remove_shm_manifest()
+            if self._atexit_registered:
+                atexit.unregister(self._atexit_cleanup)
+                self._atexit_registered = False
 
         logger.info("ReceiverProcess stopped and all SharedMemory cleaned up")
 
@@ -266,37 +304,7 @@ class ReceiverProcess:
 
         Same seed -> same node_id, so no orchestrator notification needed.
         """
-        logger.warning("ReceiverProcess restart: killing subprocess")
-        self._kill_subprocess()
-
-        # Drain stale messages
-        self._drain_queue()
-
-        # Spawn a new subprocess — it re-attaches to the existing
-        # metadata_dict and can immediately serve cached activations.
-        self._process = _mp_ctx.Process(
-            target=_receiver_worker,
-            args=(
-                self._seed,
-                self._max_message_size,
-                self._metadata_dict,
-                self._status_queue,
-                self._cache_ttl,
-                self._p2p_auth_timeout_ms,
-            ),
-            daemon=True,
-            name="P2PReceiver",
-        )
-        self._process.start()
-        logger.info(f"ReceiverProcess respawned (pid={self._process.pid})")
-
-        node_id = await self._wait_for_started(timeout=15.0)
-        self._node_id = node_id
-        logger.info(f"ReceiverProcess restarted (node_id={node_id[:16]}...)")
-        return node_id
-
-    def is_alive(self) -> bool:
-        return self._process is not None and self._process.is_alive()
+        return await super().restart(timeout=15.0)
 
     # ── activation cache (main process side) ──────────────────────
 
@@ -382,95 +390,3 @@ class ReceiverProcess:
         """Write current shared memory names to manifest for crash recovery."""
         names = [_shm_name(aid) for aid in self._shm_blocks]
         write_shm_manifest(names)
-
-    # ── internal helpers ──────────────────────────────────────────
-
-    def _kill_subprocess(self) -> None:
-        """Stop the child process: SIGTERM first, SIGKILL if it doesn't exit."""
-        if self._process is None:
-            return
-
-        pid = self._process.pid
-        if self._process.is_alive() and pid is not None:
-            try:
-                os.kill(pid, signal.SIGTERM)
-                logger.info(f"Sent SIGTERM to receiver subprocess (pid={pid})")
-            except ProcessLookupError:
-                self._process = None
-                return
-            except Exception as exc:
-                logger.warning(f"Failed to SIGTERM receiver subprocess (pid={pid}): {exc}")
-
-            # Give it a moment to exit gracefully
-            try:
-                self._process.join(timeout=3.0)
-            except Exception:
-                pass
-
-            if self._process.is_alive():
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    logger.warning(f"Sent SIGKILL to receiver subprocess (pid={pid}) after SIGTERM timeout")
-                except ProcessLookupError:
-                    pass
-                except Exception as exc:
-                    logger.warning(f"Failed to SIGKILL receiver subprocess (pid={pid}): {exc}")
-
-        # Reap the zombie
-        try:
-            self._process.join(timeout=5.0)
-        except Exception:
-            pass
-
-        self._process = None
-
-    def _drain_queue(self) -> None:
-        """Empty the status queue of stale messages."""
-        while True:
-            try:
-                self._status_queue.get_nowait()
-            except Exception:
-                break
-
-    async def _wait_for_started(self, timeout: float) -> str:
-        """Wait for the subprocess to send its (\"started\", node_id) message."""
-        loop = asyncio.get_running_loop()
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                msg = await asyncio.wait_for(
-                    loop.run_in_executor(None, self._status_queue.get, True, min(remaining, 1.0)),
-                    timeout=min(remaining, 2.0),
-                )
-            except (asyncio.TimeoutError, Exception):
-                # Check if process died
-                if self._process is not None and not self._process.is_alive():
-                    raise RuntimeError(f"Receiver subprocess died during startup (exit code={self._process.exitcode})")
-                continue
-
-            kind, value = msg
-            if kind == "started":
-                return value
-            elif kind == "error":
-                raise RuntimeError(f"Receiver subprocess error: {value}")
-            # Ignore other message types during startup
-
-        raise TimeoutError(f"Receiver subprocess did not start within {timeout}s")
-
-    def check_status_queue(self) -> list[tuple[str, str]]:
-        """Non-blocking drain of status messages from the subprocess.
-
-        Returns a list of (kind, value) tuples.  Used by P2PStack to
-        detect unhealthy events without blocking.
-        """
-        messages: list[tuple[str, str]] = []
-        while True:
-            try:
-                messages.append(self._status_queue.get_nowait())
-            except Exception:
-                break
-        return messages

@@ -1,17 +1,19 @@
 import asyncio
 from datetime import datetime
+import math
 import os
 from typing import Literal
 
 from common import settings as common_settings
-from common.utils.exceptions import NanInfWarning
+from common.utils.exceptions import NanInfWarning, WeightPartitionException
 from common.utils.partitions import MinerPartition
 from common.utils.s3_utils import filter_exceptions
 from common.utils.partitions import get_start_and_end_indices
-from pydantic import BaseModel
-import torch
-from platformdirs import user_data_dir
+from common.snowpipe.messages.training_metrics import TrainingMetric
 
+import torch
+from pydantic import BaseModel
+from platformdirs import user_data_dir
 
 from loguru import logger
 from subnet.utils.vector_utils import check_for_nans_and_infs
@@ -38,7 +40,6 @@ class MergingPartition(BaseModel):
     old_optimizer_state: torch.Tensor | None = None  # This is where the optimizer state from the previous run goes
     new_optimizer_state: torch.Tensor | None = None  # This is where the optimizer state from the new run goes
     new_weights: torch.Tensor | None = None  # This is where the weights from the new run goes
-    local_optimizer_state: torch.Tensor | None = None  # This is where the local optimizer state from the new run goes
 
 
 def get_cosine_similarity(old_shard: torch.Tensor, new_shard: torch.Tensor) -> float:
@@ -69,7 +70,10 @@ async def download_merged_partitions(
     device: str,
     layer: int = None,
     num_partitions: int = None,
-    download_type: Literal["weights", "optimizer_state", "local_optimizer_state"] = "weights",
+    download_type: Literal["weights", "optimizer_state"] = "weights",
+    telemetry_service=None,
+    miner_hotkey: str = None,
+    skip_cosine_validation: bool = False,
 ) -> torch.Tensor | None:
     """Downloads the weights and optimizer state for a given list of partitions.
 
@@ -85,6 +89,9 @@ async def download_merged_partitions(
         f"Downloading {download_type} for layer {layer}. Target tensor shape: {target_tensor.shape} with {num_partitions} partitions"
     )
     partition_download_error_counter: int = 0
+
+    # Total parts is the number of partitions that have been uploaded to the db,
+    # and will not always be equal to the expect number calculated from calculate_n_partitions
     total_parts: int = len(merged_partitions) if merged_partitions else 0
 
     if not merged_partitions:
@@ -95,7 +102,6 @@ async def download_merged_partitions(
         # Check for nans and infs in the weights
         check_for_nans_and_infs(target_tensor, "current weights", exception_type=NanInfWarning)
 
-        total_tensors_downloaded: int = 0
         total_shard_elements_downloaded: int = 0
 
         BATCH_DOWNLOAD_SIZE = (
@@ -121,15 +127,7 @@ async def download_merged_partitions(
                 downloaded_tensors = await asyncio.gather(
                     *[
                         download_tensor(
-                            (
-                                partition.weight_path
-                                if download_type == "weights"
-                                else (
-                                    partition.optimizer_state_path
-                                    if download_type == "optimizer_state"
-                                    else partition.local_optimizer_state_path
-                                )
-                            ),
+                            path=partition.weight_path,
                             device="cpu",
                             dtype=torch.bfloat16,
                         )
@@ -168,8 +166,48 @@ async def download_merged_partitions(
                         )
                     except Exception as e:
                         logger.warning(
-                            f"Error calculating cosine similarity for partition chunk {partition.chunk_number} for layer {layer} for {download_type} shard: {e}"
+                            f"Error calculating cosine similarity for partition chunk {partition.chunk_number} "
+                            f"for layer {layer} for {download_type} shard: {e}. Rejecting shard."
                         )
+                        partition_download_error_counter += 1
+                        continue
+
+                    # Reject shards with abnormally low cosine similarity (corrupted data)
+                    if (
+                        download_type == "weights"
+                        and not skip_cosine_validation
+                        and (
+                            math.isnan(cosine_similarity_tensor_shard)
+                            or cosine_similarity_tensor_shard < common_settings.MIN_COSINE_SIMILARITY_DOWNLOAD
+                        )
+                    ):
+                        logger.exception(
+                            f"REJECTED partition chunk {partition.chunk_number} for layer {layer}: "
+                            f"cosine similarity {cosine_similarity_tensor_shard:.6f} < "
+                            f"threshold {common_settings.MIN_COSINE_SIMILARITY_DOWNLOAD}. "
+                            f"Keeping old weights for this shard."
+                        )
+                        if telemetry_service is not None:
+                            try:
+                                telemetry_service.log(
+                                    TrainingMetric(
+                                        type="corrupted_partition_download",
+                                        source_service="miner",
+                                        miner_hotkey=miner_hotkey,
+                                        layer_idx=layer,
+                                        metric_name="cosine_similarity_rejected_shard",
+                                        metric_value={
+                                            "chunk_number": partition.chunk_number,
+                                            "cosine_similarity": cosine_similarity_tensor_shard,
+                                            "threshold": common_settings.MIN_COSINE_SIMILARITY_DOWNLOAD,
+                                        },
+                                    )
+                                )
+                            except Exception as e:
+                                logger.warning(f"Error logging corrupted partition download telemetry: {e}")
+
+                        partition_download_error_counter += 1
+                        continue
 
                     logger.debug(
                         f"{download_type} shard shape: {tensor_shard.shape}, expected start idx: {start_idx}, expected end idx: {end_idx}, range: {end_idx - start_idx}"
@@ -177,8 +215,6 @@ async def download_merged_partitions(
                     target_tensor[start_idx:end_idx] = tensor_shard
 
                     total_shard_elements_downloaded += tensor_shard.numel()
-                    total_tensors_downloaded += 1
-
                     logger.debug(f"Applied partition {partition.chunk_number}: {download_type}[{start_idx}:{end_idx}]")
 
             except Exception as e:
@@ -186,12 +222,22 @@ async def download_merged_partitions(
                 partition_download_error_counter += BATCH_DOWNLOAD_SIZE
                 continue
 
-        logger.debug(
-            f"Downloaded {total_parts - partition_download_error_counter} / {total_parts} partitions inside download_partitions"
-        )
+        successful_downloads = total_parts - partition_download_error_counter
+        logger.debug(f"Downloaded {successful_downloads} / {total_parts} partitions inside download_partitions")
+        download_pct = (successful_downloads / total_parts) * 100
         logger.info(
-            f"download_partitions downloaded {total_shard_elements_downloaded} / {target_tensor.numel()} ({(total_shard_elements_downloaded/target_tensor.numel())*100}%) {download_type}"
+            f"download_partitions downloaded {total_shard_elements_downloaded} / {target_tensor.numel()} ({download_pct}%) {download_type}"
         )
+
+        # Protect against partial downloads for weights: if any partition shards
+        # failed, the resulting tensor is a mix of old and new weights which causes
+        # the miner to diverge from the rest of the network.
+        if download_pct < common_settings.MIN_PARTITION_DOWNLOAD_SUCCESS_PCT and download_type == "weights":
+            raise WeightPartitionException(
+                f"Partial weight download: {successful_downloads}/{total_parts} "
+                f"partition shards successfully downloaded ({download_pct:.1f}% coverage). "
+                f"Refusing to apply partial weights to prevent miner divergence. Please check your network connection and try again."
+            )
 
         # Cast the model weights and optimizer state to the correct device.
         target_tensor: torch.Tensor = target_tensor.to(device)

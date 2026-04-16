@@ -1,6 +1,7 @@
 from typing import Any, Literal
 from common.models.api_models import (
     GetActivationRequest,
+    HeartbeatResponse,
     LayerOptimizerStateResponse,
     RunInfo,
     ActivationResponse,
@@ -14,7 +15,6 @@ from common.models.api_models import (
     FileUploadResponse,
     SubmitActivationRequest,
     SubmittedWeightsAndOptimizerPresigned,
-    SyncActivationAssignmentsRequest,
     WeightSubmitResponse,
     WeightUpdate,
     AttestationChallengeRequest,
@@ -114,6 +114,21 @@ class MinerAPIClient(CommonAPIClient):
         except Exception as e:
             logger.error(f"Error getting layer state: {e}")
             raise
+
+    async def heartbeat(self, expected_phase: LayerPhase | None = None) -> HeartbeatResponse:
+        path = "/miner/heartbeat"
+        if expected_phase is not None:
+            path = f"{path}?expected_phase={expected_phase.value}"
+        response = await CommonAPIClient.orchestrator_request(
+            method="GET",
+            path=path,
+            hotkey=self.hotkey,
+            body={},
+            is_mounted=self.is_mounted,
+            electron_version=self.electron_version,
+        )
+        parsed_response = self.parse_response(response)
+        return HeartbeatResponse.model_validate(parsed_response)
 
     async def get_activations(self, get_activation_request: GetActivationRequest) -> list[ActivationResponse] | dict:
         try:
@@ -227,21 +242,6 @@ class MinerAPIClient(CommonAPIClient):
             logger.error(f"Error submitting activation: {e}")
             raise
 
-    async def sync_activation_assignments(self, activation_ids: list[str]) -> dict[str, bool]:
-        try:
-            response = await CommonAPIClient.orchestrator_request(
-                method="POST",
-                path="/miner/sync_activation_assignments",
-                hotkey=self.hotkey,
-                body=SyncActivationAssignmentsRequest(activation_ids=activation_ids).model_dump(),
-                is_mounted=self.is_mounted,
-                electron_version=self.electron_version,
-            )
-            return self.parse_response(response)
-        except Exception as e:
-            logger.error(f"Error checking if activation is active: {e}")
-            raise
-
     async def get_partitions(self) -> list[int] | dict:
         """Get the partition indices for a given hotkey."""
         try:
@@ -291,21 +291,6 @@ class MinerAPIClient(CommonAPIClient):
             logger.error(f"Error notifying orchestrator of state call: {e}")
             raise
 
-    async def get_learning_rate(self) -> float | dict:
-        """Get the current learning rate."""
-        try:
-            response: float = await CommonAPIClient.orchestrator_request(
-                method="GET",
-                path="/miner/learning_rate",
-                hotkey=self.hotkey,
-                is_mounted=self.is_mounted,
-                electron_version=self.electron_version,
-            )
-            return self.parse_response(response)
-        except Exception as e:
-            logger.error(f"Error getting learning rate: {e}")
-            raise
-
     async def submit_merged_partitions(
         self,
         merged_partitions: list[MinerPartition],
@@ -331,7 +316,7 @@ class MinerAPIClient(CommonAPIClient):
             raise
 
     async def request_attestation_challenge(
-        self, action: Literal["weights", "merged_partitions"]
+        self, action: Literal["registration", "weights", "merged_partitions"], run_id: str | None = None
     ) -> RequestAttestationChallengeResponse | None:
         """Request a fresh attestation challenge for a specific action."""
         try:
@@ -339,7 +324,7 @@ class MinerAPIClient(CommonAPIClient):
                 method="POST",
                 path="/miner/request_attestation_challenge",
                 hotkey=self.hotkey,
-                body=AttestationChallengeRequest(action=action).model_dump(),
+                body=AttestationChallengeRequest(action=action, run_id=run_id).model_dump(),
                 is_mounted=self.is_mounted,
                 electron_version=self.electron_version,
             )

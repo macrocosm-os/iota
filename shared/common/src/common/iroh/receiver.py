@@ -5,11 +5,12 @@ import hashlib
 
 from iroh import Iroh, NodeOptions, iroh_ffi
 from loguru import logger
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 from common.iroh.cleanup import _force_free_iroh_node
 from common.iroh.monitored_node import MonitoredNode, OnUnhealthy
 from common.iroh.protocol import BiProtocolFactory, P2PCallback, PROTOCOL_ID_BI, PROTOCOL_ID_UNI, UniProtocolFactory
+from common.iroh.router import P2PRouter
 from common.iroh.serializer import Serializer
 from common.iroh.settings import DEFAULT_MAX_MESSAGE_SIZE
 
@@ -21,12 +22,13 @@ class Receiver(BaseModel):
     node: Iroh | None = None
     _monitored_node: MonitoredNode | None = PrivateAttr(default=None)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     async def start(
         self,
-        callback_function: P2PCallback,
+        router: P2PRouter | None = None,
+        *,
+        callback_function: P2PCallback | None = None,
         serializer: Serializer | None = None,
         request_model_cls: type[BaseModel] | None = None,
         on_unhealthy: OnUnhealthy | None = None,
@@ -34,27 +36,46 @@ class Receiver(BaseModel):
     ) -> Receiver:
         """Initialise the Iroh node and set ``self.node_id``.
 
+        Pass a :class:`P2PRouter` for decorator-based dispatch, or
+        ``callback_function`` for the legacy single-callback mode.
+
         After this returns the receiver is listening for incoming
         connections but the caller is **not** blocked.  Call
         :meth:`serve_forever` if you want to block until shutdown.
         """
+        if router is None and callback_function is None:
+            raise ValueError("Either router or callback_function must be provided")
+
         iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
         secret_key = hashlib.sha256(self.seed.encode()).digest() if self.seed else None
 
-        factory_kwargs = dict(
-            callback_function=callback_function,
-            max_message_size=self.max_message_size,
-            serializer=serializer,
-            request_model_cls=request_model_cls,
-        )
+        if router is not None:
+            protocols = {
+                PROTOCOL_ID_UNI: UniProtocolFactory(
+                    callback_function=router.uni_dispatch,
+                    max_message_size=self.max_message_size,
+                ),
+                PROTOCOL_ID_BI: BiProtocolFactory(
+                    callback_function=router.bi_dispatch,
+                    max_message_size=self.max_message_size,
+                ),
+            }
+        else:
+            factory_kwargs = dict(
+                callback_function=callback_function,
+                max_message_size=self.max_message_size,
+                serializer=serializer,
+                request_model_cls=request_model_cls,
+            )
+            protocols = {
+                PROTOCOL_ID_UNI: UniProtocolFactory(**factory_kwargs),
+                PROTOCOL_ID_BI: BiProtocolFactory(**factory_kwargs),
+            }
 
         # Create Iroh node with separate protocol handlers for uni and bi streams
         self.node = await Iroh.memory_with_options(
             NodeOptions(
-                protocols={
-                    PROTOCOL_ID_UNI: UniProtocolFactory(**factory_kwargs),
-                    PROTOCOL_ID_BI: BiProtocolFactory(**factory_kwargs),
-                },
+                protocols=protocols,
                 secret_key=secret_key,
             )
         )

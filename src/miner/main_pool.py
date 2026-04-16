@@ -130,16 +130,18 @@ def main():
                 module=r"huggingface_hub\.file_download",
             )
 
-        miner = Miner(
-            wallet_name=args.wallet,
-            wallet_hotkey=args.hotkey,
-            auto_start=args.auto_start,
-            payout_coldkey=payout_override,
-            show_dashboard=args.show_dashboard,
-            btcli_disabled=btcli_disabled,
-        )
+        async def _run():
+            miner = Miner(
+                wallet_name=args.wallet,
+                wallet_hotkey=args.hotkey,
+                auto_start=args.auto_start,
+                payout_coldkey=payout_override,
+                show_dashboard=args.show_dashboard,
+                btcli_disabled=btcli_disabled,
+            )
+            await miner.run_miner()
 
-        asyncio.run(miner.run_miner())
+        asyncio.run(_run())
     except KeyboardInterrupt:
         pass
     except Exception:

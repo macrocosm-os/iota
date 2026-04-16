@@ -49,6 +49,7 @@ class HealthServerMixin:
         app = web.Application()
 
         async def health_handler(request):
+            node_location = getattr(self, "_node_location", None)
             return web.json_response(
                 {
                     "status": "healthy",
@@ -58,6 +59,7 @@ class HealthServerMixin:
                     "registered": getattr(self, "registered_on_metagraph", True),
                     "timestamp": time.time(),
                     "spec_version": common_settings.__SPEC_VERSION__,
+                    "location": node_location.model_dump() if node_location is not None else None,
                 }
             )
 

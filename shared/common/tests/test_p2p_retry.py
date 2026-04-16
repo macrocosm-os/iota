@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from common.iroh.retry import P2PRetry, P2PRetryPolicy, P2PTimeouts, _is_connection_scoped_iroh_error
+from common.iroh.retry import P2PRetry, P2PRetryPolicy, P2PTimeouts, _classify_iroh_error
 from common.iroh.timings import P2POperationTimings
 
 
@@ -652,34 +652,50 @@ class TestP2PRetryNodeReset:
 
 
 # ---------------------------------------------------------------------------
-# _is_connection_scoped_iroh_error classification
+# _classify_iroh_error classification
 # ---------------------------------------------------------------------------
 
 
-class TestIsConnectionScopedIrohError:
+class TestClassifyIrohError:
+    # -- fail_fast --
+    def test_version_mismatch_is_fail_fast(self):
+        assert _classify_iroh_error(Exception("version mismatch")) == "fail_fast"
+
+    # -- peer_unreachable --
+    def test_no_addressing_information(self):
+        assert _classify_iroh_error(Exception("no addressing information")) == "peer_unreachable"
+
+    def test_discovery_produced_no_results(self):
+        assert _classify_iroh_error(Exception("discovery produced no results")) == "peer_unreachable"
+
+    def test_discovery_service_failed(self):
+        assert _classify_iroh_error(Exception("discovery service failed")) == "peer_unreachable"
+
+    # -- connection --
     def test_connection_lost(self):
-        assert _is_connection_scoped_iroh_error(Exception("connection lost")) is True
+        assert _classify_iroh_error(Exception("connection lost")) == "connection"
 
     def test_closed_by_peer(self):
-        assert _is_connection_scoped_iroh_error(Exception("closed by peer: 0")) is True
+        assert _classify_iroh_error(Exception("closed by peer: 0")) == "connection"
 
     def test_timed_out(self):
-        assert _is_connection_scoped_iroh_error(Exception("timed out")) is True
+        assert _classify_iroh_error(Exception("timed out")) == "connection"
 
     def test_stream_closed(self):
-        assert _is_connection_scoped_iroh_error(Exception("stream closed")) is True
+        assert _classify_iroh_error(Exception("stream closed")) == "connection"
 
     def test_reset_by_peer(self):
-        assert _is_connection_scoped_iroh_error(Exception("reset by peer")) is True
+        assert _classify_iroh_error(Exception("reset by peer")) == "connection"
 
     def test_case_insensitive(self):
-        assert _is_connection_scoped_iroh_error(Exception("Connection Lost")) is True
+        assert _classify_iroh_error(Exception("Connection Lost")) == "connection"
 
-    def test_unknown_error_is_not_connection_scoped(self):
-        assert _is_connection_scoped_iroh_error(Exception("endpoint bind failed")) is False
+    # -- node (default) --
+    def test_unknown_error_is_node_scoped(self):
+        assert _classify_iroh_error(Exception("endpoint bind failed")) == "node"
 
-    def test_empty_message_is_not_connection_scoped(self):
-        assert _is_connection_scoped_iroh_error(Exception("")) is False
+    def test_empty_message_is_node_scoped(self):
+        assert _classify_iroh_error(Exception("")) == "node"
 
 
 # ---------------------------------------------------------------------------
@@ -810,3 +826,112 @@ class TestP2PRetryConnectionScopedIrohError:
         assert call_count == 2
         assert invalidate_count == 1  # invalidated the dead connection
         assert reset_count == 0  # node was NOT reset
+
+
+# ---------------------------------------------------------------------------
+# P2PRetry — fail-fast IrohError handling
+# ---------------------------------------------------------------------------
+
+
+class TestP2PRetryFailFast:
+    @pytest.mark.asyncio
+    async def test_fail_fast_no_retry(self, monkeypatch):
+        """Version mismatch raises immediately — no retry, no callbacks."""
+        import common.iroh.retry as retry_mod
+
+        monkeypatch.setattr(retry_mod, "IrohError", _FakeIrohError)
+
+        policy = P2PRetryPolicy(max_retries=3, base_delay=0.01)
+        retry = P2PRetry(policy, P2PTimeouts())
+
+        call_count = 0
+        invalidate_count = 0
+        reset_count = 0
+
+        async def on_inv():
+            nonlocal invalidate_count
+            invalidate_count += 1
+
+        async def on_reset():
+            nonlocal reset_count
+            reset_count += 1
+
+        async def raise_version_mismatch():
+            nonlocal call_count
+            call_count += 1
+            raise _FakeIrohError("version mismatch")
+
+        with pytest.raises(_FakeIrohError, match="version mismatch"):
+            await retry.execute(raise_version_mismatch, on_invalidate=on_inv, on_node_reset=on_reset)
+        assert call_count == 1  # no retries
+        assert invalidate_count == 0
+        assert reset_count == 0
+
+
+# ---------------------------------------------------------------------------
+# P2PRetry — peer-unreachable IrohError handling
+# ---------------------------------------------------------------------------
+
+
+class TestP2PRetryPeerUnreachable:
+    @pytest.mark.asyncio
+    async def test_peer_unreachable_retries_without_invalidation(self, monkeypatch):
+        """Discovery errors retry with backoff but don't call on_invalidate or on_node_reset."""
+        import common.iroh.retry as retry_mod
+
+        monkeypatch.setattr(retry_mod, "IrohError", _FakeIrohError)
+
+        policy = P2PRetryPolicy(max_retries=2, base_delay=0.01)
+        retry = P2PRetry(policy, P2PTimeouts())
+
+        call_count = 0
+        invalidate_count = 0
+        reset_count = 0
+
+        async def on_inv():
+            nonlocal invalidate_count
+            invalidate_count += 1
+
+        async def on_reset():
+            nonlocal reset_count
+            reset_count += 1
+
+        async def raise_discovery():
+            nonlocal call_count
+            call_count += 1
+            raise _FakeIrohError("discovery produced no results")
+
+        with pytest.raises(_FakeIrohError, match="discovery produced no results"):
+            await retry.execute(raise_discovery, on_invalidate=on_inv, on_node_reset=on_reset)
+        assert call_count == 3  # 1 initial + 2 retries
+        assert invalidate_count == 0  # no connection to invalidate
+        assert reset_count == 0  # not a node problem
+
+    @pytest.mark.asyncio
+    async def test_peer_unreachable_recovery(self, monkeypatch):
+        """Peer becomes reachable after first discovery failure."""
+        import common.iroh.retry as retry_mod
+
+        monkeypatch.setattr(retry_mod, "IrohError", _FakeIrohError)
+
+        policy = P2PRetryPolicy(max_retries=2, base_delay=0.01)
+        retry = P2PRetry(policy, P2PTimeouts())
+
+        call_count = 0
+        invalidate_count = 0
+
+        async def on_inv():
+            nonlocal invalidate_count
+            invalidate_count += 1
+
+        async def fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise _FakeIrohError("no addressing information")
+            return "found peer"
+
+        result = await retry.execute(fail_then_ok, on_invalidate=on_inv)
+        assert result == "found peer"
+        assert call_count == 2
+        assert invalidate_count == 0
