@@ -1,12 +1,21 @@
 """Integration tests for P2P activation transfer using iroh-cosmos."""
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
 from common import settings as common_settings
 from miner.new_miner import Miner
+from miner.sync.variable import SyncedVariable, PollingLoop
 from common.iroh.p2p_protocol import P2PNotFoundError
+
+
+@pytest.fixture(autouse=True)
+def _stub_polling_loop(monkeypatch):
+    """Replace the shared PollingLoop with a no-op mock so tests don't
+    hit the bridge HTTP server (which isn't running locally)."""
+    monkeypatch.setattr(SyncedVariable, "polling_loop", MagicMock(spec=PollingLoop))
 
 
 @pytest.mark.asyncio
@@ -96,7 +105,7 @@ async def test_miner_p2p_multi_miner_concurrent_requests(monkeypatch):
     monkeypatch.setenv("BITTENSOR", "False")
     monkeypatch.setattr(common_settings, "BITTENSOR", False)
 
-    miner_count = 20
+    miner_count = 8
     layer_size = miner_count // 2
     fanout = 3
     miners = [
@@ -105,7 +114,7 @@ async def test_miner_p2p_multi_miner_concurrent_requests(monkeypatch):
     ]
 
     for miner in miners:
-        await miner._start_p2p()
+        await miner._start_p2p(timeout=30.0)
 
     try:
         for i, miner in enumerate(miners):

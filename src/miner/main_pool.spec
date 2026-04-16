@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from PyInstaller.utils.hooks import collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_data_files
 
 load_dotenv()
 
@@ -18,11 +18,11 @@ a = Analysis(
     ["main_pool.py"],
     pathex=[],
     binaries=[(str(ATTEST_SO_PATH), "common"), *IROH_BINARIES],
-    datas=[],
+    datas=collect_data_files("certifi"),
     hiddenimports=["platformdirs.macos", "iroh.iroh_ffi"],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["hooks/hook-ssl-certifi.py"],
     excludes=[],
     noarchive=False,
     optimize=0,

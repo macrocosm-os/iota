@@ -10,14 +10,14 @@ from common import settings as common_settings
 logger.remove()
 logger.add(
     sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSSSSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level> | <magenta>{extra}</magenta>",
-    level="DEBUG",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <cyan><b>[VALID]</b></cyan> | <level>{level: <8}</level> | <cyan>{name}:{line}</cyan> | <level>{message}</level> | <magenta>{extra}</magenta>",
+    level=common_settings.LOG_LEVEL,
     colorize=True,
 )
 if common_settings.LOG_FILE_ENABLED:
     logger.add(
         f"../../logs/{validator_settings.WALLET_NAME}.log",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSSSSS} | {level: <8} | {name}:{function}:{line} | {message} | {extra}",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | [VALID] | {level: <8} | {name}:{line} | {message} | {extra}",
         level="DEBUG",
         rotation="10 MB",
         retention="10 days",

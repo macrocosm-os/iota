@@ -33,23 +33,49 @@ T = TypeVar("T")
 # IrohError classification
 # ---------------------------------------------------------------------------
 
-# Error messages that indicate a single peer connection died — not a
-# node-level problem.  For these we just invalidate the one connection
-# instead of tearing down the entire iroh node (which kills *all*
-# connections to healthy peers).
+# Deterministic errors that will never succeed — raise immediately, no retry.
+_FAIL_FAST_PATTERNS = ("version mismatch",)
+
+# Peer not found in discovery network.  No connection exists to invalidate;
+# retrying gives time for the peer to come online / publish addressing info.
+_PEER_UNREACHABLE_PATTERNS = (
+    "no addressing information",
+    "discovery produced no results",
+    "discovery service failed",
+)
+
+# A single peer connection died — invalidate that one connection and retry.
 _CONNECTION_SCOPED_PATTERNS = (
+    # quinn ConnectionError variants
     "connection lost",
     "closed by peer",
     "timed out",
-    "stream closed",
     "reset by peer",
+    "locally closed",
+    "application closed",
+    # quinn WriteError / ReadError variants
+    "stream closed",
+    "stopped by peer",
 )
 
 
-def _is_connection_scoped_iroh_error(exc: BaseException) -> bool:
-    """Return True when *exc* looks like a single-connection failure."""
+def _classify_iroh_error(exc: BaseException) -> str:
+    """Classify an IrohError into a recovery tier.
+
+    Returns one of:
+    - ``"fail_fast"``          – deterministic, will never succeed
+    - ``"peer_unreachable"``   – peer not in discovery, retry without invalidation
+    - ``"connection"``         – single connection died, invalidate and retry
+    - ``"node"``               – unrecognised, reset the whole iroh node
+    """
     msg = str(exc).lower()
-    return any(p in msg for p in _CONNECTION_SCOPED_PATTERNS)
+    if any(p in msg for p in _FAIL_FAST_PATTERNS):
+        return "fail_fast"
+    if any(p in msg for p in _PEER_UNREACHABLE_PATTERNS):
+        return "peer_unreachable"
+    if any(p in msg for p in _CONNECTION_SCOPED_PATTERNS):
+        return "connection"
+    return "node"
 
 
 # ---------------------------------------------------------------------------
@@ -199,49 +225,81 @@ class P2PRetry:
                 if timings is not None:
                     timings.errors.append(f"{type(exc).__name__}: {exc} (attempt {attempt + 1})")
 
-                # Classify IrohErrors: connection-scoped errors just need
-                # the one connection invalidated; node-scoped errors need a
-                # full node reset.
+                # Classify IrohErrors into four tiers so we take the
+                # right recovery action without wasting effort.
                 is_iroh_error = IrohError is not None and isinstance(exc, IrohError)
-                conn_scoped = is_iroh_error and _is_connection_scoped_iroh_error(exc)
 
                 if is_iroh_error:
-                    if conn_scoped:
-                        logger.warning(f"Connection-scoped IrohError, invalidating connection: {exc}")
+                    scope = _classify_iroh_error(exc)
+
+                    if scope == "fail_fast":
+                        logger.warning(f"Permanent peer error, will not retry: {exc}")
+                        raise
+
+                    delay = self.policy.delay_for_attempt(attempt)
+                    total = self.policy.total_attempts
+
+                    if scope == "peer_unreachable":
+                        logger.warning(
+                            f"Peer not reachable (not found in discovery network), "
+                            f"retry {attempt + 1}/{total}: {exc} — backoff {delay:.2f}s"
+                        )
+                        # No invalidation — there's no connection to invalidate
+
+                    elif scope == "connection":
+                        logger.warning(
+                            f"Connection to peer failed, invalidating cached connection, "
+                            f"retry {attempt + 1}/{total}: {exc} — backoff {delay:.2f}s"
+                        )
                         if on_invalidate:
                             try:
                                 await on_invalidate()
                             except Exception:
                                 pass
-                    elif on_node_reset:
-                        logger.warning(f"Node-scoped IrohError, resetting node: {exc}")
-                        try:
-                            await on_node_reset()
-                        except Exception:
-                            pass
 
-                if attempt < self.policy.max_retries:
-                    delay = self.policy.delay_for_attempt(attempt)
-                    if timings is not None:
-                        timings.retry_count = attempt + 1
-                        timings.total_backoff_time += delay
-                    logger.warning(
-                        f"P2P retry {attempt + 1}/{self.policy.total_attempts}: "
-                        f"{type(exc).__name__}: {exc} — backoff {delay:.2f}s"
-                    )
-                    if self.policy.invalidate_on_error and on_invalidate and not is_iroh_error:
-                        try:
-                            await on_invalidate()
-                        except Exception:
-                            pass
-                    await asyncio.sleep(delay)
+                    else:  # "node"
+                        logger.warning(
+                            f"Node-level error, resetting iroh node, "
+                            f"retry {attempt + 1}/{total}: {exc} — backoff {delay:.2f}s"
+                        )
+                        if on_node_reset:
+                            try:
+                                await on_node_reset()
+                            except Exception:
+                                pass
+
+                    if attempt < self.policy.max_retries:
+                        if timings is not None:
+                            timings.retry_count = attempt + 1
+                            timings.total_backoff_time += delay
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
                 else:
-                    if self.policy.invalidate_on_error and on_invalidate and not is_iroh_error:
-                        try:
-                            await on_invalidate()
-                        except Exception:
-                            pass
-                    raise
+                    # Non-IrohError retryable exceptions
+                    if attempt < self.policy.max_retries:
+                        delay = self.policy.delay_for_attempt(attempt)
+                        if timings is not None:
+                            timings.retry_count = attempt + 1
+                            timings.total_backoff_time += delay
+                        logger.warning(
+                            f"P2P retry {attempt + 1}/{self.policy.total_attempts}: "
+                            f"{type(exc).__name__}: {exc} — backoff {delay:.2f}s"
+                        )
+                        if self.policy.invalidate_on_error and on_invalidate:
+                            try:
+                                await on_invalidate()
+                            except Exception:
+                                pass
+                        await asyncio.sleep(delay)
+                    else:
+                        if self.policy.invalidate_on_error and on_invalidate:
+                            try:
+                                await on_invalidate()
+                            except Exception:
+                                pass
+                        raise
 
         # Should be unreachable, but satisfies the type checker.
         assert last_exc is not None

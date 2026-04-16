@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import OrderedDict
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, overload
 
 from iroh import (
     Iroh,
@@ -102,13 +102,18 @@ class Sender:
 
     # ── node management ──────────────────────────────────────────────
 
+    _NODE_CREATE_TIMEOUT: float = 10.0
+
     async def _get_node(self) -> Iroh:
         """Lazily create and reuse a single Iroh node."""
         if self._node is None:
             async with self._node_lock:
                 if self._node is None:
                     iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
-                    self._node = await Iroh.memory_with_options(NodeOptions(protocols={}))
+                    self._node = await asyncio.wait_for(
+                        Iroh.memory_with_options(NodeOptions(protocols={})),
+                        timeout=self._NODE_CREATE_TIMEOUT,
+                    )
                     self._monitored_node.set_node(self._node)
                     self._monitored_node.start_monitoring()
         return self._node
@@ -190,11 +195,18 @@ class Sender:
 
     async def send_message(
         self,
-        node_id: str,
+        node_id: str | list[str],
         message: bytes,
         timings: P2POperationTimings | None = None,
     ) -> None:
-        """Send a unidirectional message (fire-and-forget) with retry."""
+        """Send a unidirectional message (fire-and-forget) with retry.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently.
+        Timings are not tracked for multi-send.
+        """
+        if isinstance(node_id, list):
+            await asyncio.gather(*[self.send_message(nid, message) for nid in node_id])
+            return
 
         async def _do_send() -> None:
             # Reset per-phase timings on each attempt (retries overwrite)
@@ -226,21 +238,75 @@ class Sender:
                 timings.total_end = _time.time()
                 timings.total_duration = timings.total_end - timings.total_start
 
-    async def send_model(self, node_id: str, model: BaseModel, serializer: Serializer) -> None:
-        """Send a pydantic model as a unidirectional message (fire-and-forget)."""
+    async def send_model(self, node_id: str | list[str], model: BaseModel, serializer: Serializer) -> None:
+        """Send a pydantic model as a unidirectional message (fire-and-forget).
+
+        Pass a list of node IDs to fan out to multiple peers concurrently.
+        """
         await self.send_message(node_id, wrap_envelope(model, serializer))
+
+    async def send_routed(
+        self,
+        route: str,
+        node_id: str | list[str],
+        model: BaseModel,
+        serializer: Serializer | None = None,
+        timings: P2POperationTimings | None = None,
+    ) -> None:
+        """Send a typed UNI message with routed envelope.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently.
+        Timings are not tracked for multi-send.
+        """
+        from common.iroh.router import wrap_routed_envelope
+
+        payload = wrap_routed_envelope(route, model, serializer)
+        await self.send_message(node_id, payload, timings=timings)
 
     # ── send + receive (bidirectional) ───────────────────────────────
 
+    @overload
     async def send_message_bi(
         self,
         node_id: str,
         message: bytes,
         max_message_size: int,
+        callback: Callable[[bytes], bytes] | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> bytes:
+        ...
+
+    @overload
+    async def send_message_bi(
+        self,
+        node_id: list[str],
+        message: bytes,
+        max_message_size: int,
+        callback: Callable[[bytes], bytes] | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> list[bytes]:
+        ...
+
+    async def send_message_bi(
+        self,
+        node_id: str | list[str],
+        message: bytes,
+        max_message_size: int,
         callback: Callable[[bytes], bytes] | None = None,
         timings: P2POperationTimings | None = None,
-    ) -> bytes:
-        """Send a message and wait for response (bidirectional) with retry."""
+    ) -> bytes | list[bytes]:
+        """Send a message and wait for response (bidirectional) with retry.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently,
+        returning a list of responses in the same order. Timings are not
+        tracked for multi-send.
+        """
+        if isinstance(node_id, list):
+            return list(
+                await asyncio.gather(
+                    *[self.send_message_bi(nid, message, max_message_size, callback) for nid in node_id]
+                )
+            )
 
         async def _do_send_bi() -> bytes:
             peer_conn = await self._get_connection(node_id, PROTOCOL_ID_BI, timings)
@@ -289,6 +355,7 @@ class Sender:
                 timings.total_end = _time.time()
                 timings.total_duration = timings.total_end - timings.total_start
 
+    @overload
     async def send_model_bi(
         self,
         node_id: str,
@@ -297,10 +364,98 @@ class Sender:
         response_model_cls: type[ModelT],
         max_message_size: int,
     ) -> ModelT:
-        """Send a pydantic model and receive a pydantic model response (bidirectional)."""
+        ...
+
+    @overload
+    async def send_model_bi(
+        self,
+        node_id: list[str],
+        model: BaseModel,
+        serializer: Serializer,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+    ) -> list[ModelT]:
+        ...
+
+    async def send_model_bi(
+        self,
+        node_id: str | list[str],
+        model: BaseModel,
+        serializer: Serializer,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+    ) -> ModelT | list[ModelT]:
+        """Send a pydantic model and receive a pydantic model response (bidirectional).
+
+        Pass a list of node IDs to fan out to multiple peers concurrently,
+        returning a list of responses in the same order.
+        """
         wire_bytes = wrap_envelope(model, serializer)
+        if isinstance(node_id, list):
+            responses = await self.send_message_bi(node_id, wire_bytes, max_message_size)
+            return [unwrap_envelope(r, response_model_cls) for r in responses]
         response_bytes = await self.send_message_bi(node_id, wire_bytes, max_message_size)
         return unwrap_envelope(response_bytes, response_model_cls)
+
+    @overload
+    async def send_routed_bi(
+        self,
+        route: str,
+        node_id: str,
+        model: BaseModel,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+        serializer: Serializer | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> ModelT:
+        ...
+
+    @overload
+    async def send_routed_bi(
+        self,
+        route: str,
+        node_id: list[str],
+        model: BaseModel,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+        serializer: Serializer | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> list[ModelT]:
+        ...
+
+    async def send_routed_bi(
+        self,
+        route: str,
+        node_id: str | list[str],
+        model: BaseModel,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+        serializer: Serializer | None = None,
+        timings: P2POperationTimings | None = None,
+    ) -> ModelT | list[ModelT]:
+        """Send a typed BI request with routed envelope, receive a typed response.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently,
+        returning a list of responses in the same order. Timings are not
+        tracked for multi-send.
+        """
+        from common.iroh.router import unwrap_routed_envelope, wrap_routed_envelope
+
+        payload = wrap_routed_envelope(route, model, serializer)
+        if isinstance(node_id, list):
+            responses = await self.send_message_bi(node_id, payload, max_message_size)
+            return [
+                ser.deserialize(body, response_model_cls)
+                for _, body, ser in (unwrap_routed_envelope(r) for r in responses)
+            ]
+        response_bytes = await self.send_message_bi(
+            node_id,
+            payload,
+            max_message_size,
+            timings=timings,
+        )
+        _, body, ser = unwrap_routed_envelope(response_bytes)
+        return ser.deserialize(body, response_model_cls)
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -368,13 +523,18 @@ class PooledSender:
 
     # ── node management ──────────────────────────────────────────────
 
+    _NODE_CREATE_TIMEOUT: float = 10.0
+
     async def _get_node(self) -> Iroh:
         """Lazily create and reuse a single Iroh node."""
         if self._node is None:
             async with self._node_lock:
                 if self._node is None:
                     iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
-                    self._node = await Iroh.memory_with_options(NodeOptions(protocols={}))
+                    self._node = await asyncio.wait_for(
+                        Iroh.memory_with_options(NodeOptions(protocols={})),
+                        timeout=self._NODE_CREATE_TIMEOUT,
+                    )
                     self._monitored_node.set_node(self._node)
                     self._monitored_node.start_monitoring()
         return self._node
@@ -450,11 +610,18 @@ class PooledSender:
 
     async def send_message(
         self,
-        node_id: str,
+        node_id: str | list[str],
         message: bytes,
         timings: P2POperationTimings | None = None,
     ) -> None:
-        """Send a unidirectional message (fire-and-forget) with retry."""
+        """Send a unidirectional message (fire-and-forget) with retry.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently.
+        Timings are not tracked for multi-send.
+        """
+        if isinstance(node_id, list):
+            await asyncio.gather(*[self.send_message(nid, message) for nid in node_id])
+            return
 
         async def _do_send() -> None:
             peer_conn = await self._get_connection(node_id, PROTOCOL_ID_UNI, timings)
@@ -485,21 +652,75 @@ class PooledSender:
                 timings.total_end = _time.time()
                 timings.total_duration = timings.total_end - timings.total_start
 
-    async def send_model(self, node_id: str, model: BaseModel, serializer: Serializer) -> None:
-        """Send a pydantic model as a unidirectional message (fire-and-forget)."""
+    async def send_model(self, node_id: str | list[str], model: BaseModel, serializer: Serializer) -> None:
+        """Send a pydantic model as a unidirectional message (fire-and-forget).
+
+        Pass a list of node IDs to fan out to multiple peers concurrently.
+        """
         await self.send_message(node_id, wrap_envelope(model, serializer))
+
+    async def send_routed(
+        self,
+        route: str,
+        node_id: str | list[str],
+        model: BaseModel,
+        serializer: Serializer | None = None,
+        timings: P2POperationTimings | None = None,
+    ) -> None:
+        """Send a typed UNI message with routed envelope.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently.
+        Timings are not tracked for multi-send.
+        """
+        from common.iroh.router import wrap_routed_envelope
+
+        payload = wrap_routed_envelope(route, model, serializer)
+        await self.send_message(node_id, payload, timings=timings)
 
     # ── send + receive (bidirectional) ───────────────────────────────
 
+    @overload
     async def send_message_bi(
         self,
         node_id: str,
         message: bytes,
         max_message_size: int,
+        callback: Callable[[bytes], bytes] | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> bytes:
+        ...
+
+    @overload
+    async def send_message_bi(
+        self,
+        node_id: list[str],
+        message: bytes,
+        max_message_size: int,
+        callback: Callable[[bytes], bytes] | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> list[bytes]:
+        ...
+
+    async def send_message_bi(
+        self,
+        node_id: str | list[str],
+        message: bytes,
+        max_message_size: int,
         callback: Callable[[bytes], bytes] | None = None,
         timings: P2POperationTimings | None = None,
-    ) -> bytes:
-        """Send a message and wait for response (bidirectional) with retry."""
+    ) -> bytes | list[bytes]:
+        """Send a message and wait for response (bidirectional) with retry.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently,
+        returning a list of responses in the same order. Timings are not
+        tracked for multi-send.
+        """
+        if isinstance(node_id, list):
+            return list(
+                await asyncio.gather(
+                    *[self.send_message_bi(nid, message, max_message_size, callback) for nid in node_id]
+                )
+            )
 
         async def _do_send_bi() -> bytes:
             peer_conn = await self._get_connection(node_id, PROTOCOL_ID_BI, timings)
@@ -548,6 +769,7 @@ class PooledSender:
                 timings.total_end = _time.time()
                 timings.total_duration = timings.total_end - timings.total_start
 
+    @overload
     async def send_model_bi(
         self,
         node_id: str,
@@ -556,10 +778,118 @@ class PooledSender:
         response_model_cls: type[ModelT],
         max_message_size: int,
     ) -> ModelT:
-        """Send a pydantic model and receive a pydantic model response (bidirectional)."""
+        ...
+
+    @overload
+    async def send_model_bi(
+        self,
+        node_id: list[str],
+        model: BaseModel,
+        serializer: Serializer,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+    ) -> list[ModelT]:
+        ...
+
+    async def send_model_bi(
+        self,
+        node_id: str | list[str],
+        model: BaseModel,
+        serializer: Serializer,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+    ) -> ModelT | list[ModelT]:
+        """Send a pydantic model and receive a pydantic model response (bidirectional).
+
+        Pass a list of node IDs to fan out to multiple peers concurrently,
+        returning a list of responses in the same order.
+        """
         wire_bytes = wrap_envelope(model, serializer)
+        if isinstance(node_id, list):
+            responses = await self.send_message_bi(node_id, wire_bytes, max_message_size)
+            return [unwrap_envelope(r, response_model_cls) for r in responses]
         response_bytes = await self.send_message_bi(node_id, wire_bytes, max_message_size)
         return unwrap_envelope(response_bytes, response_model_cls)
+
+    @overload
+    async def send_routed_bi(
+        self,
+        route: str,
+        node_id: str,
+        model: BaseModel,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+        serializer: Serializer | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> ModelT:
+        ...
+
+    @overload
+    async def send_routed_bi(
+        self,
+        route: str,
+        node_id: list[str],
+        model: BaseModel,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+        serializer: Serializer | None = ...,
+        timings: P2POperationTimings | None = ...,
+    ) -> list[ModelT]:
+        ...
+
+    async def send_routed_bi(
+        self,
+        route: str,
+        node_id: str | list[str],
+        model: BaseModel,
+        response_model_cls: type[ModelT],
+        max_message_size: int,
+        serializer: Serializer | None = None,
+        timings: P2POperationTimings | None = None,
+    ) -> ModelT | list[ModelT]:
+        """Send a typed BI request with routed envelope, receive a typed response.
+
+        Pass a list of node IDs to fan out to multiple peers concurrently,
+        returning a list of responses in the same order. Timings are not
+        tracked for multi-send.
+        """
+        from common.iroh.router import unwrap_routed_envelope, wrap_routed_envelope
+
+        payload = wrap_routed_envelope(route, model, serializer)
+        if isinstance(node_id, list):
+            responses = await self.send_message_bi(node_id, payload, max_message_size)
+            return [
+                ser.deserialize(body, response_model_cls)
+                for _, body, ser in (unwrap_routed_envelope(r) for r in responses)
+            ]
+        response_bytes = await self.send_message_bi(
+            node_id,
+            payload,
+            max_message_size,
+            timings=timings,
+        )
+        _, body, ser = unwrap_routed_envelope(response_bytes)
+        return ser.deserialize(body, response_model_cls)
+
+    async def send_routed_bi_raw(
+        self,
+        route: str,
+        node_id: str,
+        model: BaseModel,
+        max_message_size: int,
+        serializer: Serializer | None = None,
+        timings: P2POperationTimings | None = None,
+    ) -> bytes:
+        """Send a typed BI request with routed envelope, return raw response bytes.
+
+        Unlike ``send_routed_bi``, this does **not** unwrap the response as a
+        routed envelope — it returns the raw bytes from the peer.  Useful when
+        the response is a simple status byte (e.g. activation push ack).
+        """
+        from common.iroh.router import wrap_routed_envelope
+
+        payload = wrap_routed_envelope(route, model, serializer)
+        return await self.send_message_bi(node_id, payload, max_message_size, timings=timings)
 
     # ── lifecycle ────────────────────────────────────────────────────
 

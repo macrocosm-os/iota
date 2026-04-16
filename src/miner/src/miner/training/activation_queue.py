@@ -19,8 +19,10 @@ from miner.utils.activation_utils import download_sample
 from miner.utils.activation_hash import compute_activation_hash, verify_activation_hash
 from subnet.model.model_mixin import ModelManager
 from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
+from common.utils.shared_states import LayerPhase
 from miner import settings as miner_settings
 
+from common.iroh.activation_push import ActivationPushMessage
 from common.iroh.timings import P2POperationTimings
 from miner.utils.stats import StatsTracker, tensor_num_bytes
 from common.iroh.p2p_protocol import P2PRequestError
@@ -191,24 +193,41 @@ class ActivationQueue:
                 raise
 
     async def _fetch_activations(self):
-        """Fetch activations from the miner API and add them to the queue."""
+        """Route to the appropriate fetcher based on layer."""
+        if self._state_manager.layer == 0:
+            await self._fetch_activations_layer0()
+        else:
+            await self._fetch_activations_push_based()
+
+    async def _fetch_activations_layer0(self):
+        """Layer-0 fetcher: forward samples from orchestrator, backward from push queue."""
+        last_state_check = time.time()
         while True:
-            # This loop will only break if `get_activation` raises an exception (i.e. LayerStateException)
+            # This loop will only break if an exception is raised (i.e. LayerStateException)
             await asyncio.sleep(0.51)  # comply with the orchestrator rate limit
 
-            # async with TimerLogger(
-            #     name="fetch_activations",
-            #     metadata={"hotkey": self._miner_api_client.hotkey.ss58_address, "layer": self._state_manager.layer},
-            #     hotkey=self._miner_api_client.hotkey.ss58_address[:8],
-            # ):
+            # ── Periodic heartbeat for state-change detection ────────────────
+            if time.time() - last_state_check >= 30.0:
+                try:
+                    await self._miner_api_client.heartbeat(expected_phase=LayerPhase.TRAINING)
+                except RateLimitException:
+                    pass
+                except (LayerStateException, MinerNotRegisteredException):
+                    raise
+                except Exception as exc:
+                    logger.debug(f"Heartbeat check failed (non-fatal): {exc}")
+                last_state_check = time.time()
+
+            # Drain backward activations that arrived via push from layer 1
+            await self._drain_push_queue(direction_filter="backward")
+
             # Keep cache clean
             self._cache.cleanup()
 
             # Log cache and queue status
-            cache_vacancy = miner_settings.MAX_ACTIVATION_CACHE_SIZE - len(self._cache)
-            logger.debug(
-                f"Cache size: {len(self._cache)}/{miner_settings.MAX_ACTIVATION_CACHE_SIZE} (vacancy: {cache_vacancy})"
-            )
+            effective_max_cache = self._cache.effective_max_for_queue
+            cache_vacancy = effective_max_cache - len(self._cache)
+            logger.debug(f"Cache size: {len(self._cache)}/{effective_max_cache} (vacancy: {cache_vacancy})")
             logger.debug(
                 f"Backward activations in queue: {len(self._backward_queue)}"
                 f" - Forward activations in queue: {len(self._forward_queue)}"
@@ -217,15 +236,14 @@ class ActivationQueue:
             queue_status = f"backward: {[a.activation_id for a in self._backward_queue]} forward: {[a.activation_id for a in self._forward_queue]}"
             logger.debug(f"Queue status: {queue_status}")
 
-            max_allowed_total = (
-                miner_settings.MAX_ACTIVATION_CACHE_SIZE + miner_settings.MIN_FORWARD_ACTIVATIONS_IN_QUEUE
-            )
+            max_allowed_total = effective_max_cache + miner_settings.MIN_FORWARD_ACTIVATIONS_IN_QUEUE
             used = len(self._cache) + len(self._forward_queue)
             n_fwd_activations = min(max_allowed_total - used, miner_settings.MAX_FORWARD_ACTIVATIONS_IN_QUEUE)
             missing_backwards = len(self._cache) - len(self._backward_queue)
 
             if n_fwd_activations < 0:
                 n_fwd_activations = 0
+
             logger.debug(
                 f"Max allowed forwards: {max_allowed_total}"
                 f" -- Used: {used}"
@@ -233,7 +251,7 @@ class ActivationQueue:
                 f" -- Missing backwards: {missing_backwards}"
             )
 
-            if n_fwd_activations == 0 and missing_backwards == 0:
+            if n_fwd_activations == 0:
                 # This can happen if our queue is full and we haven't yet processed anything into the cache
                 logger.debug("No forward activations needed and no backwards activations needed")
                 continue
@@ -258,7 +276,7 @@ class ActivationQueue:
                 raise
 
             if len(response) == 0:
-                logger.warning("No activations received from orchestrator")
+                logger.debug("No activations received from orchestrator")
                 continue
 
             logger.debug(f"Response contains: {[(a.activation_id, a.direction) for a in response]}")
@@ -285,7 +303,7 @@ class ActivationQueue:
             forward_response = await self._filter_excess_forwards(forward_response=forward_response)
 
             if len(backward_response) == 0 and len(forward_response) == 0:
-                logger.warning("No activations to download")
+                logger.debug("No activations to download after filtering")
                 continue
 
             logger.debug(
@@ -339,6 +357,9 @@ class ActivationQueue:
                     attestation_crypto=activation_response.attestation_crypto,
                     upload_url=activation_response.presigned_upload_url,
                     activation_upload_path=activation_response.activation_upload_path,
+                    # For layer-0 forward activations, presigned_download_url IS the sample URL.
+                    # Carry it through so the last-layer miner can download target labels via push.
+                    target_download_url=activation_response.presigned_download_url,
                 )
                 logger.debug(
                     f"Downloaded activation {activation_response.activation_id} going {activation_response.direction}"
@@ -623,6 +644,183 @@ class ActivationQueue:
                     f"Removed {removal_amount} forward activations from response to make way for backward activations"
                 )
             return forward_response
+
+    async def _drain_push_queue(self, direction_filter: str | None = None) -> None:
+        """Pull all currently available messages from the P2P push queue into the activation queues.
+
+        Args:
+            direction_filter: If set, only enqueue messages whose ``direction``
+                              matches (e.g. ``"backward"`` for layer-0).
+                              ``None`` means accept all directions.
+        """
+        if not self._miner:
+            return
+        while True:
+            try:
+                msg = self._miner._p2p_push_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if direction_filter is not None and msg.direction != direction_filter:
+                # Wrong direction for this fetcher — put it back and stop draining
+                await self._miner._p2p_push_queue.put(msg)
+                break
+
+            entry = await self._push_message_to_activation_data(msg)
+            if entry is None:
+                continue
+
+            async with self._queue_lock:
+                if self._stats_tracker is not None:
+                    self._stats_tracker.ensure_activation_stats(
+                        msg.activation_id,
+                        direction=msg.direction,
+                        time_received=time.time(),
+                    )
+                    stats = self._stats_tracker.ensure_activation_stats(msg.activation_id, direction=msg.direction)
+                    stats.timing.queue.start = time.time()
+                if msg.direction == "backward":
+                    self._backward_queue.append(entry)
+                else:
+                    self._forward_queue.append(entry)
+            logger.debug(f"Enqueued pushed activation {msg.activation_id} ({msg.direction})")
+
+    def _validate_push_layer_routing(self, msg: ActivationPushMessage) -> bool:
+        """Reject pushes whose target_layer does not match this miner's training layer."""
+        if msg.target_layer is None:
+            if msg.source_layer is not None:
+                logger.warning(
+                    f"Push {msg.activation_id} has source_layer={msg.source_layer} but no target_layer "
+                    "(legacy sender); accepting without target check"
+                )
+            return True
+        my_layer = self._state_manager.layer
+        if msg.target_layer != my_layer:
+            logger.error(
+                f"Rejecting {msg.direction} push {msg.activation_id}: target_layer={msg.target_layer} "
+                f"but this miner is layer {my_layer}"
+            )
+            return False
+        return True
+
+    async def _push_message_to_activation_data(self, msg: ActivationPushMessage) -> "ActivationData | None":
+        """Decode an :class:`ActivationPushMessage` into an :class:`ActivationData`."""
+        if not self._validate_push_layer_routing(msg):
+            return None
+        try:
+            import io as _io
+
+            buffer = _io.BytesIO(msg.tensor_bytes)
+            input_activations = torch.load(buffer, map_location="cpu", weights_only=True)
+
+            if not self._mock and self._model_manager is not None:
+                if msg.direction == "forward":
+                    input_activations = input_activations.reshape(
+                        common_settings.MINI_BATCH_SIZE,
+                        common_settings.SEQUENCE_LENGTH,
+                        self._model_manager.model_config.get("bottleneck_dim")
+                        or self._model_manager.model_config["emb_dim"],
+                    )
+                else:  # backward gradient has the same shape as the forward input
+                    input_activations = input_activations.reshape(
+                        common_settings.MINI_BATCH_SIZE,
+                        common_settings.SEQUENCE_LENGTH,
+                        self._model_manager.model_config.get("bottleneck_dim")
+                        or self._model_manager.model_config["emb_dim"],
+                    )
+            elif self._mock:
+                input_activations = self._reshape_mock_activations(input_activations)
+
+            if self._miner:
+                input_hash = compute_activation_hash(msg.tensor_bytes)
+                await self._miner.store_input_hash(msg.activation_id, input_hash)
+
+            # Download sample activations for last-layer forward passes
+            sample_activations = None
+            if (
+                msg.direction == "forward"
+                and msg.sample_path
+                and self._model_manager is not None
+                and self._state_manager.layer == self._model_manager.model_metadata["n_splits"] - 1
+            ):
+                logger.debug(f"Last layer miner, downloading sample activations for {msg.activation_id}")
+                sample_activations = await asyncio.wait_for(
+                    download_sample(
+                        download_url=msg.sample_path,
+                        tokenizer=self._model_manager.tokenizer,
+                        device="cpu",
+                        mock=self._mock,
+                        run_flags=self._run_flags,
+                    ),
+                    timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
+                )
+
+            return ActivationData(
+                activation_id=msg.activation_id,
+                direction=msg.direction,
+                input_activations=input_activations,
+                sample_activations=sample_activations,
+                output_activations=None,
+                state=None,
+                upload_time=time.time(),
+                source_hotkey=msg.source_hotkey,
+                source_p2p_node_ids=msg.source_p2p_node_ids,
+                target_download_url=msg.sample_path,
+            )
+        except Exception as exc:
+            aid = getattr(msg, "activation_id", "<unknown>")
+            logger.error(f"Failed to decode push message for {aid}: {exc}")
+            return None
+
+    async def _fetch_activations_push_based(self) -> None:
+        """For layer > 0: receive all activations via P2P push instead of polling the orchestrator.
+
+        A lightweight orchestrator heartbeat runs every 30 s to detect layer-state
+        changes (which raises :class:`LayerStateException` and resets training).
+        """
+        last_state_check = time.time()
+        while True:
+            # ── Periodic layer-state check ────────────────────────────────────
+            if time.time() - last_state_check >= 30.0:
+                try:
+                    await self._miner_api_client.heartbeat(expected_phase=LayerPhase.TRAINING)
+                except RateLimitException:
+                    pass
+                except (LayerStateException, MinerNotRegisteredException):
+                    raise
+                except Exception as exc:
+                    logger.debug(f"Heartbeat check failed (non-fatal): {exc}")
+                last_state_check = time.time()
+
+            # ── Wait for the next push (1 s timeout so the state check fires) ─
+            try:
+                msg = await asyncio.wait_for(
+                    self._miner._p2p_push_queue.get(),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+
+            entry = await self._push_message_to_activation_data(msg)
+            if entry is None:
+                continue
+
+            async with self._queue_lock:
+                if self._stats_tracker is not None:
+                    self._stats_tracker.ensure_activation_stats(
+                        msg.activation_id,
+                        direction=msg.direction,
+                        time_received=time.time(),
+                    )
+                    stats = self._stats_tracker.ensure_activation_stats(msg.activation_id, direction=msg.direction)
+                    stats.timing.queue.start = time.time()
+                if msg.direction == "backward":
+                    self._backward_queue.append(entry)
+                else:
+                    self._forward_queue.append(entry)
+            logger.debug(f"Enqueued pushed activation {msg.activation_id} ({msg.direction})")
 
     def _cancel_tasks(self, tasks: list[asyncio.Task], completed_tasks: Optional[set[asyncio.Task]] = None):
         if completed_tasks is None:

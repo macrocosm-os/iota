@@ -1,3 +1,4 @@
+import pprint
 import asyncio
 import copy
 import json
@@ -7,8 +8,12 @@ import sys
 import threading
 import time
 import webbrowser
+from common.snowpipe.messages.lifecycle_events import LifecycleEvent
+from common.utils.location_utils import resolve_node_location
 from common.utils.verify_enclave_signature import payload_base64_from_obj
 from loguru import logger
+from miner.sync import NodeRegistry, SyncedNode
+from miner.sync.variable import SyncedVariable, sync_run_sync_prefix
 from miner.utils.node_control_mixin import NodeControlMixin
 from miner.utils.miner_dashboard_api import start_visualization_server
 from miner.utils.partition_merging import download_previous_optimizer_state_for_partition_batch, merge_partition_batch
@@ -32,6 +37,7 @@ from miner.utils.partition_merging import (
 from miner import settings as miner_settings
 from miner.state_manager import StateManager
 from miner.utils.utils import (
+    collect_system_data,
     create_metadata,
     upload_file,
     upload_tensor,
@@ -53,11 +59,15 @@ from common.iroh import (
     P2POperationTimings,
     P2PStack,
 )
+from common.iroh.activation_push import ActivationPushMessage
+from common.models.peer_status import PeerStatusBroadcast
 from common.models.api_models import (
     AttestationChallengeResponse,
     EnclaveSignResponse,
-    MinerRegistrationResponse,
     MinerAttestationPayload,
+    MinerRegistrationResponse,
+    MountedAttestationPayload,
+    NodeLocation,
     RegisterMinerRequest,
     SubmittedWeightsAndOptimizerPresigned,
     WeightSubmitResponse,
@@ -70,6 +80,7 @@ from common.utils.exceptions import (
     LayerStateException,
     RateLimitException,
     MinerNotRegisteredException,
+    MinerResetException,
     RunFullException,
     NanInfException,
     NanInfWarning,
@@ -139,7 +150,21 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             electron_version=miner_settings.ELECTRON_VERSION,
         )
         self.need_to_pull_weights = True
+        self._weight_download_failures: int = 0
         self._needs_local_optimizer_state_download: bool = False
+
+        # Initialize compute node and node registry before referencing them elsewhere
+        self.compute_node = SyncedNode(node_id=self.wallet.hotkey.ss58_address, server_url=common_settings.BRIDGE_URL)
+        self.compute_node.peer_eviction_enabled = self.run_flags.peer_eviction.isOn()
+        self.node_registry = SyncedVariable(
+            variable_id=f"{sync_run_sync_prefix(self.state_manager.run_id)}/node_registry",
+            default=NodeRegistry(),
+            on_update=self._on_registry_update,
+        )
+        self.compute_node.bind_registry(self.node_registry)
+        self.node_registry.value.register(self.compute_node.compute_node)
+
+        # Pass node_registry as a parameter after it has been initialized above
         self.training_phase: TrainingPhase = TrainingPhase(
             miner_api_client=self.miner_api_client,
             state_manager=self.state_manager,
@@ -149,10 +174,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             mock=self.mock,
             is_mounted=miner_settings.IS_MOUNTED,
             miner=self,
+            node_registry=self.node_registry,
         )
         self.stats_tracker = StatsTracker()
         self.training_phase.attach_stats_tracker(self.stats_tracker)
-        self._latest_attestation_payloads: dict[str, MinerAttestationPayload | EnclaveSignResponse] = {}
+        self._latest_attestation_payloads: dict[
+            str, MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse
+        ] = {}
         self.visualization_process: multiprocessing.Process | None = None
 
         # Telemetry
@@ -170,8 +198,20 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.node_control_process: multiprocessing.Process | None = None
         self.is_mounted = miner_settings.IS_MOUNTED
 
+        # Node location — resolved once at startup via IP geolocation
+        self._node_location: NodeLocation | None = None
+
         # P2P lifecycle manager (receiver subprocess + sender)
         self.p2p: P2PStack | None = None
+
+        # Queue populated by the bridge task that reads from the P2PStack's
+        # multiprocessing push_queue and forwards to this asyncio queue.
+        # ActivationQueue reads from this instead of polling the orchestrator.
+        self._p2p_push_queue: asyncio.Queue[ActivationPushMessage] = asyncio.Queue()
+        self._push_bridge_task: asyncio.Task | None = None
+
+        # Track miner start time for uptime reporting in peer status broadcasts.
+        self._start_time: float = time.time()
 
         # Input hash tracking: activation_id -> hash of input we received
         self.input_activation_hashes: dict[str, str] = {}
@@ -182,7 +222,39 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self._peer_semaphores_lock = asyncio.Lock()
         self._max_concurrent_per_peer = 2  # Based on benchmark: BI degrades at concurrency >= 5
 
-    async def _collect_attestation_payload(self, action: str) -> MinerAttestationPayload | EnclaveSignResponse | None:
+    def _stamp_registry_entry(self, entry: dict) -> dict:
+        """Ensure all miner-owned fields are present on a registry entry.
+
+        Called both from explicit write sites and from the ``on_update``
+        callback so that fields this miner is authoritative for
+        (``p2p_node_ids``, layer ``groups``) are never lost — not even when a
+        remote fetch or :meth:`~miner.sync.registry.NodeRegistry.apply_full_value`
+        re-injection overwrites the dict with stale data.
+        """
+        if self.p2p is not None:
+            entry["p2p_node_ids"] = self.p2p.node_ids
+        if self.state_manager.run_id is not None:
+            entry["groups"] = ["all", f"layer-{self.state_manager.layer}"]
+            entry["training_layer"] = self.state_manager.layer
+        return entry
+
+    def _on_registry_update(self, registry: NodeRegistry) -> None:
+        """Re-stamp our own entry after every remote fetch.
+
+        The miner is authoritative for its own ``p2p_node_ids``.  A
+        fetch from Redis may carry stale values for this field; this
+        callback restores it immediately so the next push sends the
+        correct data back.
+        """
+        node_id = self.compute_node.compute_node.node_id
+        entry = registry.get(node_id)
+        if entry is not None:
+            self._stamp_registry_entry(entry)
+            registry[node_id] = entry
+
+    async def _collect_attestation_payload(
+        self, action: str
+    ) -> MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None:
         if self.run_flags.attest.isOff():
             return None
 
@@ -200,12 +272,23 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
             if self.is_mounted:
                 challenge_id = json.loads(challenge_response.attestation_challenge_blob)["challenge_id"]
-                payload = await self.enclave_sign_with_purpose(
-                    purpose="attestation",
-                    payload=payload_base64_from_obj(challenge),
-                    challenge_id=challenge_id,
-                )
-                logger.debug(f"Signing attestation challenge {challenge_id} for action {action}")
+                challenge_base64 = payload_base64_from_obj(challenge)
+                try:
+                    payload = await self.collect_mounted_attestation(
+                        challenge_base64=challenge_base64,
+                        challenge_id=challenge_id,
+                    )
+                    logger.debug(f"Collecting mounted attestation challenge {challenge_id} for action {action}")
+                except Exception as mounted_exc:
+                    logger.warning(
+                        f"Mounted attestation collection failed for challenge {challenge_id}; falling back to enclave signature: {mounted_exc}"
+                    )
+                    payload = await self.enclave_sign_with_purpose(
+                        purpose="attestation",
+                        payload=challenge_base64,
+                        challenge_id=challenge_id,
+                    )
+                    logger.debug(f"Signing attestation challenge {challenge_id} for action {action}")
             else:
                 payload = await asyncio.to_thread(collect_attestation_payload, challenge)
 
@@ -267,17 +350,170 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             else:
                 setattr(self.run_flags, field_name, new_flag)
 
-    async def _start_p2p(self) -> None:
+    async def _start_p2p(self, timeout: float = 5.0) -> None:
         """Initialize and start the P2P stack (receiver subprocess + sender)."""
         self.p2p = P2PStack(
             cache_ttl=float(miner_settings.P2P_ACTIVATION_CACHE_TTL),
             max_cache_size=miner_settings.MAX_ACTIVATION_CACHE_SIZE,
         )
         seed = f"iota-miner-{self.wallet.hotkey.ss58_address}"
-        await self.p2p.start(seed=seed)
+        await self.p2p.start(seed=seed, timeout=timeout)
+
+        # Bridge: forward activation push messages from the multiprocessing
+        # queue (written by the receiver subprocess) into the asyncio queue
+        # consumed by ActivationQueue._drain_push_queue().
+        self._push_bridge_task = asyncio.create_task(
+            self._bridge_push_queue(),
+            name="PushBridge",
+        )
+
+        # Advertise P2PStack receiver IDs so peers can push activations
+        # and route status broadcasts to us.
+        node_id = self.compute_node.compute_node.node_id
+        entry = dict(self.node_registry.value.get(node_id) or self.compute_node.compute_node.model_dump())
+        self._stamp_registry_entry(entry)
+        self.node_registry.value[node_id] = entry
+        logger.info(f"P2P node IDs: {self.p2p.node_ids}")
+
+    async def _bridge_push_queue(self) -> None:
+        """Bridge multiprocessing.Queue -> asyncio.Queue for activation pushes.
+
+        The receiver subprocess writes ActivationPushMessage objects into
+        ``self.p2p.push_queue`` (a multiprocessing.Queue).  This task polls
+        that queue in a thread-executor and forwards messages into the
+        asyncio ``self._p2p_push_queue`` consumed by ActivationQueue.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                # Block in executor with a short timeout so we can be cancelled
+                msg = await loop.run_in_executor(None, self.p2p.push_queue.get, True, 0.5)
+                # Defensive: if the router passed raw bytes (e.g. model_cls
+                # was None due to type-hint resolution failure), deserialize
+                # here so consumers always get a Pydantic model.
+                if isinstance(msg, (bytes, bytearray)):
+                    import msgpack
+
+                    msg = ActivationPushMessage.model_validate(msgpack.unpackb(msg))
+                await self._p2p_push_queue.put(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Queue.get timeout or other transient error — just retry
+                await asyncio.sleep(0.1)
+
+    async def _broadcast_peer_status(self) -> None:
+        """Send current metrics to all miners on adjacent layers via routed UNI.
+
+        Fire-and-forget via P2PStack sender; errors are logged but never propagated.
+        """
+        if self.p2p is None or self.p2p.sender is None:
+            return
+        layer = self.state_manager.layer
+        if layer is None:
+            return
+
+        queue = self.training_phase._queue
+        msg = PeerStatusBroadcast(
+            source_hotkey=self.hotkey,
+            forward_queue_size=len(queue._forward_queue),
+            backward_queue_size=len(queue._backward_queue),
+            cache_size=len(self.training_phase._cache),
+            cache_capacity=miner_settings.MAX_ACTIVATION_CACHE_SIZE,
+            uptime_seconds=time.time() - self._start_time,
+            layer_phase=self.miner_api_client.layer_state.value,
+        )
+
+        # Collect p2p_node_ids from peers on adjacent layers
+        target_node_ids: list[str] = []
+        for adj in [layer - 1, layer + 1]:
+            if adj < 0:
+                continue
+            peers = self.node_registry.value.get_nodes_for_layer(adj)
+            for peer in peers:
+                if peer.p2p_node_ids:
+                    target_node_ids.extend(peer.p2p_node_ids)
+                else:
+                    logger.debug(f"Peer {peer.node_id[:8]}... in layer-{adj} has no p2p_node_ids")
+
+        if not target_node_ids:
+            logger.debug(f"No p2p_node_ids found on any adjacent-layer peer (layer={layer})")
+            return
+
+        try:
+            await self.p2p.sender.send_routed("/peer/status", target_node_ids, msg)
+            logger.debug(f"Broadcast peer status to {len(target_node_ids)} node(s)")
+        except Exception as exc:
+            logger.debug(f"Failed to broadcast peer status: {exc}")
+
+    def _sync_peer_status_into_registry(self) -> None:
+        """Read received peer status from the shared dict and merge into ComputeNode entries."""
+        if self.p2p is None:
+            return
+        peer_dict = self.p2p.peer_status_dict
+        if peer_dict is None:
+            return
+
+        # Snapshot the shared dict to avoid holding the proxy lock
+        try:
+            snapshot = dict(peer_dict)
+        except Exception:
+            return
+
+        # Build hotkey → node_id index from registry
+        hotkey_to_node_id: dict[str, str] = {}
+        for node in self.node_registry.value.all_nodes():
+            hotkey_to_node_id[node.node_id] = node.node_id  # node_id IS the hotkey
+
+        for source_hotkey, (status_dict, received_at) in snapshot.items():
+            node_id = hotkey_to_node_id.get(source_hotkey)
+            if node_id is None:
+                continue
+            entry = self.node_registry.value.get(node_id)
+            if entry is None:
+                continue
+            entry = dict(entry)
+            status_dict["last_status_received"] = received_at
+            entry["runtime_metrics"] = status_dict
+            self.node_registry.value[node_id] = entry
+
+    async def _peer_status_broadcast_loop(self) -> None:
+        """Background task: broadcast peer status to adjacent-layer miners
+        and sync received status into the node registry.
+
+        Stale node eviction is handled by SyncedNode._lead_check_loop.
+        """
+        broadcast_interval = 1.0
+        broadcast_timeout = 10.0
+        while True:
+            try:
+                await asyncio.wait_for(self._broadcast_peer_status(), timeout=broadcast_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Peer status broadcast timed out — sender may be stuck")
+            except Exception as exc:
+                logger.debug(f"Peer status broadcast error: {exc}")
+
+            try:
+                self._sync_peer_status_into_registry()
+            except Exception as exc:
+                logger.debug(f"Peer status sync error: {exc}")
+
+            if self.p2p and self.p2p.peer_status_dict:
+                n = len(self.p2p.peer_status_dict)
+                if n:
+                    logger.debug(f"Peer status dict has {n} entries")
+
+            await asyncio.sleep(broadcast_interval)
 
     async def _stop_p2p(self) -> None:
         """Shutdown the P2P stack."""
+        if self._push_bridge_task is not None:
+            self._push_bridge_task.cancel()
+            try:
+                await self._push_bridge_task
+            except asyncio.CancelledError:
+                pass
+            self._push_bridge_task = None
         if self.p2p is not None:
             await self.p2p.stop()
             self.p2p = None
@@ -288,6 +524,54 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         if self.p2p is not None:
             return self.p2p.node_id
         return None
+
+    @property
+    def cache(self):
+        """Expose the training phase's activation cache for the activation publisher."""
+        return self.training_phase._cache
+
+    async def push_activation(
+        self,
+        target_p2p_node_ids: list[str],
+        msg: ActivationPushMessage,
+    ) -> None:
+        """Push an activation to a peer via bidirectional P2P with ack.
+
+        Sends to **one** randomly chosen receiver from *target_p2p_node_ids*
+        and waits for a single-byte ack.  An ack from one receiver is sufficient.
+
+        Args:
+            target_p2p_node_ids: P2P node IDs of the target miner.
+            msg:                 The activation push message to send.
+
+        Raises:
+            SenderUnavailableError: If the sender subprocess is restarting or
+                unavailable.  Callers should retry with the same target.
+            ActivationPushNackError: If the receiver explicitly NACKs the push
+                (e.g. queue full).  Callers may re-enqueue or pick a different peer.
+            Exception: If the send fails for other reasons (peer unreachable,
+                network error, etc.).  Callers may retry with a different peer.
+        """
+        import random
+        from common.iroh.sender_subprocess import SenderUnavailableError
+        from common.iroh.activation_push import decode_push_ack, ActivationPushNackError
+
+        if self.p2p is None or self.p2p.sender is None:
+            raise SenderUnavailableError("Sender not available")
+
+        target = random.choice(target_p2p_node_ids)
+        ack_bytes = await self.p2p.sender.send_routed_bi_raw(
+            "/activation/push",
+            target,
+            msg,
+            max_message_size=128,
+        )
+        status = decode_push_ack(ack_bytes)
+        if status != P2PResponseStatus.SUCCESS:
+            raise ActivationPushNackError(
+                status,
+                f"Push {msg.activation_id} NACK from {target[:16]}...: {status.name}",
+            )
 
     async def cache_activation(self, activation_id: str, tensor_bytes: bytes) -> None:
         """Cache activation for P2P retrieval by other miners.
@@ -404,12 +688,21 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             logger.info(
                 f"🔄 Miner {self.hotkey[:8]} in Layer {self.state_manager.layer} is in state: {self.miner_api_client.layer_state}"
             )
+            logger.info(f"🔄 Node registry: {pprint.pformat(self.node_registry.value)}")
 
             if self.miner_api_client.layer_state == LayerPhase.TRAINING:
                 if self.need_to_pull_weights:
-                    if self.model_manager.epoch_on_registration == 1:
+                    # Only skip weight download on the very first epoch for miners that
+                    # registered at epoch 1 (no prior merge has happened yet).
+                    # epoch_counter is 0 before the first merge completes; after that,
+                    # merged weights always exist and must be downloaded.
+                    first_epoch_no_weights = (
+                        self.model_manager.epoch_on_registration == 1 and self.model_manager.epoch_counter == 0
+                    )
+                    if first_epoch_no_weights:
                         logger.info(
-                            f"Miner {self.hotkey[:8]} registered on epoch 1 - no merged weights to download, proceeding with current model weights"
+                            f"Miner {self.hotkey[:8]} registered on epoch 1 and has not completed a merge yet"
+                            " - no merged weights to download, proceeding with current model weights"
                         )
                     else:
                         try:
@@ -425,13 +718,34 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                         except MinerNotRegisteredException:
                             # Re-raise so training_loop can reset and re-register; do not retry download
                             raise
-                        except Exception as e:
-                            logger.exception(f"Error downloading and setting weights: {e}")
+                        except torch.cuda.OutOfMemoryError as e:
+                            self._weight_download_failures += 1
+                            torch.cuda.empty_cache()
+                            logger.error(
+                                f"Miner {self.hotkey[:8]} CUDA OOM downloading weights "
+                                f"(attempt {self._weight_download_failures}/3): {e}"
+                            )
+                            if self._weight_download_failures == 2:
+                                logger.error(
+                                    f"Miner {self.hotkey[:8]} hit {self._weight_download_failures} "
+                                    f"consecutive OOM failures — resetting to re-register"
+                                )
+                                self._weight_download_failures = 0
+                                raise MinerResetException("Persistent CUDA OOM during weight download") from e
+                            await asyncio.sleep(5)
+                            return
+
+                        except Exception:
+                            self._weight_download_failures += 1
                             logger.warning(
-                                f"Miner {self.hotkey[:8]} will NOT train until global weights are downloaded successfully... Retrying"
+                                f"Miner {self.hotkey[:8]} will NOT train until global weights "
+                                f"are downloaded successfully... Retrying "
+                                f"(attempt {self._weight_download_failures}/5)"
                             )
                             await asyncio.sleep(1)
                             return
+
+                        self._weight_download_failures = 0
 
                         # If miner is new to this layer, download global optimizer state (if feature enabled)
                         if self._needs_local_optimizer_state_download and self.run_flags.upload_optimizer_state.isOn():
@@ -486,6 +800,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     weight_path_per_layer, partitions = await get_weight_partition_info(
                         layer=self.state_manager.layer, miner_api_client=self.miner_api_client
                     )
+                    logger.info(
+                        f"🔄 Miner got weight partition info: {len(partitions)} partitions assigned, "
+                        f"{len(weight_path_per_layer)} miners submitted weights"
+                    )
 
                     if not partitions:
                         logger.info("🔄 Miner has no partitions to merge")
@@ -507,92 +825,103 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     await wait_for_state(state=LayerPhase.TRAINING, miner_api_client=self.miner_api_client)
 
                 self.model_manager.epoch_counter += 1
-                self.training_phase.local_optimization_steps = 0
+                await self.training_phase.epoch_reset()
                 return
 
             await asyncio.sleep(1.1)
 
     async def training_loop(self):
         """Main training loop delegating to tick with existing error handling."""
-        while True:
+        broadcast_task = asyncio.create_task(self._peer_status_broadcast_loop())
+        try:
+            while True:
+                try:
+                    await self.report_training_state(
+                        state="training_tick",
+                        run_id=self.state_manager.run_id,
+                        layer=self.state_manager.layer,
+                    )
+                    await self.training_loop_tick()
+                except RunFullException as e:
+                    logger.warning(
+                        f"🔄 Miner {self.hotkey[:8]} cannot join run because it is full. Retrying in 60 seconds: {e}"
+                    )
+                    await asyncio.sleep(60)
+                    await self.reset_miner_state()
+                    continue
+                except LayerStateException as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} layer state change...: {e}")
+                    await self.report_training_state(
+                        state="layer_state_change",
+                        detail=str(e),
+                        run_id=self.state_manager.run_id,
+                        layer=self.state_manager.layer,
+                    )
+                    continue
+                except MinerNotRegisteredException as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} miner not registered error: {e}")
+                    await self.reset_miner_state()
+                    continue
+                except MinerResetException as e:
+                    logger.warning(f"🔄 Miner {self.hotkey[:8]} needs reset: {e}")
+                    await self.reset_miner_state()
+                    continue
+                except APIException as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} API exception: {e}")
+                    continue
+                except RateLimitException as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} Rate limit exception: {e}")
+                    continue
+                except aiohttp.ClientResponseError as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} Client response error: {e}")
+                    continue
+                except (aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
+                    logger.warning(f"🔄 Miner {self.hotkey[:8]} Connection error (DNS/network): {e}. Retrying...")
+                    await asyncio.sleep(5)
+                    continue
+                except (asyncio.TimeoutError, TimeoutError) as e:
+                    logger.warning(f"🔄 Miner {self.hotkey[:8]} Timeout error: {e}")
+                    continue
+                except SubmittedWeightsError as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} Submitted weights error: {e}")
+                    continue
+                except MinerInitializingException as e:
+                    logger.warning(
+                        f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (initializing) and cannot perform work: {e}"
+                    )
+                    await self.register_set_status(status="initializing")
+                    await asyncio.sleep(60)
+                    continue
+                except MinerFrozenException as e:
+                    logger.warning(
+                        f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (initializing) and cannot perform work: {e}"
+                    )
+                    await self.register_set_status(status="frozen")
+                    await asyncio.sleep(60)
+                    continue
+                except MinerBlockedException as e:
+                    logger.warning(
+                        f"🔄 Miner {self.hotkey[:8]} has been temporarily blocked and cannot perform work: {e}"
+                    )
+                    await asyncio.sleep(60)
+                    continue
+                except WeightPartitionException as e:
+                    logger.info(f"🔄 Miner {self.hotkey[:8]} Partition exception: {e}")
+                    continue
+                except NanInfWarning as e:
+                    logger.info(f"⚠️ Miner {self.hotkey[:8]} NaN/Inf warning: {e}")
+                    continue
+                except NanInfException as e:
+                    logger.error(f"❌ Miner {self.hotkey[:8]} NaN/Inf exception: {e}")
+                    raise
+                except Exception:
+                    raise
+        finally:
+            broadcast_task.cancel()
             try:
-                await self.report_training_state(
-                    state="training_tick",
-                    run_id=self.state_manager.run_id,
-                    layer=self.state_manager.layer,
-                )
-                await self.training_loop_tick()
-            except RunFullException as e:
-                logger.warning(
-                    f"🔄 Miner {self.hotkey[:8]} cannot join run because it is full. Retrying in 60 seconds: {e}"
-                )
-                await asyncio.sleep(60)
-                await self.reset_miner_state()
-                continue
-            except LayerStateException as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} layer state change...: {e}")
-                await self.report_training_state(
-                    state="layer_state_change",
-                    detail=str(e),
-                    run_id=self.state_manager.run_id,
-                    layer=self.state_manager.layer,
-                )
-                continue
-            except MinerNotRegisteredException as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} miner not registered error: {e}")
-                await self.reset_miner_state()
-                continue
-            except APIException as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} API exception: {e}")
-                continue
-            except RateLimitException as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} Rate limit exception: {e}")
-                continue
-            except aiohttp.ClientResponseError as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} Client response error: {e}")
-                continue
-            except (aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
-                logger.warning(f"🔄 Miner {self.hotkey[:8]} Connection error (DNS/network): {e}. Retrying...")
-                await asyncio.sleep(5)
-                continue
-            except (asyncio.TimeoutError, TimeoutError) as e:
-                logger.warning(f"🔄 Miner {self.hotkey[:8]} Timeout error: {e}")
-                continue
-            except SubmittedWeightsError as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} Submitted weights error: {e}")
-                continue
-
-            except MinerInitializingException as e:
-                logger.warning(
-                    f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (initializing) and cannot perform work: {e}"
-                )
-                await self.register_set_status(status="initializing")
-                await asyncio.sleep(60)
-                continue
-
-            except MinerFrozenException as e:
-                logger.warning(
-                    f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (initializing) and cannot perform work: {e}"
-                )
-                await self.register_set_status(status="frozen")
-                await asyncio.sleep(60)
-                continue
-
-            except MinerBlockedException as e:
-                logger.warning(f"🔄 Miner {self.hotkey[:8]} has been temporarily blocked and cannot perform work: {e}")
-                await asyncio.sleep(60)
-                continue
-            except WeightPartitionException as e:
-                logger.info(f"🔄 Miner {self.hotkey[:8]} Partition exception: {e}")
-                continue
-            except NanInfWarning as e:
-                logger.info(f"⚠️ Miner {self.hotkey[:8]} NaN/Inf warning: {e}")
-                continue
-            except NanInfException as e:
-                logger.error(f"❌ Miner {self.hotkey[:8]} NaN/Inf exception: {e}")
-                raise
-            except Exception:
-                raise
+                await broadcast_task
+            except asyncio.CancelledError:
+                pass
 
     async def run(self):
         self._start_visualization_server_process(port=self.visualization_port)
@@ -619,6 +948,76 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         )
         await self.training_loop()
 
+    async def _apply_registration_response(self, response: MinerRegistrationResponse) -> tuple[int, int]:
+        """
+        Validate and apply a registration response to miner state.
+
+        Returns:
+            (assigned_layer, current_epoch)
+        """
+        if response.layer is None:
+            raise Exception(f"Miner {self.hotkey[:8]} registered with no layer assigned, this should not happen")
+        if response.num_partitions is None:
+            raise Exception(f"Number of partitions is None for miner {self.hotkey[:8]}")
+
+        old_run_id = self.state_manager.run_id
+        assigned_layer = int(response.layer)
+        current_epoch = int(response.current_epoch)
+
+        logger.debug(f"Number of partitions for miner {self.hotkey[:8]}: {response.num_partitions}")
+        self.model_manager.num_partitions = int(response.num_partitions)
+        self.num_partitions = int(response.num_partitions)
+
+        # TODO: clean these up
+        self.layer = assigned_layer
+        self.state_manager.layer = assigned_layer
+        self.state_manager.training_epoch_when_registered = current_epoch
+        self.state_manager.run_id = response.run_id
+        self.run_id = response.run_id
+        self.model_manager.epoch_on_registration = current_epoch
+        # Local merge-cycle count is per assignment; re-register / new run must not inherit the old value.
+        self.model_manager.epoch_counter = 0
+
+        layer_groups = ["all", f"layer-{assigned_layer}"]
+        self.compute_node.compute_node = self.compute_node.compute_node.model_copy(
+            update={"groups": layer_groups, "training_layer": assigned_layer}
+        )
+
+        self._update_run_flags(response.run_flags)
+
+        self.stats_tracker.reset()
+        self.stats_tracker.set_layer(assigned_layer)
+        self.stats_tracker.set_remote_epoch(current_epoch)
+        self.stats_tracker.set_run_id(response.run_id)
+
+        if sync_run_sync_prefix(old_run_id) != sync_run_sync_prefix(response.run_id):
+            self.node_registry.rebind_namespace(sync_run_sync_prefix(response.run_id))
+            # Pull existing registry from the bridge so we merge with peers
+            # that already registered under this run, rather than overwriting
+            # with a single-node snapshot.
+            try:
+                await self.node_registry.pull()
+            except Exception as exc:
+                logger.warning(f"Failed to pull node_registry after rebind (proceeding with local): {exc}")
+            self.node_registry.value.register(self.compute_node.compute_node)
+            await self.training_phase.rebind_backward_counter_for_run()
+
+        logger.success(
+            f"✅ Miner {self.hotkey[:8]} registered successfully in layer {assigned_layer} on training epoch {current_epoch}"
+        )
+        logger.debug(f"Run flags for miner {self.hotkey[:8]}: {self.run_flags}")
+
+        # Advertise layer membership so peers can find us for push routing.
+        node_id = self.compute_node.compute_node.node_id
+        entry = dict(self.node_registry.value.get(node_id) or self.compute_node.compute_node.model_dump())
+        self._stamp_registry_entry(entry)
+        self.node_registry.value[node_id] = entry
+        await self.node_registry.push()
+        logger.info(f"Registered with P2P node ID: {(self.p2p.node_id or 'n/a')[:16]}...")
+        logger.debug(f"Updated node registry groups: {layer_groups}")
+
+        return assigned_layer, current_epoch
+
     async def register(self) -> tuple[dict, dict]:
         """Single registration attempt. Raises on failure for caller to retry."""
         logger.info(f"🔄 Attempting to fetch run info for miner {self.hotkey[:8]}...")
@@ -638,47 +1037,52 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 "P2P must be initialized before registration."
             )
 
+        logger.info(f"Collecting system data (includes speedtest) for miner {self.hotkey[:8]}...")
+        system_data = collect_system_data()
+        if system_data:
+            try:
+                payload = json.loads(system_data)
+                if payload.get("bandwidth"):
+                    logger.info(f"Speedtest complete for miner {self.hotkey[:8]}: {payload['bandwidth']}")
+                else:
+                    logger.warning(
+                        f"No bandwidth in system data for miner {self.hotkey[:8]} (speedtest may have failed)"
+                    )
+            except json.JSONDecodeError:
+                pass
+        else:
+            logger.warning(f"Failed to collect system data for miner {self.hotkey[:8]}")
+
         register_request = RegisterMinerRequest(
             run_id=best_run.run_id,
             register_as_metagraph_miner=True,
             p2p_node_id=self.p2p_node_id,
+            system_data=system_data,
+            location=self._node_location,
         )
         response: MinerRegistrationResponse = await self.miner_api_client.register_miner_request(
             register_miner_request=register_request
         )
         logger.info(f"Registered with P2P node ID: {self.p2p_node_id[:16]}...")
 
-        assigned_layer = int(response.layer)
-        current_epoch = int(response.current_epoch)
-
-        logger.debug(f"Number of partitions for miner {self.hotkey[:8]}: {response.num_partitions}")
-
-        self.model_manager.num_partitions = int(response.num_partitions)
-        self.num_partitions = int(response.num_partitions)
-
-        if response.layer is None:
-            raise Exception(f"Miner {self.hotkey[:8]} registered with no layer assigned, this should not happen")
-
-        # TODO: clean these up
-        self.layer = assigned_layer
-        self.state_manager.layer = assigned_layer
-        self.state_manager.training_epoch_when_registered = current_epoch
-        self.state_manager.run_id = response.run_id
-        self.run_id = response.run_id
-        self.model_manager.epoch_on_registration = current_epoch
-
-        self._update_run_flags(response.run_flags)
+        await self._apply_registration_response(response)
         await self.register_set_status(status="registered")
 
-        self.stats_tracker.reset()
-        self.stats_tracker.set_layer(self.state_manager.layer)
-        self.stats_tracker.set_remote_epoch(current_epoch)
-        self.stats_tracker.set_run_id(response.run_id)
+        # Emit a location lifecycle event so geographic data is persisted to Snowflake
+        if self._node_location is not None and self.telemetry_service is not None:
+            location_event = LifecycleEvent(
+                type="node_location",
+                source_service="miner",
+                miner_hotkey=self.hotkey,
+                run_id=self.run_id,
+                event_category="node_location",
+                details=self._node_location.model_dump(),
+            )
+            self.telemetry_service.log(location_event)
+            logger.debug(
+                f"📍 Location event queued for telemetry: " f"{self._node_location.city}, {self._node_location.country}"
+            )
 
-        logger.success(
-            f"✅ Miner {self.hotkey[:8]} registered successfully in layer {self.state_manager.layer} on training epoch {current_epoch}"
-        )
-        logger.debug(f"Run flags for miner {self.hotkey[:8]}: {self.run_flags}")
         return response.model_cfg.model_dump(), response.model_metadata.model_dump()
 
     async def register_loop(self) -> tuple[dict, dict]:
@@ -823,6 +1227,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 metadata: dict = create_metadata(tensor=pseudo_gradients, num_sections=self.num_partitions)
                 metadata["local_optimization_steps"] = self.training_phase.local_optimization_steps
 
+                logger.info(
+                    f"submit_weights: uploading weights for {self.num_partitions} partitions "
+                    f"(1 weights S3 upload + 1 metadata S3 upload + 1 API submit call)"
+                )
                 # Convert tensor to bytes, handling bfloat16 compatibility
                 path = await upload_tensor(
                     tensor=pseudo_gradients,
@@ -900,8 +1308,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         logger.info("🚀 Starting miner 🚀")
         try:
+            # Resolve node location from public IP (best-effort, non-blocking on failure)
+            self._node_location = await resolve_node_location()
+
             # Start P2P before registration so we have a node_id to register with
             await self._start_p2p()
+            self.training_phase._publisher.start_send_loop()
             logger.info("P2P communication started")
 
             # Start the healthcheck server
@@ -951,6 +1363,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     self._stop_visualization_server_process()
                 except Exception as e:
                     logger.error(f"Failed to stop visualization server: {e}")
+
+                # Stop outbound send loop before P2P
+                try:
+                    self.training_phase._publisher.stop_send_loop()
+                except Exception as e:
+                    logger.error(f"Failed to stop outbound send loop: {e}")
 
                 # Stop P2P communication
                 try:
@@ -1073,9 +1491,31 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 submitted_weights_and_optimizers=weight_path_per_layer,
                 run_flags=self.run_flags,
             )
+            n_batches = min(miner_settings.N_PARTITION_BATCHES, len(partitions))
+            total_pseudograd_downloads = len(partitions) * len(filtered_metadata)
+            total_optimizer_downloads = len(partitions)
+            total_s3_uploads = len(partitions) * 3
+            logger.info(
+                f"merge_partitions: {len(partitions)} partitions across {n_batches} batches | "
+                f"{len(filtered_metadata)} miners contributing | "
+                f"expected requests: {len(weight_path_per_layer)} metadata + "
+                f"{total_pseudograd_downloads} pseudograd + "
+                f"{total_optimizer_downloads} optimizer downloads + "
+                f"{total_s3_uploads} S3 uploads + {n_batches} API submit calls"
+            )
+
+            async def submit_batch(final_partitions: list[MinerPartition]) -> None:
+                attestation_payload = await self._collect_attestation_payload(action="merged_partitions")
+                await self.miner_api_client.submit_merged_partitions(
+                    merged_partitions=final_partitions,
+                    attestation=attestation_payload,
+                )
+                logger.debug(f"{len(final_partitions)} batch partitions submitted")
+
+            submission_tasks: list[asyncio.Task] = []
             # Grab a batch of partitions to download the weights for
-            for batch in range(min(miner_settings.N_PARTITION_BATCHES, len(partitions))):
-                logger.debug(f"Merging batch {batch} of {min(miner_settings.N_PARTITION_BATCHES, len(partitions))}")
+            for batch in range(n_batches):
+                logger.debug(f"Merging batch {batch} of {n_batches}")
 
                 # Grab a batch of partitions to merge (no downloading yet)
                 batch_partitions: list[MergingPartition] = get_partition_batch(batch_index=batch, partitions=partitions)
@@ -1129,20 +1569,21 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
                 # Do the actual merging (apply the optimizer state to the weights)
                 weights_length = sum([p.numel() for p in old_model.parameters()])
+                current_global_epoch = self.model_manager.epoch_on_registration + self.model_manager.epoch_counter
                 merged_partitions = await merge_partition_batch(
                     partition_batch=merging_partitions,
                     filtered_metadata=filtered_metadata,
                     old_model=old_model,
-                    local_optimizer_state=self.model_manager.optimizer,
                     weights_length=weights_length,
                     num_partitions=self.num_partitions,
                     device=device,
                     run_flags=self.run_flags,
+                    epoch=current_global_epoch,
                 )
                 logger.debug(f"{len(merged_partitions)} batch partitions merged")
                 log_gpu_memory_usage(note=f"after merging partitions on {device}")
 
-                # Upload the merged partitions to the database and return list of MinerPartition
+                # Upload the merged partitions to S3 and fire off submission in the background
                 final_partitions = await upload_partition_batch(
                     merged_partitions=merged_partitions,
                     hotkey=self.wallet.hotkey,
@@ -1150,18 +1591,15 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     run_flags=self.run_flags,
                 )
                 logger.debug(f"{len(final_partitions)} batch partitions uploaded")
-
-                # Submit the merged partitions to the database
-                attestation_payload = await self._collect_attestation_payload(action="merged_partitions")
-                await self.miner_api_client.submit_merged_partitions(
-                    merged_partitions=final_partitions,
-                    attestation=attestation_payload,
-                )
-                logger.debug(f"{len(final_partitions)} batch partitions submitted")
+                submission_tasks.append(asyncio.create_task(submit_batch(final_partitions)))
 
                 self.model_manager.model = self.model_manager.model.to(self.device)
 
                 del old_model
                 del merged_partitions  # TODO: @cassova: do a better job of cleaning this up
-                del final_partitions  # TODO: @cassova: do a better job of cleaning this up
+                del final_partitions
                 log_gpu_memory_usage(note="after merging partitions")
+
+            # Wait for all background submission tasks to complete
+            await asyncio.gather(*submission_tasks)
+            logger.debug(f"All {len(submission_tasks)} batch submission tasks completed")

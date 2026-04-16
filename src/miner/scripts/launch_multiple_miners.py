@@ -122,7 +122,7 @@ def run_single_miner_process(wallet_name: str, wallet_hotkey: str, miner_id: int
     logger.add(
         sys.stderr,
         format=f"<green>{{time:YYYY-MM-DD HH:mm:ss.SSS}}</green> | <level>{{level: <8}}</level> | <cyan>MINER-{miner_id}</cyan> | <level>{{message}}</level>",
-        level="DEBUG",
+        level=common_settings.LOG_LEVEL,
         colorize=True,
     )
     if common_settings.LOG_FILE_ENABLED:
@@ -135,7 +135,7 @@ def run_single_miner_process(wallet_name: str, wallet_hotkey: str, miner_id: int
         logger.add(
             log_file,
             format=f"{{time:YYYY-MM-DD HH:mm:ss.SSS}} | {{level: <8}} | MINER-{miner_id} | {{message}}",
-            level="DEBUG",
+            level="DEBUG",  # Log file always captures DEBUG for post-hoc analysis
             rotation="10 MB",
             retention="10 days",
             colorize=False,
@@ -266,7 +266,7 @@ def main():
     logger.add(
         sys.stderr,
         format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>MAIN</cyan> | <level>{message}</level>",
-        level="DEBUG",
+        level=common_settings.LOG_LEVEL,
         colorize=True,
     )
     if common_settings.LOG_FILE_ENABLED:
@@ -279,7 +279,7 @@ def main():
         logger.add(
             log_file,
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | MAIN | {message}",
-            level="DEBUG",
+            level="DEBUG",  # Log file always captures DEBUG for post-hoc analysis
             rotation="10 MB",
             retention="10 days",
             colorize=False,

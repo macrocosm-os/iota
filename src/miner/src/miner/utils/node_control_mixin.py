@@ -10,6 +10,7 @@ from common.models.api_models import (
     TrainingStateResponse,
     EnclaveGetKeyIdResponse,
     EnclaveSignResponse,
+    MountedAttestationPayload,
     RegisterSetBestRunResponse,
     RegisterSetStatusResponse,
     RegisterStatus,
@@ -277,6 +278,10 @@ class NodeControlMixin:
         for attempt in range(1, retries + 1):
             try:
                 res = await self._control_post_json("/enclave/sign", req, timeout_s=timeout_s)
+                # Never forward enclave public keys in attestation submissions;
+                # orchestrator verifies signatures against the key pinned at registration.
+                res.pop("public_key_base64", None)
+                res.pop("publicKeyX963Base64", None)
                 res["challenge_id"] = challenge_id
                 return EnclaveSignResponse(**res)
             except Exception as e:
@@ -309,3 +314,42 @@ class NodeControlMixin:
             dp_keychain=dp_keychain,
             challenge_id=challenge_id,
         )
+
+    async def collect_mounted_attestation(
+        self,
+        *,
+        challenge_base64: str,
+        challenge_id: Optional[str] = None,
+        schema_version: Optional[int] = None,
+        dp_keychain: Optional[bool] = None,
+        timeout_s: float = 30.0,
+        retries: int = 3,
+    ) -> MountedAttestationPayload:
+        if not self._is_mounted:
+            raise RuntimeError("Node control disabled; collect_mounted_attestation unavailable")
+
+        await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
+
+        req: Dict[str, Any] = {
+            "challengeBase64": challenge_base64,
+        }
+        if challenge_id is not None:
+            req["challengeId"] = challenge_id
+        if schema_version is not None:
+            req["schemaVersion"] = schema_version
+        if dp_keychain is not None:
+            req["dpKeychain"] = dp_keychain
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                res = await self._control_post_json("/attestation/collect", req, timeout_s=timeout_s)
+                res["challenge_id"] = challenge_id
+                return MountedAttestationPayload(**res)
+            except Exception as e:
+                last_err = e
+                logger.warning(f"collect_mounted_attestation failed (attempt {attempt}/{retries}): {e}")
+                await asyncio.sleep(2 * attempt)
+                await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
+
+        raise RuntimeError(f"Failed to collect_mounted_attestation after retries: {last_err}")

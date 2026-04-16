@@ -10,10 +10,12 @@ dependencies = [
     "subnet",
     "textual>=0.74.0",
     "psutil>=7.1.1",
+    "speedtest-cli>=2.1.3",
     "blessed>=1.23.0",
-    "bittensor-cli>=9.13.1",
     "platformdirs>=4.5.0",
     "prometheus_client>=0.20.0",
+    "httpx>=0.27.0",
+    "jsonpatch>=1.33",
 ]
 
 [tool.uv]

@@ -28,6 +28,9 @@ class RunFlags(BaseModel):
     weighted_partition_averaging: RunFlag = RunFlag(enabled=True)
     clip_pseudo_gradients: RunFlag = RunFlag()
     use_AdamW: RunFlag = RunFlag()
+    peer_eviction: RunFlag = RunFlag()
+    auto_max_cache: RunFlag = RunFlag()
+    sync_patches: RunFlag = RunFlag(enabled=True)
 
 
 RUN_FLAGS = RunFlags()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from common.models.run_flags import RunFlags
-from typing import Any
 from miner.utils.timer_logger import TimerLoggerMiner
 import torch
 from loguru import logger
@@ -22,12 +21,18 @@ from subnet.model.utils import compute_loss, log_gpu_memory_usage
 from subnet.model import gpu_device
 
 from miner.utils.stats import StatsTracker
+from miner.sync import DistributedCounter, NodeRegistry, SyncedVariable
+from miner.sync.variable import sync_run_sync_prefix
+from common.utils.lr_scheduler import make_lr_scheduler
 from miner.telemetry.metric_registry import (
     ACTIVATIONS_PROCESSED_TOTAL,
     BACKWARD_PASS_DURATION_SECONDS,
     FORWARD_PASS_DURATION_SECONDS,
     TRAINING_LOSS,
 )
+
+if False:  # for typing purposes only
+    from miner.new_miner import Miner
 
 
 class TrainingPhase:
@@ -39,8 +44,9 @@ class TrainingPhase:
         device: str,
         run_flags: RunFlags,
         mock: bool,
+        node_registry: SyncedVariable[NodeRegistry],
+        miner: Miner,  # ty: ignore[invalid-type-form]
         is_mounted: bool = False,
-        miner: Any | None = None,
     ):
         self._miner_api_client = miner_api_client
         self._state_manager = state_manager
@@ -49,7 +55,7 @@ class TrainingPhase:
         self._device = device
         self._run_flags = run_flags
         self._mock = mock
-        self._cache: ActivationCache = ActivationCache(miner_api_client=self._miner_api_client)
+        self._cache: ActivationCache = ActivationCache(hotkey=self._hotkey)
         self._queue: ActivationQueue = ActivationQueue(
             miner_api_client=self._miner_api_client,
             state_manager=self._state_manager,
@@ -58,16 +64,71 @@ class TrainingPhase:
             run_flags=self._run_flags,
             miner=miner,
         )
+        from miner.training.peer_selection import select_by_capacity
+
         self._publisher = ActivationPublisher(
-            miner_api_client=self._miner_api_client, run_flags=self._run_flags, miner=miner
+            miner_api_client=self._miner_api_client,
+            run_flags=self._run_flags,
+            miner=miner,
+            node_registry=node_registry,
+            peer_selector=select_by_capacity,
         )
         self._stats_tracker: StatsTracker | None = None
         self.backwards_since_reset = 0
         self.backwards_since_last_optim = 0
         self.local_optimization_steps = 0
         self.is_mounted = is_mounted
+        self._auto_max_cache_frozen: bool = False
+        if self._run_flags.auto_max_cache.isOn():
+            self._cache._warmup_active = True
         self.miner = miner
         self._loss_on_cpu: bool = False
+        self.node_registry = node_registry
+        # Counter is created lazily after registration so Redis keys include ``run_id``.
+        self._backward_counter: DistributedCounter | None = None
+        self._counter_started: bool = False
+        self._lr_scheduler = make_lr_scheduler()
+
+    async def rebind_backward_counter_for_run(self) -> None:
+        """Drop the distributed counter so the next opt step binds a run-scoped Redis key."""
+        if self._backward_counter is not None:
+            await self._backward_counter.stop()
+            self._backward_counter = None
+        self._counter_started = False
+
+    async def _ensure_backward_counter(self) -> DistributedCounter:
+        """Build or replace the backward counter for the current run and layer."""
+        ns = sync_run_sync_prefix(self._state_manager.run_id)
+        name = f"global_backward_count_{self._state_manager.layer}"
+        if (
+            self._backward_counter is not None
+            and getattr(self._backward_counter, "_namespace", None) == ns
+            and getattr(self._backward_counter, "_name", None) == name
+        ):
+            return self._backward_counter
+        if self._backward_counter is not None:
+            await self._backward_counter.stop()
+        self._backward_counter = DistributedCounter(
+            name=name,
+            server_url=common_settings.BRIDGE_URL.rstrip("/"),
+            namespace=ns,
+            poll_interval=5,
+        )
+        return self._backward_counter
+
+    def _record_forward_timing(self, activation_data: ActivationData, start_time: float, end_time: float) -> None:
+        if self._stats_tracker is None:
+            return
+        stats = self._stats_tracker.ensure_activation_stats(
+            activation_data.activation_id,
+            direction=activation_data.direction,
+        )
+        stats.timing.forward.start = start_time
+        stats.timing.forward.end = end_time
+        stats.timing.forward.duration = end_time - start_time
+        stats.timing.forward.cache_len = len(self._cache)
+        stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
+        stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
 
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker and propagate to child components."""
@@ -92,7 +153,7 @@ class TrainingPhase:
                 await self._queue.check_if_training_is_complete()
 
                 if self._cache.is_full() and self._queue.next_activation_is_forward():
-                    logger.info(f"Activation cache is full. Waiting for backwards activations: {len(self._cache)}")
+                    logger.debug(f"Activation cache is full ({len(self._cache)}), waiting for backward activations")
                     await asyncio.sleep(1)
                     continue
 
@@ -122,7 +183,11 @@ class TrainingPhase:
                         await self.forward(activation)
                     elif activation.direction == "backward":
                         await self.backward(activation)
+
                 # Loop until LayerStateException is raised by `get_activation`
+                logger.debug(
+                    f"Node registry contains nodes: {[node.node_id for node in self.node_registry.value.all_nodes()]}"
+                )
         except Exception:
             logger.info("Finishing training phase")
             raise
@@ -161,8 +226,8 @@ class TrainingPhase:
                 if self._stats_tracker is not None:
                     self._stats_tracker.record_forward()
                 start_time = time.time()
-                logger.info(
-                    f"🚀 Starting FORWARD pass for layer {self._state_manager.layer} | Processing activation {activation_data.activation_id} | Miner: {self._hotkey[:8]}"
+                logger.debug(
+                    f"Starting FORWARD pass | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                 )
                 log_gpu_memory_usage(note="starting training forward pass")
                 if self._state_manager.layer == 0:
@@ -185,18 +250,7 @@ class TrainingPhase:
                     logger.debug(
                         f"Last layer miner, performing backward pass for activation {activation_data.activation_id}"
                     )
-                    end_time = time.time()
-                    if self._stats_tracker is not None:
-                        stats = self._stats_tracker.ensure_activation_stats(
-                            activation_data.activation_id,
-                            direction=activation_data.direction,
-                        )
-                        stats.timing.forward.start = start_time
-                        stats.timing.forward.end = end_time
-                        stats.timing.forward.duration = end_time - start_time
-                        stats.timing.forward.cache_len = len(self._cache)
-                        stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
-                        stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
+                    self._record_forward_timing(activation_data, start_time, end_time=time.time())
                     return await self.backward(activation_data=activation_data)
 
                 logger.debug(f"Forwarding activation of size {activation_data.input_activations.shape}")
@@ -210,22 +264,8 @@ class TrainingPhase:
                 logger.debug(f"Activation shape after forward: {output_activations_cpu.shape}")
                 log_gpu_memory_usage(note="after training forward pass")
 
-                # If we are not on the last layer, we just need to upload the activations
-                logger.info(
-                    f"output activations before upload with shape {output_activations_cpu.shape} for {self._hotkey[:8]} on layer {self._state_manager.layer}"
-                )
                 end_time = time.time()
-                if self._stats_tracker is not None:
-                    stats = self._stats_tracker.ensure_activation_stats(
-                        activation_data.activation_id,
-                        direction=activation_data.direction,
-                    )
-                    stats.timing.forward.start = start_time
-                    stats.timing.forward.end = end_time
-                    stats.timing.forward.duration = end_time - start_time
-                    stats.timing.forward.cache_len = len(self._cache)
-                    stats.timing.forward.forward_queue_len = len(self._queue._forward_queue)
-                    stats.timing.forward.backward_queue_len = len(self._queue._backward_queue)
+                self._record_forward_timing(activation_data, start_time, end_time)
 
                 layer_idx = str(self._state_manager.layer)
                 FORWARD_PASS_DURATION_SECONDS.labels(layer_idx=layer_idx).observe(end_time - start_time)
@@ -240,11 +280,16 @@ class TrainingPhase:
                     attestation_crypto=activation_data.attestation_crypto,
                     upload_url=activation_data.upload_url,
                     activation_path=activation_data.activation_upload_path,
+                    source_p2p_node_ids=None,  # forward: publisher picks next-layer peer from registry
+                    sample_path=activation_data.target_download_url,
                 )
 
                 log_gpu_memory_usage(note="after training forward pass cleaning on non-last layer miner")
                 logger.success(
-                    f"✅ Successfully completed FORWARD pass for activation {activation_data.activation_id} on layer {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
+                    f"✅ FORWARD complete | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
+                )
+                logger.debug(
+                    f"Node registry in forward contains: {[m.node_id for m in self.node_registry.value.all_nodes()]}"
                 )
 
     async def backward(self, activation_data: ActivationData):
@@ -264,6 +309,10 @@ class TrainingPhase:
                 all_input_activations_grads = []
                 losses = []
 
+                logger.info(
+                    f"🔄 BACKWARD pass | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
+                )
+
                 # Sub-phase timing accumulators (accumulated across local batch iterations)
                 gpu_setup_total = 0.0
                 bwd_fwd_total = 0.0
@@ -273,10 +322,7 @@ class TrainingPhase:
 
                 for i in range(0, len(activation_data.input_activations), miner_settings.LOCAL_BATCH_SIZE):
                     log_gpu_memory_usage(
-                        note=f"after training forward pass cleaning on last layer miner with cach size of {len(self._cache)}"
-                    )
-                    logger.info(
-                        f"🔄 Starting BACKWARD pass for activation {activation_data.activation_id} | Layer: {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
+                        note=f"after training forward pass cleaning on last layer miner with cache size of {len(self._cache)}"
                     )
                     gpu_setup_start = time.time()
                     async with TimerLoggerMiner(name="moving to gpu", hotkey=self._hotkey[:8]):
@@ -326,10 +372,6 @@ class TrainingPhase:
 
                     log_gpu_memory_usage(note="after preparing activations on training backward pass")
 
-                    logger.info(
-                        f"output activations before backward with shape {output_activations_gpu.shape} for {self._hotkey[:8]} on layer {self._state_manager.layer}"
-                    )
-
                     # Compute loss; if targets download or loss computation fails, skip backward gracefully
                     if last_layer:
                         try:
@@ -354,7 +396,6 @@ class TrainingPhase:
                             )
                             return
 
-                    logger.debug(f"State: {state}")
                     bwd_pass_start = time.time()
                     async with TimerLoggerMiner(name="backward pass", hotkey=self._hotkey[:8]):
                         await self._model_manager._backward(
@@ -424,7 +465,11 @@ class TrainingPhase:
                     if losses:
                         mean_loss = sum(losses) / len(losses)
                         TRAINING_LOSS.labels(layer_idx=layer_idx).set(mean_loss)
-                        self._publisher.publish_loss(loss=mean_loss, activation_id=activation_data.activation_id)
+                        self._publisher.publish_loss(
+                            loss=mean_loss,
+                            activation_id=activation_data.activation_id,
+                            layer_idx=self._state_manager.layer,
+                        )
                         if self._stats_tracker is not None:
                             self._stats_tracker.record_loss(mean_loss)
                     self._publisher.publish_activation(
@@ -436,11 +481,24 @@ class TrainingPhase:
                         attestation_crypto=activation_data.attestation_crypto,
                         upload_url=activation_data.upload_url,
                         activation_path=activation_data.activation_upload_path,
+                        source_p2p_node_ids=self._cache[activation_data.activation_id].source_p2p_node_ids or None,
                     )
 
                 async with TimerLoggerMiner(name="cleaning up cache", hotkey=self._hotkey[:8]):
                     # Cleanup cache
                     del self._cache[activation_data.activation_id]
+
+                    # auto_max_cache: freeze max cache size after N backward activations
+                    if self._run_flags.auto_max_cache.isOn() and not self._auto_max_cache_frozen:
+                        if self.backwards_since_reset >= common_settings.N_BACKWARDS_FOR_CACHE_INCREASE_STOP:
+                            frozen_size = len(self._cache)
+                            logger.info(
+                                f"🔒 auto_max_cache: freezing max cache size at {frozen_size} "
+                                f"after {self.backwards_since_reset} backward activations | hotkey={self._hotkey[:8]}"
+                            )
+                            self._cache._warmup_active = False
+                            self._cache._frozen_max_size = frozen_size
+                            self._auto_max_cache_frozen = True
 
                     # Cleanup GPU memory
                     del output_activations_gpu, cached_input_activation, backwards_grads_from_previous_miner
@@ -450,11 +508,22 @@ class TrainingPhase:
 
                         # Check if we need to perform a local optimization step
                         self.backwards_since_last_optim += 1
-                        if self.backwards_since_last_optim >= common_settings.MINI_BATCH_ACCUMULATION_COUNT:
+                        mini_batch_accumulation_count = (
+                            self._model_manager.model_metadata.get("mini_batch_accumulation_count")
+                            or common_settings.MINI_BATCH_ACCUMULATION_COUNT
+                        )
+                        if self.backwards_since_last_optim >= mini_batch_accumulation_count:
                             logger.info(
-                                f"🔄 Miner {self._hotkey[:8]} performing local optimization step after {common_settings.MINI_BATCH_ACCUMULATION_COUNT} backward passes"
+                                f"🔄 Local optimization step after {mini_batch_accumulation_count} backward passes | hotkey={self._hotkey[:8]}"
                             )
-                            learning_rate = await self._miner_api_client.get_learning_rate()
+                            if not self._counter_started:
+                                counter = await self._ensure_backward_counter()
+                                await counter.start()
+                                self._counter_started = True
+                            global_step = await self._backward_counter.increment()
+                            logger.debug(f"Global step for miner {self._hotkey[:8]}: {global_step}")
+                            learning_rate = self._lr_scheduler.step(global_step)
+                            logger.debug(f"LR at global step {global_step}: {learning_rate}")
                             await self._model_manager.local_optimization_step(learning_rate=learning_rate)
                             await self.optimization_reset()
 
@@ -462,11 +531,11 @@ class TrainingPhase:
 
                             self.local_optimization_steps += 1
                             logger.success(
-                                f"✅ Miner {self._hotkey[:8]} completed local optimization step #{self.local_optimization_steps}"
+                                f"✅ Optimization step #{self.local_optimization_steps} | hotkey={self._hotkey[:8]}"
                             )
 
                         logger.success(
-                            f"✅ Successfully completed BACKWARD pass for activation {activation_data.activation_id} | Layer: {self._state_manager.layer} | Miner: {self._hotkey[:8]}"
+                            f"✅ BACKWARD complete | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                         )
 
                 if self._stats_tracker is not None:
@@ -534,8 +603,24 @@ class TrainingPhase:
         self.backwards_since_reset = 0
         self.local_optimization_steps = 0
         self._loss_on_cpu = False
+        self._auto_max_cache_frozen = False
+        self._cache._frozen_max_size = None
+        self._cache._warmup_active = self._run_flags.auto_max_cache.isOn()
         await self.optimization_reset()
         await self._publisher.reset()
+
+    async def epoch_reset(self):
+        """Reset cache and queues between epochs.
+
+        Model weights change entirely after a merge, so all cached activations
+        and queued work from the previous epoch are stale and must be discarded.
+        """
+        logger.debug("🗑️ Resetting for new epoch")
+        self.local_optimization_steps = 0
+        await self._cache.reset()
+        self._queue._forward_queue.clear()
+        self._queue._backward_queue.clear()
+        log_gpu_memory_usage(note="after epoch reset")
 
     async def optimization_reset(self):
         """Reset the cache and backward pass counter after performing optimization step."""
