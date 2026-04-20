@@ -114,17 +114,45 @@ class DistributedCounter:
         return f"{self._namespace}/{self._name}"
 
     async def _do_delta(self, delta: int) -> int:
+        """Atomically add *delta* to the counter; returns the new value.
+
+        Retries only on connection-setup failures (TCP connect / TLS handshake)
+        because those happen before the request is sent, so retrying cannot
+        double-apply the delta. Post-send errors (ReadError, ReadTimeout,
+        RemoteProtocolError, HTTPStatusError) are propagated so the caller's
+        error handling can decide without risking duplicated increments.
+        """
         if self._client is None:
             raise RuntimeError("DistributedCounter is not started — use it as an async context manager")
-        resp = await self._client.post(
-            f"/counter/{self._service}/{self._server_key()}",
-            json={"delta": delta},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._value = int(data["value"])
-        self._version = int(data["version"])
-        return self._value
+
+        max_attempts = 3
+        backoff = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await self._client.post(
+                    f"/counter/{self._service}/{self._server_key()}",
+                    json={"delta": delta},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._value = int(data["value"])
+                self._version = int(data["version"])
+                return self._value
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if attempt >= max_attempts:
+                    logger.error(
+                        f"[{self._node_id}] counter delta exhausted {max_attempts} attempts: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    raise
+                logger.warning(
+                    f"[{self._node_id}] counter delta attempt {attempt}/{max_attempts} failed "
+                    f"({type(exc).__name__}: {exc}); retrying in {backoff:.1f}s"
+                )
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+        raise RuntimeError("unreachable: _do_delta retry loop exited without returning or raising")
 
     async def _put_value(self, value: int) -> None:
         if self._client is None:

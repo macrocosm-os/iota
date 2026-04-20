@@ -420,13 +420,11 @@ class TrainingPhase:
                             self._model_manager.model_config["bottleneck_dim"]
                             or self._model_manager.model_config["emb_dim"]
                         )
-                        # Detach and convert to bfloat16 to ensure we only save the values
-                        # NOTE: if we cast to bfloat16 after moving to CPU, there will be extra load if the grad is huge
-                        # but if we do it before, we'll be taking up additional GPU memory
-                        grad_flattened = emb_weight.grad.detach().cpu().to(torch.bfloat16).flatten()
-                        input_activation_grads = grad_flattened[
-                            : common_settings.SEQUENCE_LENGTH * embedding_dim * common_settings.MINI_BATCH_SIZE
-                        ]
+                        n_grad_elems = common_settings.SEQUENCE_LENGTH * embedding_dim * common_settings.MINI_BATCH_SIZE
+                        # Same values as flatten().cpu()[:n] before, but slice + bf16 on GPU then D2H only for the prefix.
+                        input_activation_grads = (
+                            emb_weight.grad.detach().reshape(-1)[:n_grad_elems].to(torch.bfloat16).cpu()
+                        )
                     else:
                         input_activation_grads = sliced_cached_input_activation.grad.detach().cpu()
                     grad_extract_total += time.time() - grad_extract_start

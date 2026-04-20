@@ -30,22 +30,27 @@ if NETWORK == "local":
     ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", 8000))
     ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "localhost")
     ORCHESTRATOR_SCHEMA = os.getenv("ORCHESTRATOR_SCHEME", "http")
+
+    BRIDGE_URL = os.getenv("BRIDGE_URL", "http://localhost:8001/sync")
 elif NETWORK == "test":
     # Testnet
     ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", 443))
     ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "iota-branch-main.api.macrocosmos.ai")
     ORCHESTRATOR_SCHEMA = os.getenv("ORCHESTRATOR_SCHEME", "https")
+
+    BRIDGE_URL = os.getenv("BRIDGE_URL", "https://iota-branch-main.api.macrocosmos.ai/sync")
 else:
     # Mainnet
     ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", 443))
     ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "iota.api.macrocosmos.ai")
     ORCHESTRATOR_SCHEMA = os.getenv("ORCHESTRATOR_SCHEME", "https")
 
+    BRIDGE_URL = os.getenv("BRIDGE_URL", "https://iota.api.macrocosmos.ai/sync")
+
 ORCHESTRATOR_URL = f"{ORCHESTRATOR_SCHEMA}://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}"
 REQUEST_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", "3"))
 
 # Bridge settings
-BRIDGE_URL = os.getenv("BRIDGE_URL", "http://localhost:8001/sync")
 CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", "40"))  # TODO: Make this 20s
 
 MIN_PART_SIZE = 10 * 1024 * 1024  # 10MB

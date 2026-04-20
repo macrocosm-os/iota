@@ -27,6 +27,7 @@ from miner.telemetry import TelemetryBufferService
 from miner.utils.stats import StatsTracker
 import torch
 import aiohttp
+import httpx
 from bittensor import Wallet
 from subnet.common_api_client import CommonAPIClient
 from miner.health_server import HealthServerMixin
@@ -877,6 +878,20 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     continue
                 except (aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
                     logger.warning(f"🔄 Miner {self.hotkey[:8]} Connection error (DNS/network): {e}. Retrying...")
+                    await asyncio.sleep(5)
+                    continue
+                except (
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                    httpx.ReadError,
+                    httpx.ReadTimeout,
+                    httpx.WriteError,
+                    httpx.RemoteProtocolError,
+                    httpx.PoolTimeout,
+                ) as e:
+                    logger.warning(
+                        f"🔄 Miner {self.hotkey[:8]} httpx transient error ({type(e).__name__}): {e}. Retrying..."
+                    )
                     await asyncio.sleep(5)
                     continue
                 except (asyncio.TimeoutError, TimeoutError) as e:
