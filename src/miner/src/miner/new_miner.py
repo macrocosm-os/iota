@@ -27,6 +27,7 @@ from miner.telemetry import TelemetryBufferService
 from miner.utils.stats import StatsTracker
 import torch
 import aiohttp
+import httpx
 from bittensor import Wallet
 from subnet.common_api_client import CommonAPIClient
 from miner.health_server import HealthServerMixin
@@ -164,20 +165,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.compute_node.bind_registry(self.node_registry)
         self.node_registry.value.register(self.compute_node.compute_node)
 
-        # Pass node_registry as a parameter after it has been initialized above
-        self.training_phase: TrainingPhase = TrainingPhase(
-            miner_api_client=self.miner_api_client,
-            state_manager=self.state_manager,
-            model_manager=self.model_manager,
-            device=self.device,
-            run_flags=self.run_flags,
-            mock=self.mock,
-            is_mounted=miner_settings.IS_MOUNTED,
-            miner=self,
-            node_registry=self.node_registry,
-        )
         self.stats_tracker = StatsTracker()
-        self.training_phase.attach_stats_tracker(self.stats_tracker)
+
+        # To be created on registration.
+        self.training_phase: TrainingPhase | None = None
+
         self._latest_attestation_payloads: dict[
             str, MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse
         ] = {}
@@ -528,6 +520,8 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
     @property
     def cache(self):
         """Expose the training phase's activation cache for the activation publisher."""
+        if self.training_phase is None:
+            return None
         return self.training_phase._cache
 
     async def push_activation(
@@ -825,6 +819,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     await wait_for_state(state=LayerPhase.TRAINING, miner_api_client=self.miner_api_client)
 
                 self.model_manager.epoch_counter += 1
+                await self._clear_stale_p2p_state()
                 await self.training_phase.epoch_reset()
                 return
 
@@ -877,6 +872,20 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     continue
                 except (aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
                     logger.warning(f"🔄 Miner {self.hotkey[:8]} Connection error (DNS/network): {e}. Retrying...")
+                    await asyncio.sleep(5)
+                    continue
+                except (
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                    httpx.ReadError,
+                    httpx.ReadTimeout,
+                    httpx.WriteError,
+                    httpx.RemoteProtocolError,
+                    httpx.PoolTimeout,
+                ) as e:
+                    logger.warning(
+                        f"🔄 Miner {self.hotkey[:8]} httpx transient error ({type(e).__name__}): {e}. Retrying..."
+                    )
                     await asyncio.sleep(5)
                     continue
                 except (asyncio.TimeoutError, TimeoutError) as e:
@@ -937,18 +946,24 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         await self.report_training_state(state="resetting")
         await self.reset_miner_state()
+        await self.compute_node.start()
         logger.info(f"🚀 Starting miner {self.hotkey[:8]} on layer {self.layer} | Timeout: {miner_settings.TIMEOUT}s")
 
-        await self.report_training_state(
-            state="waiting_training", run_id=self.state_manager.run_id, layer=self.state_manager.layer
-        )
-        await wait_for_state(state=LayerPhase.TRAINING, miner_api_client=self.miner_api_client, raise_bad_sync=False)
-        await self.report_training_state(
-            state="training", run_id=self.state_manager.run_id, layer=self.state_manager.layer
-        )
-        await self.training_loop()
+        try:
+            await self.report_training_state(
+                state="waiting_training", run_id=self.state_manager.run_id, layer=self.state_manager.layer
+            )
+            await wait_for_state(
+                state=LayerPhase.TRAINING, miner_api_client=self.miner_api_client, raise_bad_sync=False
+            )
+            await self.report_training_state(
+                state="training", run_id=self.state_manager.run_id, layer=self.state_manager.layer
+            )
+            await self.training_loop()
+        finally:
+            await self.compute_node.stop()
 
-    async def _apply_registration_response(self, response: MinerRegistrationResponse) -> tuple[int, int]:
+    async def _apply_registration_response(self, response: MinerRegistrationResponse):
         """
         Validate and apply a registration response to miner state.
 
@@ -960,12 +975,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         if response.num_partitions is None:
             raise Exception(f"Number of partitions is None for miner {self.hotkey[:8]}")
 
+        model_config = response.model_cfg.model_dump()
+        model_metadata = response.model_metadata.model_dump()
+
         old_run_id = self.state_manager.run_id
         assigned_layer = int(response.layer)
         current_epoch = int(response.current_epoch)
 
         logger.debug(f"Number of partitions for miner {self.hotkey[:8]}: {response.num_partitions}")
-        self.model_manager.num_partitions = int(response.num_partitions)
         self.num_partitions = int(response.num_partitions)
 
         # TODO: clean these up
@@ -974,6 +991,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.state_manager.training_epoch_when_registered = current_epoch
         self.state_manager.run_id = response.run_id
         self.run_id = response.run_id
+
+        self.model_manager.num_partitions = int(response.num_partitions)
+        self.model_manager.model_config = model_config
+        self.model_manager.model_metadata = model_metadata
         self.model_manager.epoch_on_registration = current_epoch
         # Local merge-cycle count is per assignment; re-register / new run must not inherit the old value.
         self.model_manager.epoch_counter = 0
@@ -985,10 +1006,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         self._update_run_flags(response.run_flags)
 
-        self.stats_tracker.reset()
-        self.stats_tracker.set_layer(assigned_layer)
-        self.stats_tracker.set_remote_epoch(current_epoch)
-        self.stats_tracker.set_run_id(response.run_id)
+        # Create a clean stats tracker.
+        self.stats_tracker = StatsTracker(
+            current_layer=assigned_layer,
+            remote_epoch=current_epoch,
+            run_id=self.run_id,
+        )
+
+        await self._setup_training_phase()
 
         if sync_run_sync_prefix(old_run_id) != sync_run_sync_prefix(response.run_id):
             self.node_registry.rebind_namespace(sync_run_sync_prefix(response.run_id))
@@ -1000,7 +1025,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             except Exception as exc:
                 logger.warning(f"Failed to pull node_registry after rebind (proceeding with local): {exc}")
             self.node_registry.value.register(self.compute_node.compute_node)
-            await self.training_phase.rebind_backward_counter_for_run()
 
         logger.success(
             f"✅ Miner {self.hotkey[:8]} registered successfully in layer {assigned_layer} on training epoch {current_epoch}"
@@ -1012,11 +1036,79 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         entry = dict(self.node_registry.value.get(node_id) or self.compute_node.compute_node.model_dump())
         self._stamp_registry_entry(entry)
         self.node_registry.value[node_id] = entry
+
         await self.node_registry.push()
         logger.info(f"Registered with P2P node ID: {(self.p2p.node_id or 'n/a')[:16]}...")
         logger.debug(f"Updated node registry groups: {layer_groups}")
 
-        return assigned_layer, current_epoch
+    async def _clear_stale_p2p_state(self) -> None:
+        """Drain P2P queues, clear shared-memory cache, and reset input hashes.
+
+        Called when rebuilding the training phase so that stale activations from
+        a previous epoch / run are never processed with the wrong model weights
+        or served to peers.
+        """
+        # 1. Drain the multiprocessing push queue (receiver -> bridge).
+        if self.p2p is not None:
+            dropped = self.p2p.drain_push_queue()
+            if dropped:
+                logger.info(f"Drained {dropped} stale message(s) from P2P push queue")
+
+            # 2. Clear the SharedMemory activation cache.
+            cleared = self.p2p.clear_activation_cache()
+            if cleared:
+                logger.info(f"Cleared {cleared} stale activation(s) from P2P shared-memory cache")
+
+        # 3. Drain the asyncio-side bridge queue.
+        bridge_dropped = 0
+        while not self._p2p_push_queue.empty():
+            try:
+                self._p2p_push_queue.get_nowait()
+                bridge_dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if bridge_dropped:
+            logger.info(f"Drained {bridge_dropped} stale message(s) from asyncio P2P bridge queue")
+
+        # 4. Clear input hash tracking.
+        async with self.input_hash_lock:
+            count = len(self.input_activation_hashes)
+            self.input_activation_hashes.clear()
+            if count:
+                logger.info(f"Cleared {count} stale input activation hash(es)")
+
+    async def _setup_training_phase(self) -> None:
+        """Tear down any existing ``TrainingPhase`` and setup a fresh one.
+
+        Used on (re-)registration: the new instance
+        starts with a clean cache/queue/publisher/LR-scheduler state, and the
+        old instance's background tasks (publisher send loop, activation fetcher,
+        distributed backward counter) are cleanly stopped so they don't linger.
+        """
+        existing: TrainingPhase | None = getattr(self, "training_phase", None)
+        if existing is not None:
+            try:
+                await existing.shutdown()
+            except Exception as e:
+                logger.error(f"Failed to shut down previous TrainingPhase: {e}")
+
+        await self._clear_stale_p2p_state()
+
+        self.training_phase = TrainingPhase(
+            miner_api_client=self.miner_api_client,
+            state_manager=self.state_manager,
+            model_manager=self.model_manager,
+            device=self.device,
+            run_flags=self.run_flags,
+            mock=self.mock,
+            is_mounted=miner_settings.IS_MOUNTED,
+            node_registry=self.node_registry,
+            miner=self,
+        )
+        self.training_phase.attach_stats_tracker(self.stats_tracker)
+        # The publisher's outbound send loop is per-instance; start it so activations
+        # produced by this TrainingPhase actually get drained to peers.
+        self.training_phase._publisher.start_send_loop()
 
     async def register(self) -> tuple[dict, dict]:
         """Single registration attempt. Raises on failure for caller to retry."""
@@ -1027,7 +1119,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         best_run = identify_best_run(run_info_list=run_info_list)
         logger.info(f"✅ Best run for miner {self.hotkey[:8]} is {best_run.run_id}")
-
         logger.info(f"🔄 Attempting to register miner {self.hotkey[:8]} on run {best_run.run_id} with orchestrator...")
 
         # P2P node ID is required for registration
@@ -1313,7 +1404,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
             # Start P2P before registration so we have a node_id to register with
             await self._start_p2p()
-            self.training_phase._publisher.start_send_loop()
             logger.info("P2P communication started")
 
             # Start the healthcheck server
@@ -1366,7 +1456,8 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
                 # Stop outbound send loop before P2P
                 try:
-                    self.training_phase._publisher.stop_send_loop()
+                    if self.training_phase is not None:
+                        self.training_phase._publisher.stop_send_loop()
                 except Exception as e:
                     logger.error(f"Failed to stop outbound send loop: {e}")
 
@@ -1398,11 +1489,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         """
         logger.info("🔄 Resetting miner entire state!")
         self.need_to_pull_weights = True
+        self._weight_download_failures = 0
 
         old_run_id = self.state_manager.run_id
         old_layer = self.state_manager.layer
-
-        await self.training_phase.reset()
 
         # We provide the model config and metadata so that all miners are aligned.
         model_config, model_metadata = await self.register_loop()

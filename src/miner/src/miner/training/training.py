@@ -1,29 +1,31 @@
 from __future__ import annotations
 
-from common.models.run_flags import RunFlags
-from miner.utils.timer_logger import TimerLoggerMiner
 import torch
 from loguru import logger
 import asyncio
 import time
 
+from common.models.run_flags import RunFlags
 from common import settings as common_settings
 from common.utils.exceptions import NanInfException
+from common.utils.lr_scheduler import make_lr_scheduler
 from subnet.utils.vector_utils import check_for_nans_and_infs
-from miner import settings as miner_settings
-from miner.state_manager import StateManager
-from miner.training.activation_cache import ActivationData, ActivationCache
-from miner.training.activation_queue import ActivationQueue
-from miner.training.activation_publisher import ActivationPublisher
 from subnet.miner_api_client import MinerAPIClient
 from subnet.model.model_mixin import ModelManager
 from subnet.model.utils import compute_loss, log_gpu_memory_usage
 from subnet.model import gpu_device
 
+
 from miner.utils.stats import StatsTracker
+from miner.utils.timer_logger import TimerLoggerMiner
+from miner import settings as miner_settings
+from miner.state_manager import StateManager
+from miner.training.activation_cache import ActivationData, ActivationCache
+from miner.training.activation_queue import ActivationQueue
+from miner.training.activation_publisher import ActivationPublisher
+from miner.training.peer_selection import select_by_capacity
 from miner.sync import DistributedCounter, NodeRegistry, SyncedVariable
 from miner.sync.variable import sync_run_sync_prefix
-from common.utils.lr_scheduler import make_lr_scheduler
 from miner.telemetry.metric_registry import (
     ACTIVATIONS_PROCESSED_TOTAL,
     BACKWARD_PASS_DURATION_SECONDS,
@@ -55,7 +57,13 @@ class TrainingPhase:
         self._device = device
         self._run_flags = run_flags
         self._mock = mock
-        self._cache: ActivationCache = ActivationCache(hotkey=self._hotkey)
+        self._cache: ActivationCache = ActivationCache(
+            hotkey=self._hotkey,
+            cache_timeout_sec=common_settings.activation_cache_timeout_sec(
+                num_layers=self._model_manager.model_metadata["n_splits"],
+                layer_idx=self._state_manager.layer,
+            ),
+        )
         self._queue: ActivationQueue = ActivationQueue(
             miner_api_client=self._miner_api_client,
             state_manager=self._state_manager,
@@ -64,7 +72,6 @@ class TrainingPhase:
             run_flags=self._run_flags,
             miner=miner,
         )
-        from miner.training.peer_selection import select_by_capacity
 
         self._publisher = ActivationPublisher(
             miner_api_client=self._miner_api_client,
@@ -420,13 +427,11 @@ class TrainingPhase:
                             self._model_manager.model_config["bottleneck_dim"]
                             or self._model_manager.model_config["emb_dim"]
                         )
-                        # Detach and convert to bfloat16 to ensure we only save the values
-                        # NOTE: if we cast to bfloat16 after moving to CPU, there will be extra load if the grad is huge
-                        # but if we do it before, we'll be taking up additional GPU memory
-                        grad_flattened = emb_weight.grad.detach().cpu().to(torch.bfloat16).flatten()
-                        input_activation_grads = grad_flattened[
-                            : common_settings.SEQUENCE_LENGTH * embedding_dim * common_settings.MINI_BATCH_SIZE
-                        ]
+                        n_grad_elems = common_settings.SEQUENCE_LENGTH * embedding_dim * common_settings.MINI_BATCH_SIZE
+                        # Same values as flatten().cpu()[:n] before, but slice + bf16 on GPU then D2H only for the prefix.
+                        input_activation_grads = (
+                            emb_weight.grad.detach().reshape(-1)[:n_grad_elems].to(torch.bfloat16).cpu()
+                        )
                     else:
                         input_activation_grads = sliced_cached_input_activation.grad.detach().cpu()
                     grad_extract_total += time.time() - grad_extract_start
@@ -597,17 +602,53 @@ class TrainingPhase:
         )
         return loss
 
-    async def reset(self):
-        """Reset the training phase."""
-        logger.debug("🗑️ Performing full reset of training")
-        self.backwards_since_reset = 0
-        self.local_optimization_steps = 0
-        self._loss_on_cpu = False
-        self._auto_max_cache_frozen = False
-        self._cache._frozen_max_size = None
-        self._cache._warmup_active = self._run_flags.auto_max_cache.isOn()
-        await self.optimization_reset()
-        await self._publisher.reset()
+    async def shutdown(self) -> None:
+        """Tear down background tasks and release resources held by this instance.
+
+        Must be called before discarding a ``TrainingPhase`` (e.g. on re-registration)
+        so the old publisher send loop, activation fetcher task, and distributed
+        backward counter don't linger alongside a freshly built replacement.
+        """
+        logger.debug("🧹 Shutting down TrainingPhase")
+
+        # Stop the publisher's outbound send loop and cancel any in-flight publish tasks.
+        try:
+            self._publisher.stop_send_loop()
+        except Exception as e:
+            logger.error(f"Failed to stop publisher send loop: {e}")
+
+        pending_publishes = [t for t in self._publisher._publishing_tasks if not t.done()]
+        for task in pending_publishes:
+            task.cancel()
+        if pending_publishes:
+            await asyncio.gather(*pending_publishes, return_exceptions=True)
+        self._publisher._publishing_tasks.clear()
+
+        # Cancel the activation fetcher if it's somehow still alive. By normal flow
+        # it has already exited via LayerStateException, but make the teardown
+        # idempotent so we never leave a dangling task.
+        fetcher = self._queue._activation_fetcher_task
+        if fetcher is not None and not fetcher.done():
+            fetcher.cancel()
+            try:
+                await fetcher
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Stop the distributed counter so its background poller/Redis connection exits.
+        if self._backward_counter is not None:
+            try:
+                await self._backward_counter.stop()
+            except Exception as e:
+                logger.error(f"Failed to stop backward counter: {e}")
+            self._backward_counter = None
+        self._counter_started = False
+
+        # Drop cached activations to release GPU memory before the new instance loads weights.
+        try:
+            await self._cache.reset()
+        except Exception as e:
+            logger.error(f"Failed to reset activation cache on shutdown: {e}")
 
     async def epoch_reset(self):
         """Reset cache and queues between epochs.
