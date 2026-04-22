@@ -115,6 +115,22 @@ class MinerAPIClient(CommonAPIClient):
             logger.error(f"Error getting layer state: {e}")
             raise
 
+    async def get_all_layers_training(self) -> bool:
+        """Return True iff every layer in this miner's run is in TRAINING phase."""
+        try:
+            response = await CommonAPIClient.orchestrator_request(
+                method="GET",
+                path="/miner/all_layers_training",
+                hotkey=self.hotkey,
+                is_mounted=self.is_mounted,
+                electron_version=self.electron_version,
+            )
+            parsed_response = self.parse_response(response)
+            return bool(parsed_response)
+        except Exception as e:
+            logger.error(f"Error getting all-layers-training: {e}")
+            raise
+
     async def heartbeat(self, expected_phase: LayerPhase | None = None) -> HeartbeatResponse:
         path = "/miner/heartbeat"
         if expected_phase is not None:

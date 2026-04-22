@@ -30,22 +30,27 @@ if NETWORK == "local":
     ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", 8000))
     ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "localhost")
     ORCHESTRATOR_SCHEMA = os.getenv("ORCHESTRATOR_SCHEME", "http")
+
+    BRIDGE_URL = os.getenv("BRIDGE_URL", "http://localhost:8001/sync")
 elif NETWORK == "test":
     # Testnet
     ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", 443))
     ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "iota-branch-main.api.macrocosmos.ai")
     ORCHESTRATOR_SCHEMA = os.getenv("ORCHESTRATOR_SCHEME", "https")
+
+    BRIDGE_URL = os.getenv("BRIDGE_URL", "https://iota-branch-main.api.macrocosmos.ai/sync")
 else:
     # Mainnet
     ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", 443))
     ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "iota.api.macrocosmos.ai")
     ORCHESTRATOR_SCHEMA = os.getenv("ORCHESTRATOR_SCHEME", "https")
 
+    BRIDGE_URL = os.getenv("BRIDGE_URL", "https://iota.api.macrocosmos.ai/sync")
+
 ORCHESTRATOR_URL = f"{ORCHESTRATOR_SCHEMA}://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}"
 REQUEST_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", "3"))
 
 # Bridge settings
-BRIDGE_URL = os.getenv("BRIDGE_URL", "http://localhost:8001/sync")
 CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", "40"))  # TODO: Make this 20s
 
 MIN_PART_SIZE = 10 * 1024 * 1024  # 10MB
@@ -54,8 +59,9 @@ MAX_PART_SIZE = 100 * 1024 * 1024  # 100MB
 # System Settings
 MAX_RETRIES = 3
 RETRY_DELAY = 1.0  # seconds
-ACTIVATION_CACHE_TIMEOUT = 60 * 20
 LRU_CACHE_TIMEOUT = 20  # seconds
+ALL_LAYERS_TRAINING_CACHE_TTL_SEC = float(os.getenv("ALL_LAYERS_TRAINING_CACHE_TTL_SEC", "2"))
+
 # Model Training Settings - not for miner's to change
 HF_TOKEN = os.getenv("HF_TOKEN")
 DATASET_NAME = "HuggingFaceFW/fineweb"
@@ -87,6 +93,9 @@ MINI_BATCH_SIZE = 32
 MINI_BATCH_ACCUMULATION_COUNT = 4
 SEQUENCE_LENGTH = 800
 
+ACTIVATION_TIMEOUT_SEC = int(os.getenv("ACTIVATION_TIMEOUT", "100") if not MOCK else 600)
+MAX_ACTIVATION_PROCESS_COUNT = 3
+
 # Local mock model settings
 MOCK_MODEL_INPUT_DIM = int(os.getenv("MOCK_MODEL_INPUT_DIM", "100"))
 MOCK_MODEL_HIDDEN_DIM = int(os.getenv("MOCK_MODEL_HIDDEN_DIM", "32"))
@@ -107,3 +116,11 @@ MIN_PARTITION_DOWNLOAD_SUCCESS_PCT = 90  # TODO: Make this dynamic based on the 
 
 # Merge quality validation thresholds
 MIN_COSINE_SIMILARITY_DOWNLOAD = float(os.getenv("MIN_COSINE_SIMILARITY_DOWNLOAD", "0.9"))
+
+
+def activation_cache_timeout_sec(num_layers: int, layer_idx: int, interval_sec: int = 60) -> int:
+    """
+    Seconds to retain forward activations in the miner cache; longer for earlier layers.
+    layer_idx is 0-indexed.
+    """
+    return interval_sec * (num_layers - layer_idx)

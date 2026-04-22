@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable, Generic, TypeVar
 from common import settings as common_settings
 from common.models.run_flags import RUN_FLAGS
+from miner import settings as miner_settings
 import httpx
 import msgpack
 from loguru import logger
@@ -110,9 +111,9 @@ def _write_spec_for_sv(sv: "SyncedVariable", *, expected_version: int) -> tuple[
 class PollingLoop:
     """Single background loop driving all SyncedVariable instances."""
 
-    def __init__(self, server_url: str, tick: float = 0.2) -> None:
+    def __init__(self, server_url: str, tick: float = 2.0) -> None:
         self._server_url = server_url
-        self._client = httpx.AsyncClient(base_url=self._server_url)
+        self._client = httpx.AsyncClient(base_url=self._server_url, timeout=30)
         self._svs: list[SyncedVariable] = []
         self._task: asyncio.Task | None = None
         # id(sv) → last server version seen (0 = never polled)
@@ -421,7 +422,9 @@ class SyncedVariable(Generic[T]):
     # Shared polling loop for all instances that don't specify their own.
     # Must be set (e.g. SyncedVariable.polling_loop = PollingLoop(server_url))
     # before creating SyncedVariable instances without an explicit polling_loop.
-    polling_loop: PollingLoop | None = PollingLoop(server_url=common_settings.BRIDGE_URL)
+    polling_loop: PollingLoop | None = PollingLoop(
+        server_url=common_settings.BRIDGE_URL, tick=miner_settings.SYNC_POLL_TICK
+    )
 
     def __init__(
         self,

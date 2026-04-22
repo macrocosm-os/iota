@@ -305,6 +305,34 @@ class P2PStack:
 
         raise RuntimeError("P2P sender restart failed after all retries — crashing for process manager restart")
 
+    # ── epoch boundary cleanup ────────────────────────────────────────
+
+    def drain_push_queue(self) -> int:
+        """Drain all pending messages from the push queue.
+
+        Returns the number of messages discarded.  Called at epoch boundaries
+        so stale backward-activations from the previous epoch are never
+        processed with the new epoch's model weights.
+        """
+        dropped = 0
+        while not self._push_queue.empty():
+            try:
+                self._push_queue.get_nowait()
+                dropped += 1
+            except Exception:
+                break
+        return dropped
+
+    def clear_activation_cache(self) -> int:
+        """Remove all entries from the SharedMemory activation cache.
+
+        Returns the number of entries removed.  Called at epoch boundaries so
+        stale activations cannot be served to peers after a merge.
+        """
+        count = len(self._shm_blocks)
+        self._cleanup_all_shm()
+        return count
+
     # ── activation cache ─────────────────────────────────────────────
 
     def cache_activation(self, activation_id: str, tensor_bytes: bytes) -> None:

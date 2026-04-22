@@ -75,6 +75,10 @@ class ActivationQueue:
         self._max_forwards_in_queue: int = miner_settings.MAX_FORWARD_ACTIVATIONS_IN_QUEUE
         self._min_forwards_in_queue: int = miner_settings.MIN_FORWARD_ACTIVATIONS_IN_QUEUE
 
+        self._all_layers_training_cached: bool = False
+        self._all_layers_training_cached_at: float = 0.0
+        self._all_layers_training_ttl_sec: float = common_settings.ALL_LAYERS_TRAINING_CACHE_TTL_SEC
+
     def attach_stats_tracker(self, tracker: StatsTracker | None) -> None:
         """Attach a stats tracker for dashboard metrics."""
         self._stats_tracker = tracker
@@ -199,6 +203,24 @@ class ActivationQueue:
         else:
             await self._fetch_activations_push_based()
 
+    async def _all_layers_training(self) -> bool:
+        """Return True iff all layers in the run are currently in TRAINING."""
+        now = time.time()
+        if now - self._all_layers_training_cached_at < self._all_layers_training_ttl_sec:
+            return self._all_layers_training_cached
+        try:
+            result = await self._miner_api_client.get_all_layers_training()
+        except (LayerStateException, MinerNotRegisteredException):
+            raise
+        except RateLimitException:
+            return self._all_layers_training_cached
+        except Exception as exc:
+            logger.debug(f"all_layers_training check failed; treating as False: {exc}")
+            result = False
+        self._all_layers_training_cached = result
+        self._all_layers_training_cached_at = now
+        return result
+
     async def _fetch_activations_layer0(self):
         """Layer-0 fetcher: forward samples from orchestrator, backward from push queue."""
         last_state_check = time.time()
@@ -217,6 +239,13 @@ class ActivationQueue:
                 except Exception as exc:
                     logger.debug(f"Heartbeat check failed (non-fatal): {exc}")
                 last_state_check = time.time()
+
+            # Gate: do not request activations until every layer is in TRAINING.
+            # Keeps layer-0 from producing forwards that peers on later layers
+            # would reject because they are still uploading weights or merging.
+            if not await self._all_layers_training():
+                logger.debug("Not all layers are in TRAINING yet; skipping activation fetch tick")
+                continue
 
             # Drain backward activations that arrived via push from layer 1
             await self._drain_push_queue(direction_filter="backward")
@@ -791,6 +820,14 @@ class ActivationQueue:
                 except Exception as exc:
                     logger.debug(f"Heartbeat check failed (non-fatal): {exc}")
                 last_state_check = time.time()
+
+            # Gate: don't pull pushed activations off the queue until every
+            # layer is in TRAINING. Pushes queued before the gate opens remain
+            # in self._miner._p2p_push_queue and are picked up on a later tick.
+            if not await self._all_layers_training():
+                logger.debug("Not all layers are in TRAINING yet; deferring push consumption")
+                await asyncio.sleep(1.0)
+                continue
 
             # ── Wait for the next push (1 s timeout so the state check fires) ─
             try:

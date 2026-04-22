@@ -91,5 +91,7 @@ NODE_CONTROL_TOKEN = os.getenv("NODE_CONTROL_TOKEN")
 
 # Telemetry settings
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+SYNC_POLL_TICK = float(os.getenv("SYNC_POLL_TICK", "2.0"))
+
 TELEMETRY_FLUSH_INTERVAL_SEC = float(os.getenv("TELEMETRY_FLUSH_INTERVAL_SEC", "15"))
 TELEMETRY_MAX_BUFFER_SIZE = int(os.getenv("TELEMETRY_MAX_BUFFER_SIZE", "1000"))
