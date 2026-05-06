@@ -51,3 +51,10 @@ class P2POperationTimings(BaseModel):
     # ── payload metadata (filled by Sender) ──────────────────────
     bytes_sent: int | None = None
     bytes_received: int | None = None
+
+    # ── correlation handle (filled by SenderProxy) ───────────────
+    # Set to the subprocess request ID so a parent-side timeout (where the
+    # subprocess hasn't responded yet) can be correlated against the
+    # subprocess's own ``[sender] req_id=…`` log line that prints partial
+    # phase timings when iroh's per-phase timeout eventually fires.
+    req_id: str | None = None

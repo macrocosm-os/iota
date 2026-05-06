@@ -34,7 +34,7 @@ from common.iroh.serializer import (
 )
 from common.iroh.monitored_node import MonitoredNode, NodeHealth, HealthCheckResult
 from common.iroh.timings import P2POperationTimings, TimingsPhaseField
-from common.iroh.retry import P2PRetry, P2PRetryPolicy, P2PTimeouts
+from common.iroh.retry import P2PRetry, P2PRetryPolicy, P2PSendCancelledError, P2PTimeouts
 from common.iroh.settings import DEFAULT_MAX_MESSAGE_SIZE
 from common.iroh.iroh_subprocess import IrohSubprocess
 from common.iroh.p2p_stack import P2PStack
@@ -80,6 +80,7 @@ __all__ = [
     "P2PRetry",
     "P2PRetryPolicy",
     "P2PTimeouts",
+    "P2PSendCancelledError",
     "MonitoredNode",
     "NodeHealth",
     "HealthCheckResult",

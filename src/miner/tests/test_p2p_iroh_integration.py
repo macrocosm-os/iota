@@ -18,6 +18,33 @@ def _stub_polling_loop(monkeypatch):
     monkeypatch.setattr(SyncedVariable, "polling_loop", MagicMock(spec=PollingLoop))
 
 
+@pytest.fixture(autouse=True)
+def _relaxed_p2p_auth_timeout(monkeypatch):
+    # Sender retries reuse the same pre-signed request bytes; under
+    # heavy concurrent load on CI runners the elapsed sign→verify time
+    # can exceed the 30s production default and trip UNAUTHORIZED.
+    monkeypatch.setattr("common.iroh.p2p_stack.P2P_AUTH_TIMEOUT_MS", 300_000)
+
+
+async def _cross_register_peer_addrs(*miners: Miner) -> None:
+    """Cross-register every miner's iroh address hints with every other miner's sender.
+
+    In production the node registry sync does this automatically; these tests
+    bypass the registry and dial peers directly by p2p_node_id, so we wire it
+    up by hand. Iroh's default discovery is disabled, so dials fail with
+    ``PeerAddressUnknownError`` if the address book isn't populated.
+    """
+    for sender in miners:
+        for peer in miners:
+            if peer is sender:
+                continue
+            await sender.p2p.sender.register_peer(
+                peer.p2p_node_id,
+                peer.p2p.relay_url,
+                peer.p2p.direct_addresses,
+            )
+
+
 @pytest.mark.asyncio
 async def test_miner_p2p_activation_roundtrip(monkeypatch):
     """Test basic P2P activation request/response between two miners."""
@@ -29,6 +56,7 @@ async def test_miner_p2p_activation_roundtrip(monkeypatch):
 
     await miner_a._start_p2p()
     await miner_b._start_p2p()
+    await _cross_register_peer_addrs(miner_a, miner_b)
 
     try:
         activation_id = "activation-123"
@@ -57,6 +85,7 @@ async def test_miner_p2p_activation_not_found(monkeypatch):
 
     await miner_a._start_p2p()
     await miner_b._start_p2p()
+    await _cross_register_peer_addrs(miner_a, miner_b)
 
     try:
         # Request activation that doesn't exist in miner_b's cache
@@ -81,6 +110,7 @@ async def test_miner_p2p_large_activation(monkeypatch):
 
     await miner_a._start_p2p()
     await miner_b._start_p2p()
+    await _cross_register_peer_addrs(miner_a, miner_b)
 
     try:
         activation_id = "large-activation"
@@ -115,6 +145,7 @@ async def test_miner_p2p_multi_miner_concurrent_requests(monkeypatch):
 
     for miner in miners:
         await miner._start_p2p(timeout=30.0)
+    await _cross_register_peer_addrs(*miners)
 
     try:
         for i, miner in enumerate(miners):
@@ -167,6 +198,7 @@ async def test_miner_p2p_bidirectional_same_pair(monkeypatch):
 
     await miner_a._start_p2p()
     await miner_b._start_p2p()
+    await _cross_register_peer_addrs(miner_a, miner_b)
 
     try:
         # Both miners cache different activations

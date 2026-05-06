@@ -9,15 +9,14 @@ from bittensor import Wallet, Subtensor
 
 
 async def weight_setting_step(wallet: Wallet, subtensor: Subtensor, metagraph: bt.metagraph):
-    if not (global_weights := await ValidatorAPIClient.get_global_miner_scores(hotkey=wallet.hotkey)):
-        logger.warning("No global weights received, temporarily copying weights from the chain")
+    global_weights = await ValidatorAPIClient.get_global_miner_scores(hotkey=wallet.hotkey)
+
+    if not global_weights or "error_name" in global_weights:
+        if global_weights and "error_name" in global_weights:
+            logger.error(f"Error getting global weights: {global_weights['error_name']}")
+        logger.warning("Falling back to copying weights from the chain")
         weights = copy_weights_from_chain(metagraph=metagraph)
         await set_weights(wallet=wallet, subtensor=subtensor, weights=weights, metagraph=metagraph)
-        return
-
-    if "error_name" in global_weights:
-        logger.error(f"Error getting global weights: {global_weights['error_name']}")
-        global_weights = {}
         return
 
     global_weights = SubnetScores.model_validate(global_weights)

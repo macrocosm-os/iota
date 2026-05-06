@@ -29,6 +29,13 @@ except ImportError:  # iroh not installed (e.g. CI)
 T = TypeVar("T")
 
 
+class P2PSendCancelledError(Exception):
+    """Parent aborted an in-flight send (e.g. :class:`SenderProxy` wait timed out).
+
+    The subprocess must not treat this as a transport failure worth retrying.
+    """
+
+
 # ---------------------------------------------------------------------------
 # IrohError classification
 # ---------------------------------------------------------------------------
@@ -195,6 +202,9 @@ class P2PRetry:
 
             except asyncio.CancelledError:
                 raise  # never swallow cancellations
+
+            except P2PSendCancelledError:
+                raise
 
             except asyncio.TimeoutError as exc:
                 last_exc = exc

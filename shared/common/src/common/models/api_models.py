@@ -138,9 +138,6 @@ class ActivationResponse(BaseModel):
     upload_id: str | None = None
     presigned_download_url: str | None = None
     reason: str | None = None
-    attestation_challenge_blob: str | None = None
-    attestation_self_checks: list[str] | None = None
-    attestation_crypto: str | None = None
     presigned_upload_url: list[str] | None = None
     activation_upload_path: str | None = None
     target_download_url: str | None = None
@@ -274,7 +271,7 @@ class MountedAttestationPayload(BaseModel):
 
 
 class AttestationChallengeRequest(BaseModel):
-    action: Literal["registration", "weights", "merged_partitions"]
+    action: Literal["registration", "weights", "merged_partitions", "submit_activation"]
     run_id: str | None = None
 
 
@@ -285,7 +282,7 @@ class AttestationChallengeResponse(BaseModel):
 
 
 class RequestAttestationChallengeResponse(BaseModel):
-    action: Literal["registration", "weights", "merged_partitions"]
+    action: Literal["registration", "weights", "merged_partitions", "submit_activation"]
     attestation_challenge_blob: str
     self_checks: list[str]
     crypto: str
@@ -329,6 +326,7 @@ class RunInfo(BaseModel):
     authorized: bool
     run_flags: RunFlags
     max_miners: int
+    whitelist_force_allow: bool = False
 
 
 ############################################################
