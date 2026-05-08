@@ -1,13 +1,12 @@
 import asyncio
-from pydantic import BaseModel
 import torch
 import time
 from loguru import logger
+from pydantic import BaseModel
 
-from common import settings as common_settings
-from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
 from subnet.model import gpu_device
 from miner import settings as miner_settings
+from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
 
 
 class ActivationData(BaseModel):
@@ -18,9 +17,6 @@ class ActivationData(BaseModel):
     output_activations: torch.Tensor | None
     state: dict | None
     upload_time: float
-    attestation_challenge_blob: str | None = None
-    attestation_self_checks: list[str] | None = None
-    attestation_crypto: str | None = None
 
     upload_url: list[str] | None = None
     activation_upload_path: str | None = None
@@ -44,8 +40,9 @@ class ActivationCache:
     so that they are accessible by the backward pass once it is received.
     """
 
-    def __init__(self, hotkey: str):
+    def __init__(self, hotkey: str, cache_timeout_sec: int):
         self._hotkey: str = hotkey
+        self._cache_timeout_sec: float = cache_timeout_sec
         self._cache: dict[str, ActivationData] = {}
         self._lock: asyncio.Lock = asyncio.Lock()
 
@@ -125,7 +122,7 @@ class ActivationCache:
     def cleanup(self):
         """Cleanup the cache of activations that have timed out."""
         for activation_id, activation_data in list(self._cache.items()):
-            if activation_data.upload_time < time.time() - common_settings.ACTIVATION_CACHE_TIMEOUT:
+            if activation_data.upload_time < time.time() - self._cache_timeout_sec:
                 logger.info(f"🗑️ Removing timed-out activation from cache: {activation_id}")
                 del self[activation_id]
 

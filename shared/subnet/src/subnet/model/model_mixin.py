@@ -261,9 +261,6 @@ class ModelManager:
                         f"output activations for miner {self.logger_attributes['hotkey'][:8]}",
                         exception_type=NanInfException,
                     )
-                    logger.debug(
-                        f"Backwarding last layer output activations of shape {output_activations.shape}: {output_activations}"
-                    )
                     try:
                         if not common_settings.MOCK:
                             output_activations.backward()

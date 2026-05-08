@@ -90,24 +90,38 @@ class SyncedNode:
 
     async def _keepalive_loop(self) -> None:
         while True:
-            if self.node_registry is not None:
-                self.node_registry.value.update_keepalive()
+            try:
+                if self.node_registry is not None:
+                    registry = self.node_registry.value
+                    if registry._own_node and registry._own_node not in registry:
+                        # Bridge evicted us or local state was reset — re-insert with full metadata.
+                        logger.warning(
+                            f"[SyncedNode] Own node {self._node_id!r} missing from registry — re-registering"
+                        )
+                        registry.register(self.compute_node)
+                    else:
+                        registry.update_keepalive()
+            except Exception as exc:
+                logger.warning(f"[SyncedNode] Keepalive loop error: {exc}")
             await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     async def _lead_check_loop(self) -> None:
         while True:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
-            if self.node_registry is None:
-                continue
-            registry = self.node_registry.value
-            all_groups: set[str] = set()
-            for node in registry.all_nodes():
-                all_groups.update(node.groups)
-            for group in all_groups:
-                if self.peer_eviction_enabled and registry.is_lead(self._node_id, group):
-                    evicted = registry.evict_stale_nodes(group, KEEPALIVE_INTERVAL)
-                    for node_id in evicted:
-                        logger.info(
-                            f"[lead={self._node_id}] Evicted stale node {node_id!r} "
-                            f"from group {group!r} (no keepalive for >{3 * KEEPALIVE_INTERVAL:.0f}s)"
-                        )
+            try:
+                if self.node_registry is None:
+                    continue
+                registry = self.node_registry.value
+                all_groups: set[str] = set()
+                for node in registry.all_nodes():
+                    all_groups.update(node.groups)
+                for group in all_groups:
+                    if self.peer_eviction_enabled and registry.is_lead(self._node_id, group):
+                        evicted = registry.evict_stale_nodes(group, KEEPALIVE_INTERVAL)
+                        for node_id in evicted:
+                            logger.info(
+                                f"[lead={self._node_id}] Evicted stale node {node_id!r} "
+                                f"from group {group!r} (no keepalive for >{3 * KEEPALIVE_INTERVAL:.0f}s)"
+                            )
+            except Exception as exc:
+                logger.warning(f"[SyncedNode] Lead check loop error: {exc}")

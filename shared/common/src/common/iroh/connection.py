@@ -30,10 +30,19 @@ class PeerConnection:
     reports clean CLOSE frames and misses silently-dead connections.
     """
 
-    def __init__(self, node_id: str, protocol_id: bytes, endpoint: Endpoint):
+    def __init__(
+        self,
+        node_id: str,
+        protocol_id: bytes,
+        endpoint: Endpoint,
+        relay_url: str | None = None,
+        direct_addresses: list[str] | None = None,
+    ):
         self._node_id = node_id
         self._protocol_id = protocol_id
         self._endpoint = endpoint
+        self._relay_url = relay_url
+        self._direct_addresses = list(direct_addresses or [])
         self._conn: Connection | None = None
         self._closed_reason: str | None = None
         self._closed_watcher: asyncio.Task | None = None
@@ -132,7 +141,11 @@ class PeerConnection:
 
             self._closed_reason = None
             receiver_key = PublicKey.from_string(self._node_id)
-            connect_addr = NodeAddr(node_id=receiver_key, derp_url=None, addresses=[])
+            connect_addr = NodeAddr(
+                node_id=receiver_key,
+                derp_url=self._relay_url,
+                addresses=list(self._direct_addresses),
+            )
             self._conn = await asyncio.wait_for(
                 self._endpoint.connect(connect_addr, self._protocol_id),
                 timeout=timeout,

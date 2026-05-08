@@ -17,10 +17,12 @@ Wire format (flat dict)::
 
     {
         "node-abc": {
-            "node_id":            "node-abc",
-            "iroh_receiver_ids":  ["abc123..."],
-            "groups":             ["all", "gpu-workers"],
-            "joined_at":          1234567890.123
+            "node_id":               "node-abc",
+            "p2p_node_ids":          ["..."],
+            "iroh_relay_url":        "https://...",
+            "iroh_direct_addresses": ["192.0.2.1:54321", ...],
+            "groups":                ["all", "gpu-workers"],
+            "joined_at":             1234567890.123
         },
         ...
     }
@@ -43,8 +45,11 @@ class ComputeNode(BaseModel):
     """Identity record written to the shared registry by every :class:`~miner.sync.node.SyncedNode`."""
 
     node_id: str
-    iroh_receiver_ids: list[str] = Field(default_factory=list)
     p2p_node_ids: list[str] = Field(default_factory=list)
+    #: Home relay URL of this node's receiver, used to skip n0 DNS discovery on dial.
+    iroh_relay_url: str | None = None
+    #: Direct sockaddr hints of this node's receiver (e.g. ["192.0.2.1:54321", ...]).
+    iroh_direct_addresses: list[str] = Field(default_factory=list)
     groups: list[str] = Field(default_factory=lambda: ["all"])
     #: Orchestrator training layer index; used for routing when ``groups`` is stale (e.g. ``["all"]`` only).
     training_layer: int | None = None
@@ -62,7 +67,7 @@ class NodeRegistry(SyncedDict):
     Wire format: flat dict mapping node_id → ComputeNode fields::
 
         {
-            "node-abc": {"node_id": "node-abc", "iroh_receiver_ids": [], ...},
+            "node-abc": {"node_id": "node-abc", "p2p_node_ids": [...], ...},
             "node-xyz": {...},
         }
     """
@@ -128,13 +133,6 @@ class NodeRegistry(SyncedDict):
             if matched:
                 out.append(ComputeNode(**raw))
         return out
-
-    def get_iroh_receivers(self, node_id: str) -> list[str]:
-        """Return the iroh receiver IDs for *node_id*."""
-        entry = self.get(node_id)
-        if entry is None:
-            return []
-        return list(entry.get("iroh_receiver_ids", []))
 
     def get_lead_node(self, group: str = "all") -> ComputeNode | None:
         """Return the lead node for *group* using deterministic election.
