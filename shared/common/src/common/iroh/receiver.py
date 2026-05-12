@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 
-from iroh import Iroh, NodeOptions, iroh_ffi
+from iroh import Iroh, NodeDiscoveryConfig, NodeOptions, iroh_ffi
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
@@ -19,6 +19,8 @@ class Receiver(BaseModel):
     max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE
     seed: str | None = None
     node_id: str | None = None
+    relay_url: str | None = None
+    direct_addresses: list[str] = []
     node: Iroh | None = None
     _monitored_node: MonitoredNode | None = PrivateAttr(default=None)
 
@@ -72,14 +74,25 @@ class Receiver(BaseModel):
                 PROTOCOL_ID_BI: BiProtocolFactory(**factory_kwargs),
             }
 
-        # Create Iroh node with separate protocol handlers for uni and bi streams
+        # Create Iroh node with separate protocol handlers for uni and bi streams.
+        # ``node_discovery=NodeDiscoveryConfig.NONE`` disables iroh's default
+        # n0 DNS pkarr publishing/lookup — peer addresses are sourced from our
+        # own node registry instead, so we don't leak (or depend on) the public
+        # discovery service.
         self.node = await Iroh.memory_with_options(
             NodeOptions(
                 protocols=protocols,
                 secret_key=secret_key,
+                node_discovery=NodeDiscoveryConfig.NONE,
             )
         )
         self.node_id = await self.node.net().node_id()
+        try:
+            node_addr = await self.node.net().node_addr()
+            self.relay_url = node_addr.relay_url()
+            self.direct_addresses = list(node_addr.direct_addresses() or [])
+        except Exception as exc:
+            logger.warning(f"Failed to fetch node_addr after receiver start: {exc}")
 
         node_label = f"receiver-{self.node_id[:16]}" if self.node_id else "receiver"
         self._monitored_node = MonitoredNode(

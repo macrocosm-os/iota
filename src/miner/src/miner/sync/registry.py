@@ -17,10 +17,12 @@ Wire format (flat dict)::
 
     {
         "node-abc": {
-            "node_id":            "node-abc",
-            "iroh_receiver_ids":  ["abc123..."],
-            "groups":             ["all", "gpu-workers"],
-            "joined_at":          1234567890.123
+            "node_id":               "node-abc",
+            "p2p_node_ids":          ["..."],
+            "iroh_relay_url":        "https://...",
+            "iroh_direct_addresses": ["192.0.2.1:54321", ...],
+            "groups":                ["all", "gpu-workers"],
+            "joined_at":             1234567890.123
         },
         ...
     }
@@ -28,6 +30,7 @@ Wire format (flat dict)::
 
 from __future__ import annotations
 
+import copy
 import time
 from pydantic import BaseModel, Field
 
@@ -43,8 +46,11 @@ class ComputeNode(BaseModel):
     """Identity record written to the shared registry by every :class:`~miner.sync.node.SyncedNode`."""
 
     node_id: str
-    iroh_receiver_ids: list[str] = Field(default_factory=list)
     p2p_node_ids: list[str] = Field(default_factory=list)
+    #: Home relay URL of this node's receiver, used to skip n0 DNS discovery on dial.
+    iroh_relay_url: str | None = None
+    #: Direct sockaddr hints of this node's receiver (e.g. ["192.0.2.1:54321", ...]).
+    iroh_direct_addresses: list[str] = Field(default_factory=list)
     groups: list[str] = Field(default_factory=lambda: ["all"])
     #: Orchestrator training layer index; used for routing when ``groups`` is stale (e.g. ``["all"]`` only).
     training_layer: int | None = None
@@ -62,7 +68,7 @@ class NodeRegistry(SyncedDict):
     Wire format: flat dict mapping node_id → ComputeNode fields::
 
         {
-            "node-abc": {"node_id": "node-abc", "iroh_receiver_ids": [], ...},
+            "node-abc": {"node_id": "node-abc", "p2p_node_ids": [...], ...},
             "node-xyz": {...},
         }
     """
@@ -129,13 +135,6 @@ class NodeRegistry(SyncedDict):
                 out.append(ComputeNode(**raw))
         return out
 
-    def get_iroh_receivers(self, node_id: str) -> list[str]:
-        """Return the iroh receiver IDs for *node_id*."""
-        entry = self.get(node_id)
-        if entry is None:
-            return []
-        return list(entry.get("iroh_receiver_ids", []))
-
     def get_lead_node(self, group: str = "all") -> ComputeNode | None:
         """Return the lead node for *group* using deterministic election.
 
@@ -164,12 +163,23 @@ class NodeRegistry(SyncedDict):
 
         When the bridge (or another peer) evicts our entry from the
         registry, we immediately restore it locally so the next push
-        re-advertises our presence.
+        re-advertises our presence. The locally-known entry (with
+        ``p2p_node_ids``, ``training_layer`` and address hints) is
+        preserved across the fetch so that we never push a bare
+        node-id-only record back to the bridge — that would propagate
+        an empty ``p2p_node_ids`` to peers and break activation routing.
         """
+        local_own_entry: dict | None = None
+        if self._own_node and self._own_node in self:
+            existing = self[self._own_node]
+            if isinstance(existing, dict):
+                local_own_entry = copy.deepcopy(existing)
         super().apply_full_value(value)
         if self._own_node and self._own_node not in self:
-            node = ComputeNode(node_id=self._own_node)
-            self[self._own_node] = node.model_dump()
+            if local_own_entry is not None:
+                self[self._own_node] = local_own_entry
+            else:
+                self[self._own_node] = ComputeNode(node_id=self._own_node).model_dump()
             logger.warning(f"Re-injected own node {self._own_node} after remote fetch removed it")
 
     def evict_stale_nodes(self, group: str, keepalive_interval: float) -> list[str]:

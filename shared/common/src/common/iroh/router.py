@@ -207,7 +207,15 @@ class P2PRouter:
         if inspect.isawaitable(result):
             await result
 
-    async def _dispatch_bi(self, data: bytes, node_id: str) -> bytes:
+    async def _dispatch_bi(self, data: bytes, node_id: str):
+        """Dispatch a BI request to the registered handler.
+
+        Returns either ``bytes`` (the response to write back to the sender) or a
+        ``(bytes, Callable)`` tuple. In the tuple form the callable is a
+        post-ACK action that the protocol layer will run *after* the response
+        bytes have been successfully written to the wire — used by handlers
+        that need to defer side-effects until they know the sender has the ACK.
+        """
         handler, message = self._resolve_bi(data)
         if handler is None:
             logger.warning(f"No BI handler for message from {node_id[:16]}...")
@@ -215,6 +223,8 @@ class P2PRouter:
         result = handler(message, node_id)
         if inspect.isawaitable(result):
             result = await result
+        if isinstance(result, tuple) and len(result) == 2 and callable(result[1]):
+            return self._coerce_bi_response(result[0]), result[1]
         return self._coerce_bi_response(result)
 
     # ── resolution helpers ────────────────────────────────────────

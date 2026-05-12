@@ -59,7 +59,7 @@ async def test_download_activation_p2p_success():
     queue = ActivationQueue(
         miner_api_client=api_client,
         state_manager=_DummyStateManager(),
-        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey", cache_timeout_sec=60),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=fake_miner,
@@ -90,7 +90,7 @@ async def test_download_activation_p2p_uses_source_activation_id():
     queue = ActivationQueue(
         miner_api_client=api_client,
         state_manager=_DummyStateManager(),
-        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey", cache_timeout_sec=60),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=fake_miner,
@@ -121,7 +121,7 @@ async def test_download_activation_p2p_hash_mismatch():
     queue = ActivationQueue(
         miner_api_client=api_client,
         state_manager=_DummyStateManager(),
-        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey", cache_timeout_sec=60),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=fake_miner,
@@ -141,7 +141,7 @@ def test_validate_push_layer_accepts_matching_target() -> None:
     queue = ActivationQueue(
         miner_api_client=_DummyMinerAPIClient(),
         state_manager=_DummyStateManager(layer=2),
-        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey", cache_timeout_sec=60),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=None,
@@ -161,7 +161,7 @@ def test_validate_push_layer_rejects_mismatch() -> None:
     queue = ActivationQueue(
         miner_api_client=_DummyMinerAPIClient(),
         state_manager=_DummyStateManager(layer=1),
-        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey", cache_timeout_sec=60),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=None,
@@ -181,7 +181,7 @@ def test_validate_push_layer_legacy_without_target() -> None:
     queue = ActivationQueue(
         miner_api_client=_DummyMinerAPIClient(),
         state_manager=_DummyStateManager(layer=5),
-        activation_cache=ActivationCache(hotkey="dummy_hotkey"),
+        activation_cache=ActivationCache(hotkey="dummy_hotkey", cache_timeout_sec=60),
         mock=True,
         run_flags=RUN_FLAGS,
         miner=None,

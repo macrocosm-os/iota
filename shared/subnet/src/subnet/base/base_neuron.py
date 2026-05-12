@@ -78,14 +78,16 @@ class BaseNeuron:
         """
         try:
             logger.info(f"Downloading and setting weights for miner {self.hotkey[:8]}")
-            old_weights = torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters()).clone()
-
             merged_partitions: list[MinerPartition] | BaseErrorModel = await client.get_merged_partitions(
                 hotkey=self.wallet.hotkey
             )
 
             num_downloaded_partitions: int = len(merged_partitions) if merged_partitions else 0
-            logger.debug(f"Number of downloaded merged partitions: {num_downloaded_partitions}")
+
+            current_epoch = self.model_manager.epoch_on_registration + self.model_manager.epoch_counter
+            logger.debug(
+                f"Number of downloaded merged partitions for run {self.run_id}, epoch {current_epoch}: {num_downloaded_partitions}"
+            )
 
             if isinstance(merged_partitions, BaseErrorModel):
                 logger.error(
@@ -95,8 +97,13 @@ class BaseNeuron:
 
             if num_downloaded_partitions == 0:
                 # No merge artifact in cache yet (first epoch, new run, or layer cold start).
-                logger.info(f"No merged partitions for miner {self.hotkey[:8]} yet — keeping current model weights")
+                logger.warning(
+                    f"No merged partitions for miner {self.hotkey[:8]} yet — keeping current model weights for run {self.run_id}, epoch {current_epoch}"
+                )
                 return None
+
+            with torch.no_grad():
+                old_weights = torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters()).clone()
 
             # Skip cosine validation on the very first download after joining —
             # the model has random weights so every shard would be rejected.
