@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import inspect
 import multiprocessing
 import os
 import time
+from collections.abc import Awaitable
 from multiprocessing.managers import DictProxy, SyncManager
 from multiprocessing.shared_memory import SharedMemory
+from typing import Callable
 
 from loguru import logger
 
@@ -41,6 +44,7 @@ class P2PStack:
         cache_ttl: float = 3000.0,
         max_cache_size: int = 100,
         p2p_auth_timeout_ms: int | None = None,
+        max_sender_connections: int | None = None,
     ):
         self._receiver: ReceiverProcess | None = None
         self._sender_subprocess: SenderSubprocess | None = None
@@ -51,11 +55,13 @@ class P2PStack:
         self._cache_ttl = cache_ttl
         self._max_cache_size = max_cache_size
         self._p2p_auth_timeout_ms = p2p_auth_timeout_ms if p2p_auth_timeout_ms is not None else P2P_AUTH_TIMEOUT_MS
+        self._max_sender_connections = max_sender_connections
 
         # Shared state for receiver subprocess
         self._manager: SyncManager | None = None
         self._metadata_dict: DictProxy | None = None
         self._peer_status_dict: DictProxy | None = None
+        self._valid_hotkeys_dict: DictProxy | None = None
         self._shm_blocks: dict[str, SharedMemory] = {}
         self._atexit_registered: bool = False
 
@@ -65,6 +71,16 @@ class P2PStack:
         # Remembered for restart
         self._seed: str | None = None
         self._status_monitor_task: asyncio.Task | None = None
+
+        # Address hints for our receiver so peers can dial without discovery
+        self._relay_url: str | None = None
+        self._direct_addresses: list[str] = []
+
+        # Fired after a successful sender subprocess restart. The new
+        # subprocess starts with an empty PooledSender address book, so
+        # listeners (e.g. the miner) must drop any cached "already
+        # registered" state and re-push peer hints on the next sync.
+        self._on_sender_restarted: Callable[[], None | Awaitable[None]] | None = None
 
     # ── properties ───────────────────────────────────────────────────
 
@@ -83,6 +99,16 @@ class P2PStack:
         return None
 
     @property
+    def relay_url(self) -> str | None:
+        """Home relay URL of our receiver, or None if not yet known."""
+        return self._relay_url
+
+    @property
+    def direct_addresses(self) -> list[str]:
+        """Direct sockaddr hints of our receiver (may be empty until relay handshake completes)."""
+        return list(self._direct_addresses)
+
+    @property
     def sender(self) -> SenderProxy | None:
         """Parent-side sender proxy (same API as PooledSender)."""
         if self._sender_subprocess is not None:
@@ -96,6 +122,14 @@ class P2PStack:
     def peer_status_dict(self) -> DictProxy | None:
         """Shared dict populated by ``/peer/status`` handlers in receiver subprocess."""
         return self._peer_status_dict
+
+    @property
+    def valid_hotkeys_dict(self) -> DictProxy | None:
+        """Shared dict of in-run hotkeys; ``/peer/status`` from any other hotkey is dropped.
+
+        Owner (e.g. miner) is responsible for keeping this in sync with the node registry.
+        """
+        return self._valid_hotkeys_dict
 
     @property
     def push_queue(self) -> multiprocessing.Queue:
@@ -115,13 +149,17 @@ class P2PStack:
         self._manager = _mp_ctx.Manager()
         self._metadata_dict = self._manager.dict()
         self._peer_status_dict = self._manager.dict()
+        self._valid_hotkeys_dict = self._manager.dict()
 
         # Create sender subprocess
         logger.info("P2P start: creating sender subprocess")
-        self._sender_subprocess = SenderSubprocess(
+        sender_kwargs: dict = dict(
             retry_policy=self._retry_policy,
             timeouts=self._timeouts,
         )
+        if self._max_sender_connections is not None:
+            sender_kwargs["max_connections"] = self._max_sender_connections
+        self._sender_subprocess = SenderSubprocess(**sender_kwargs)
 
         logger.info("P2P start: starting sender subprocess")
         try:
@@ -145,6 +183,7 @@ class P2PStack:
             external_metadata_dict=self._metadata_dict,
             external_peer_status_dict=self._peer_status_dict,
             push_queue=self._push_queue,
+            external_valid_hotkeys_dict=self._valid_hotkeys_dict,
         )
 
         logger.info("P2P start: starting receiver subprocess")
@@ -158,6 +197,8 @@ class P2PStack:
             raise
 
         logger.info(f"P2P start: receiver ready (node_id={node_id[:16]}...)")
+
+        await self._drain_initial_node_addr(timeout=5.0)
 
         if not self._atexit_registered:
             atexit.register(self._atexit_cleanup)
@@ -207,6 +248,7 @@ class P2PStack:
             self._manager = None
             self._metadata_dict = None
             self._peer_status_dict = None
+            self._valid_hotkeys_dict = None
 
         remove_shm_manifest()
         if self._atexit_registered:
@@ -262,6 +304,26 @@ class P2PStack:
 
         raise RuntimeError("P2P restart failed after all retries — crashing for process manager restart")
 
+    def set_on_sender_restarted(self, callback: Callable[[], None | Awaitable[None]] | None) -> None:
+        """Register a hook fired after every successful sender subprocess restart.
+
+        The new subprocess starts with an empty address book, so the hook is the
+        signal that any "already registered" caches kept by the caller must be
+        dropped before the next dial.
+        """
+        self._on_sender_restarted = callback
+
+    async def _fire_sender_restarted(self) -> None:
+        callback = self._on_sender_restarted
+        if callback is None:
+            return
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.error(f"P2P sender restart hook raised: {exc}")
+
     async def restart_sender(self) -> None:
         """Restart the sender subprocess.
 
@@ -280,6 +342,7 @@ class P2PStack:
             )
             logger.info("P2P sender restart: completed successfully")
             self._restarting_sender = False
+            await self._fire_sender_restarted()
             return
         except asyncio.TimeoutError:
             logger.error("P2P sender restart: timed out")
@@ -295,6 +358,7 @@ class P2PStack:
             )
             logger.info("P2P sender restart: retry succeeded")
             self._restarting_sender = False
+            await self._fire_sender_restarted()
             return
         except asyncio.TimeoutError:
             logger.error("P2P sender restart: retry timed out")
@@ -304,6 +368,34 @@ class P2PStack:
             self._restarting_sender = False
 
         raise RuntimeError("P2P sender restart failed after all retries — crashing for process manager restart")
+
+    # ── epoch boundary cleanup ────────────────────────────────────────
+
+    def drain_push_queue(self) -> int:
+        """Drain all pending messages from the push queue.
+
+        Returns the number of messages discarded.  Called at epoch boundaries
+        so stale backward-activations from the previous epoch are never
+        processed with the new epoch's model weights.
+        """
+        dropped = 0
+        while not self._push_queue.empty():
+            try:
+                self._push_queue.get_nowait()
+                dropped += 1
+            except Exception:
+                break
+        return dropped
+
+    def clear_activation_cache(self) -> int:
+        """Remove all entries from the SharedMemory activation cache.
+
+        Returns the number of entries removed.  Called at epoch boundaries so
+        stale activations cannot be served to peers after a merge.
+        """
+        count = len(self._shm_blocks)
+        self._cleanup_all_shm()
+        return count
 
     # ── activation cache ─────────────────────────────────────────────
 
@@ -388,6 +480,39 @@ class P2PStack:
 
     # ── internal ─────────────────────────────────────────────────────
 
+    async def _drain_initial_node_addr(self, timeout: float) -> None:
+        """Block (briefly) until the receiver subprocess publishes its address hints.
+
+        Iroh's direct addresses are bound at node-creation time, so the first
+        ``("node_addr", ...)`` message lands on the status queue immediately
+        after ``("started", ...)``. We just need to read it before
+        ``_stamp_registry_entry`` runs so peers learn our actual addresses.
+        Other status messages observed in the meantime are passed through to
+        the regular handler.
+        """
+        if self._receiver is None:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            messages = self._receiver.check_status_queue()
+            saw_addr = False
+            for kind, value in messages:
+                if kind == "node_addr" and isinstance(value, dict):
+                    self._relay_url = value.get("relay_url")
+                    self._direct_addresses = list(value.get("direct_addresses") or [])
+                    saw_addr = True
+                elif kind == "unhealthy":
+                    # Defer unhealthy handling to the regular monitor loop.
+                    await self._on_receiver_unhealthy(value)
+            if saw_addr and self._direct_addresses:
+                logger.info(f"P2P receiver address hints: relay={self._relay_url} direct={self._direct_addresses}")
+                return
+            await asyncio.sleep(0.05)
+        logger.warning(
+            f"P2P start: no node_addr from receiver within {timeout:.1f}s — "
+            f"peers will not be able to dial us until the next refresh"
+        )
+
     async def _monitor_status_queue(self) -> None:
         """Poll both subprocess status queues for unhealthy events."""
         while True:
@@ -399,6 +524,12 @@ class P2PStack:
                 for kind, value in messages:
                     if kind == "unhealthy":
                         await self._on_receiver_unhealthy(value)
+                    elif kind == "node_addr" and isinstance(value, dict):
+                        self._relay_url = value.get("relay_url")
+                        self._direct_addresses = list(value.get("direct_addresses") or [])
+                        logger.info(
+                            f"P2P receiver address hints: relay={self._relay_url} direct={self._direct_addresses}"
+                        )
 
                 # Check if receiver subprocess died unexpectedly
                 if (

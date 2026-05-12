@@ -35,52 +35,118 @@ class ProtocolHandler:
         raise NotImplementedError("Use UniProtocol or BiProtocol")
 
     async def _handle_uni(self, conn: Connection, remote_id: str):
-        while True:
-            try:
+        # Spawn a task per accepted stream so concurrent uni messages from the
+        # same peer don't head-of-line block each other on read_to_end + handler.
+        pending: set[asyncio.Task] = set()
+        try:
+            while True:
                 recv_stream: RecvStream = await conn.accept_uni()
+                task = asyncio.create_task(self._process_uni_stream(recv_stream, remote_id))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+        except asyncio.CancelledError:
+            logger.debug(f"Uni handler cancelled for {remote_id[:16]}...")
+            raise
+        except Exception as e:
+            logger.debug(f"Uni handler ended for {remote_id[:16]}...: {type(e).__name__}: {e}")
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
-                start = time.time()
-                message_bytes = await recv_stream.read_to_end(self.max_message_size)
-                logger.debug(
-                    f"Received {len(message_bytes)} bytes in {time.time() - start:.3f}s from {remote_id[:16]}..."
-                )
+    async def _process_uni_stream(self, recv_stream: RecvStream, remote_id: str) -> None:
+        try:
+            start = time.time()
+            message_bytes = await recv_stream.read_to_end(self.max_message_size)
+            logger.debug(f"Received {len(message_bytes)} bytes in {time.time() - start:.3f}s from {remote_id[:16]}...")
 
-                if self.request_model_cls is not None:
-                    message = unwrap_envelope(message_bytes, self.request_model_cls)
-                    await self._maybe_await(self.callback_function(message, remote_id))
-                else:
-                    await self._maybe_await(self.callback_function(message_bytes, remote_id))
-            except asyncio.CancelledError:
-                logger.debug(f"Uni handler cancelled for {remote_id[:16]}...")
-                break
-            except Exception as e:
-                logger.debug(f"Uni handler ended for {remote_id[:16]}...: {type(e).__name__}: {e}")
-                break
+            if self.request_model_cls is not None:
+                message = unwrap_envelope(message_bytes, self.request_model_cls)
+                await self._maybe_await(self.callback_function(message, remote_id))
+            else:
+                await self._maybe_await(self.callback_function(message_bytes, remote_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Uni stream ended for {remote_id[:16]}...: {type(e).__name__}: {e}")
 
     async def _handle_bi(self, conn: Connection, remote_id: str):
-        while True:
-            try:
+        # Spawn a task per accepted stream. The previous serial loop forced every
+        # incoming bidi stream from this peer to wait for the previous handler's
+        # read_to_end + signature verify + ACK write before the next stream could
+        # even start, producing seconds of tail latency under load and triggering
+        # sender-side ACK timeouts that retry to a different peer (causing the
+        # duplicate-submission race fixed by miner_submissions_activation_unique).
+        pending: set[asyncio.Task] = set()
+        try:
+            while True:
                 bi_stream: BiStream = await conn.accept_bi()
+                task = asyncio.create_task(self._process_bi_stream(bi_stream, remote_id))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+        except asyncio.CancelledError:
+            logger.debug(f"Bi handler cancelled for {remote_id[:16]}...")
+            raise
+        except Exception as e:
+            logger.debug(f"Bi handler ended for {remote_id[:16]}...: {type(e).__name__}: {e}")
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
-                request_bytes = await bi_stream.recv().read_to_end(self.max_message_size)
+    async def _process_bi_stream(self, bi_stream: BiStream, remote_id: str) -> None:
+        try:
+            t_read_start = time.monotonic()
+            request_bytes = await bi_stream.recv().read_to_end(self.max_message_size)
+            read_ms = (time.monotonic() - t_read_start) * 1000.0
+            logger.info(
+                f"P2P BI | request bytes received | peer={remote_id[:16]}… | "
+                f"n={len(request_bytes)} | read_ms={read_ms:.1f}"
+            )
 
-                if self.request_model_cls is not None:
-                    request = unwrap_envelope(request_bytes, self.request_model_cls)
-                    response = await self._maybe_await(self.response_callback_function(request, remote_id))
-                else:
-                    response = await self._maybe_await(self.response_callback_function(request_bytes, remote_id))
+            t_handler_start = time.monotonic()
+            if self.request_model_cls is not None:
+                request = unwrap_envelope(request_bytes, self.request_model_cls)
+                response = await self._maybe_await(self.response_callback_function(request, remote_id))
+            else:
+                response = await self._maybe_await(self.response_callback_function(request_bytes, remote_id))
+            handler_ms = (time.monotonic() - t_handler_start) * 1000.0
+            logger.info(f"P2P BI | handler finished | peer={remote_id[:16]}… | handler_ms={handler_ms:.1f}")
 
-                response_bytes = self._coerce_response_bytes(response)
+            # Handlers may return ``(response, post_ack_action)`` to defer side-effects
+            # until after the ACK is on the wire. Without this, a handler that commits
+            # to processing a message before the ACK is written would still process it
+            # when the ACK fails to deliver — the sender then retries to a different
+            # peer, and both peers process the same message.
+            post_ack_action: Callable[[], Any] | None = None
+            if isinstance(response, tuple) and len(response) == 2 and callable(response[1]):
+                response, post_ack_action = response
 
-                await bi_stream.send().write_all(response_bytes)
-                await bi_stream.send().finish()
-                await bi_stream.send().stopped()
-            except asyncio.CancelledError:
-                logger.debug(f"Bi handler cancelled for {remote_id[:16]}...")
-                break
-            except Exception as e:
-                logger.debug(f"Bi handler ended for {remote_id[:16]}...: {type(e).__name__}: {e}")
-                break
+            response_bytes = self._coerce_response_bytes(response)
+
+            t_write_start = time.monotonic()
+            await bi_stream.send().write_all(response_bytes)
+            await bi_stream.send().finish()
+            await bi_stream.send().stopped()
+            write_ms = (time.monotonic() - t_write_start) * 1000.0
+            logger.info(
+                f"P2P BI | response sent | peer={remote_id[:16]}… | "
+                f"response_n={len(response_bytes)} | write_flush_ms={write_ms:.1f}"
+            )
+
+            if post_ack_action is not None:
+                try:
+                    action_result = post_ack_action()
+                    if inspect.isawaitable(action_result):
+                        await action_result
+                except Exception as exc:
+                    logger.warning(f"Post-ACK action raised for {remote_id[:16]}...: " f"{type(exc).__name__}: {exc}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Bi stream ended for {remote_id[:16]}...: {type(e).__name__}: {e}")
 
     async def _maybe_await(self, value: Any) -> Any:
         if inspect.isawaitable(value):
@@ -122,7 +188,7 @@ class UniProtocol(ProtocolHandler):
 class BiProtocol(ProtocolHandler):
     async def accept(self, conn: Connection):
         remote_id = conn.remote_node_id()
-        logger.debug(f"Accepted bi connection from: {remote_id[:16]}...")
+        logger.info(f"Accepted bi connection from: {remote_id[:16]}...")
         try:
             await self._handle_bi(conn, remote_id)
         except Exception as e:

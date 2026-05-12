@@ -135,7 +135,7 @@ LLAMA32_CONFIG_7B = {
     "quantize_activations_grads": False,
     "quantize_weights": False,
     "n_heads": 32,  # Number of attention heads
-    "n_layers": 28,  # Number of layers
+    "n_layers": 26,  # Number of layers
     "hidden_dim": 14336,  # Size of the intermediate dimension in FeedForward
     "n_kv_groups": 8,  # Key-Value groups for grouped-query attention
     "rope_base": 500_000.0,  # The base in RoPE's "theta"

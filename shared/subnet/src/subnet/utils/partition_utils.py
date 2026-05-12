@@ -251,28 +251,37 @@ def _model_suffix(hotkey: str, run_id: str, layer_idx: int) -> str:
     return f"{hotkey[:8]}_{run_id}_{layer_idx}"
 
 
-def delete_saved_model_weights_and_optimizer_state(hotkey: str) -> None:
-    """Deletes any saved model weights and optimizer state files for the given identity.
+def delete_saved_model_weights_and_optimizer_state(hotkey: str, current_run_id: str | None = None) -> None:
+    """Deletes saved model weights and optimizer state files.
 
-    This is useful to ensure we only keep a single snapshot per run/layer to avoid
-    accumulating files across epochs.
+    If ``current_run_id`` is provided, only files from *other* runs are deleted
+    (keeping the snapshot for the active run intact).  If ``current_run_id`` is
+    None, all files for the given hotkey are removed (used on shutdown).
     """
     data_dir = get_data_dir()
 
     try:
-        if not os.path.exists(os.path.join(data_dir, "weights")):
+        weights_dir = os.path.join(data_dir, "weights")
+        if not os.path.exists(weights_dir):
             return
 
         hotkey_prefix = hotkey[:8]
-        for file in list(os.listdir(os.path.join(data_dir, "weights"))):
-            # Delete any old snapshots for this hotkey regardless of prior run/layer to avoid disk bloat
-            if file.startswith(f"current_model_weights_{hotkey_prefix}_") or file.startswith(
-                f"current_model_optimizer_state_dict_{hotkey_prefix}_"
+        for file in list(os.listdir(weights_dir)):
+            if not (
+                file.startswith(f"current_model_weights_{hotkey_prefix}_")
+                or file.startswith(f"current_model_optimizer_state_dict_{hotkey_prefix}_")
             ):
-                try:
-                    os.remove(f"{data_dir}/weights/{file}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete file during cleanup {file}: {e}")
+                continue
+
+            # If we have a current run, keep files belonging to it
+            if current_run_id is not None and f"_{current_run_id}_" in file:
+                continue
+
+            try:
+                os.remove(os.path.join(weights_dir, file))
+                logger.debug(f"Deleted stale weight file: {file}")
+            except Exception as e:
+                logger.warning(f"Failed to delete file during cleanup {file}: {e}")
     except Exception as e:
         logger.warning(f"Error cleaning up saved model files: {e}")
 
