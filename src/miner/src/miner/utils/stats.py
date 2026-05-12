@@ -215,35 +215,6 @@ class StatsTracker:
     def set_run_id(self, run_id: object | None) -> None:
         self.run_id = str(run_id) if run_id is not None else None
 
-    def reset(self) -> None:
-        """
-        Reset the StatsTracker to its initial state.
-
-        Resets all counters, state fields, and clears history collections.
-        Configuration fields (activation_history_window, loss_history_size) are preserved.
-        """
-        # TODO: Add config settings for these?
-        self.activation_history_window = 300.0
-        self.loss_history_size = 50
-
-        # Reset state fields
-        self.current_layer = None
-        self.current_phase = None
-        self.remote_epoch = None
-        self.local_epoch = None
-        self.run_id = None
-
-        # Reset counters
-        self._forward_count = 0
-        self._backward_count = 0
-        self._download_bytes = 0
-        self._p2p_bytes = 0
-
-        # Clear history collections (preserving maxlen for _loss_history)
-        self._activations.clear()
-        self._loss_history.clear()
-        self.activation_stats.clear()
-
     # --- Aggregated views --------------------------------------------------
 
     @property

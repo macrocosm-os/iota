@@ -117,7 +117,43 @@ def get_available_hotkeys(wallet_name: str = "swarm-test") -> list[str]:
 
 def run_single_miner_process(wallet_name: str, wallet_hotkey: str, miner_id: int):
     """Run a single miner instance in a separate process."""
-    # Configure logging for the child process
+    # Put this child (and anything it spawns — torch DataLoader workers,
+    # bittensor subprocesses, etc.) in its own process group so the parent's
+    # signal handler can `killpg` the full tree atomically. Without this, a
+    # hard kill of the parent (e.g. go-task's post-grace-period SIGKILL on
+    # Ctrl+C) leaves the child and any of *its* children orphaned to init.
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+
+    # Belt-and-suspenders: if the parent launcher is killed so abruptly that
+    # it doesn't get to signal us (go-task SIGKILL racing against our
+    # signal_handler), we'd be left running forever under init (PPID=1).
+    # macOS has no PR_SET_PDEATHSIG, so we poll getppid() from a daemon
+    # thread and self-terminate when it flips to 1.
+    import threading
+
+    _original_ppid = os.getppid()
+
+    def _parent_death_watchdog() -> None:
+        while True:
+            time.sleep(2.0)
+            try:
+                if os.getppid() != _original_ppid or os.getppid() == 1:
+                    # Parent went away — kill our whole process group (this
+                    # child + any torch/bt subprocesses we spawned) and exit.
+                    try:
+                        os.killpg(os.getpgrp(), signal.SIGKILL)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    os._exit(0)
+            except Exception:  # noqa: BLE001
+                return
+
+    _wd = threading.Thread(target=_parent_death_watchdog, daemon=True, name=f"miner_{miner_id}_pdwatchdog")
+    _wd.start()
+
     logger.remove()
     logger.add(
         sys.stderr,
@@ -214,33 +250,116 @@ def launch_multiple_miners(num_miners: int, wallet_name_prefix: str = "miner", w
 
     logger.info(f"Launched {num_miners} miners in separate processes. Waiting for completion...")
 
+    # Guard against re-entry: if a second Ctrl+C / SIGTERM arrives while the
+    # handler is still running we want to `os._exit` immediately rather than
+    # start the grace period over.
+    _shutting_down = {"flag": False}
+
+    # Launcher-level parent-death watchdog. Workers already have their own
+    # (run_single_miner_process), but the LAUNCHER itself can be orphaned in
+    # the e2e flow: the e2e driver Popens us with start_new_session=True, so
+    # if the driver is SIGKILL'd (e.g. go-task post-grace), our ppid flips
+    # to 1 (launchd) but no signal is delivered. Without this watchdog the
+    # launcher keeps `process.join()`-ing forever and workers are orphaned.
+    # macOS has no PR_SET_PDEATHSIG, so we poll. Manual `task start-miners-uv`
+    # is unaffected: ppid stays stable until the user Ctrl+Cs, at which point
+    # the regular SIGINT path tears things down before the watchdog ticks.
+    import threading as _threading
+
+    _launcher_initial_ppid = os.getppid()
+
+    def _launcher_parent_watchdog() -> None:
+        while True:
+            time.sleep(2.0)
+            try:
+                ppid = os.getppid()
+            except Exception:  # noqa: BLE001
+                return
+            if ppid == _launcher_initial_ppid and ppid != 1:
+                continue
+            # Parent went away. Best-effort kill of every worker pgrp, then
+            # exit. We deliberately do NOT call signal_handler() here — it
+            # logs and runs a 3s grace period, which is wasted work when
+            # the driver is already gone.
+            for p in processes:
+                if p.pid is None:
+                    continue
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            os._exit(0)
+
+    _threading.Thread(target=_launcher_parent_watchdog, daemon=True, name="launcher_pdwatchdog").start()
+
+    def _killpg(pid: int, sig: int) -> None:
+        """Best-effort killpg of the pgrp owned by `pid`.
+
+        Children call `os.setpgrp()` in `run_single_miner_process` so each
+        has its own group; signalling that group tears down torch DataLoader
+        workers / bittensor subprocesses / anything else the miner spawned.
+        """
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return
+        # Refuse to signal our own group — would nuke the launcher itself.
+        if pgid == os.getpgrp():
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            return
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def signal_handler(signum, frame):
-        logger.info("Received shutdown signal. Stopping all miners...")
+        if _shutting_down["flag"]:
+            logger.warning("Second shutdown signal received — exiting immediately")
+            os._exit(1)
+        _shutting_down["flag"] = True
+        logger.info(f"Received shutdown signal ({signum}). Stopping all miners...")
+
         for process in processes:
-            if process.is_alive():
-                logger.info(f"Terminating miner process {process.pid}")
-                process.terminate()
+            if process.pid is None:
+                continue
+            logger.info(f"SIGTERM miner pgid of pid {process.pid}")
+            _killpg(process.pid, signal.SIGTERM)
 
-        # Give processes time to shut down gracefully
-        import time
+        # Short grace period — anything clean exits here. We intentionally do
+        # NOT consult process.is_alive() before the SIGKILL sweep; it has
+        # been observed to return False while the OS process is still
+        # running, causing the kill to be skipped and the child to survive.
+        time.sleep(3)
 
-        time.sleep(2)
-
-        # Force kill any remaining processes
         for process in processes:
-            if process.is_alive():
-                logger.warning(f"Force killing miner process {process.pid}")
-                process.kill()
+            if process.pid is None:
+                continue
+            logger.warning(f"SIGKILL miner pgid of pid {process.pid}")
+            _killpg(process.pid, signal.SIGKILL)
+
+        # Reap whatever exited so the process table stays tidy.
+        for process in processes:
+            try:
+                process.join(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
 
         logger.info("All miners stopped")
-        sys.exit(0)
+        # os._exit bypasses atexit handlers, threading teardown, and any
+        # blocking destructors in torch / bittensor that could hang us long
+        # enough for go-task to SIGKILL us with children still running.
+        os._exit(0)
 
-    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    # SIGHUP fires when the controlling terminal closes (e.g. user closes
+    # the tab with miners still running) — same cleanup path.
+    signal.signal(signal.SIGHUP, signal_handler)
 
     try:
-        # Wait for all processes to complete
         for process in processes:
             process.join()
     except KeyboardInterrupt:

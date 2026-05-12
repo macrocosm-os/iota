@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import pickle
 import struct
+import weakref
 from typing import Any, Callable
 
 from iroh import Iroh, NodeAddr, NodeOptions, PublicKey, iroh_ffi
@@ -39,9 +40,11 @@ _MAX_MSG_BYTES = 64 * 1024 * 1024  # 64 MB ceiling
 
 # uniffi_set_event_loop must be called before *any* iroh async operation but
 # calling it again mid-flight resets internal state and can race with running
-# protocol handlers.  We track whether we've already set it for the current
-# event loop and skip redundant calls.
-_event_loop_set_for: set[int] = set()
+# protocol handlers.  We skip redundant calls only for the *same* loop object.
+# Do not key this by id(loop): after a loop is destroyed, id reuse can make a
+# new asyncio.run() look like the old loop and skip uniffi_set_event_loop,
+# causing "Future attached to a different loop".
+_iroh_event_loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop] | None = None
 
 
 # ── Protocol handler ──────────────────────────────────────────────────────────
@@ -128,10 +131,11 @@ class IrohNode:
     async def start(self) -> None:
         """Start the underlying iroh node(s) and populate :attr:`receiver_ids`."""
         loop = asyncio.get_running_loop()
-        loop_id = id(loop)
-        if loop_id not in _event_loop_set_for:
+        global _iroh_event_loop_ref
+        prev_loop = _iroh_event_loop_ref() if _iroh_event_loop_ref is not None else None
+        if prev_loop is not loop:
             iroh_ffi.uniffi_set_event_loop(loop)
-            _event_loop_set_for.add(loop_id)
+            _iroh_event_loop_ref = weakref.ref(loop)
         self._node = await Iroh.memory_with_options(
             NodeOptions(protocols={PROTOCOL_ID_NODEMESH: _NodeMeshProtocolFactory(self._handlers)})
         )

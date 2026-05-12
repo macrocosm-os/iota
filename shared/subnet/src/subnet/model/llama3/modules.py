@@ -256,18 +256,9 @@ class GroupedQueryAttention(nn.Module):
         # If we used regular repeat instead of repeat_interleave, we'd get:
         #   [K1, K2, K1, K2]
 
-        # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        # Shape: (b, num_heads, num_tokens, num_tokens)
-        attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
-
-        # Use the mask to fill attention scores
-        attn_scores = attn_scores.masked_fill(mask[:num_tokens, :num_tokens], -torch.inf)
-
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
-        assert keys.shape[-1] == self.head_dim
-
-        # Shape: (b, num_tokens, num_heads, head_dim)
-        context_vec = (attn_weights @ values).transpose(1, 2)
+        context_vec = nn.functional.scaled_dot_product_attention(
+            queries=queries, keys=keys, values=values, is_causal=True
+        ).transpose(1, 2)
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.reshape(b, num_tokens, self.d_out)
