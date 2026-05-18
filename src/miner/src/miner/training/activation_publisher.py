@@ -23,6 +23,7 @@ from miner.utils.attestation_utils import AttestationUnavailableError, collect_a
 from miner.utils.activation_hash import compute_activation_hash
 from common.iroh.activation_push import ActivationPushMessage, ActivationPushNackError
 from common.iroh.sender_subprocess import SenderUnavailableError
+from common.iroh.timings import P2POperationTimings
 from subnet.miner_api_client import MinerAPIClient
 from miner.sync import ComputeNode, NodeRegistry, SyncedVariable
 from miner.training.peer_selection import select_random
@@ -41,6 +42,24 @@ def _peer_matches_target_layer(node: ComputeNode, target_layer: int) -> bool:
     return f"layer-{target_layer}" in node.groups
 
 
+def _format_phases(timings: P2POperationTimings) -> str:
+    """Compact ``conn=… open=… send=… recv=…`` (ms) for a single log line.
+
+    A ``-`` for any field means that phase did not complete — useful for
+    pinpointing which iroh phase a stalled send was sitting in.
+    """
+
+    def _fmt(v: float | None) -> str:
+        return f"{v * 1000:.0f}" if v is not None else "-"
+
+    return (
+        f"conn={_fmt(timings.connection_duration)} "
+        f"open={_fmt(timings.stream_open_duration)} "
+        f"send={_fmt(timings.send_duration)} "
+        f"recv={_fmt(timings.receive_duration)}"
+    )
+
+
 @dataclass
 class _OutboundItem:
     """An activation message waiting to be sent to a peer."""
@@ -49,6 +68,15 @@ class _OutboundItem:
     target_p2p_node_ids: list[str] | None  # Known target (backward)
     enqueued_at: float
     next_layer: int | None  # For forward routing (needs peer selection)
+    # Metadata carried so the orchestrator can be notified after P2P completes.
+    activation_path: str | None = None
+    attestation_payload: MinerAttestationPayload | MountedAttestationPayload | None = None
+    input_hash: str | None = None
+    output_hash: str = ""
+    # Errors accumulate across publisher-level retries; each new send produces fresh
+    # per-phase durations so only the last attempt's transport timing is preserved.
+    p2p_errors: list[str] = field(default_factory=list)
+    tries: int = 0
 
     # Priority + tiebreaker used by PriorityQueue: backward=0, forward=1
     _priority: int = field(init=False, default=1)
@@ -81,9 +109,9 @@ class ActivationPublisher:
         self._node_registry = node_registry
         self._peer_selector = peer_selector or select_random
 
-        # Outbound send queue — drained by _drain_outbound()
+        # Outbound send queue — drained concurrently by N worker tasks.
         self._outbound: asyncio.PriorityQueue[_OutboundItem] = asyncio.PriorityQueue()
-        self._send_loop_task: asyncio.Task | None = None
+        self._send_loop_tasks: list[asyncio.Task] = []
         # Forward routing: track empty peer lookups per layer to warn on empty → non-empty flapping.
         self._forward_peer_lookup_was_empty: dict[int, bool] = {}
 
@@ -94,17 +122,23 @@ class ActivationPublisher:
     # ── Send-loop lifecycle ──────────────────────────────────────────────────
 
     def start_send_loop(self) -> None:
-        """Start the background task that drains the outbound queue."""
-        if self._send_loop_task is None or self._send_loop_task.done():
-            self._send_loop_task = asyncio.create_task(self._drain_outbound(cache=self.miner.cache))
-            logger.info("Outbound send loop started")
+        """Spawn ACTIVATION_SEND_CONCURRENCY worker tasks that drain the outbound queue."""
+        if any(not t.done() for t in self._send_loop_tasks):
+            return
+        n = max(1, miner_settings.ACTIVATION_SEND_CONCURRENCY)
+        self._send_loop_tasks = [asyncio.create_task(self._drain_outbound_worker(worker_id=i)) for i in range(n)]
+        logger.info(f"Outbound send loop started with {n} worker(s)")
 
     def stop_send_loop(self) -> None:
-        """Cancel the background send loop."""
-        if self._send_loop_task is not None and not self._send_loop_task.done():
-            self._send_loop_task.cancel()
-            logger.info("Outbound send loop stopped")
-        self._send_loop_task = None
+        """Cancel all background send workers."""
+        cancelled = 0
+        for task in self._send_loop_tasks:
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        if cancelled:
+            logger.info(f"Outbound send loop stopped ({cancelled} worker(s) cancelled)")
+        self._send_loop_tasks = []
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -113,9 +147,6 @@ class ActivationPublisher:
         tensor: torch.Tensor,
         activation_id: str,
         direction: str,
-        attestation_challenge_blob: str | None,
-        attestation_self_checks: list[str] | None,
-        attestation_crypto: str | None,
         upload_url: list[str] | None,
         activation_path: str | None,
         source_p2p_node_ids: list[str] | None = None,
@@ -127,9 +158,6 @@ class ActivationPublisher:
                 tensor=tensor,
                 activation_id=activation_id,
                 direction=direction,
-                attestation_challenge_blob=attestation_challenge_blob,
-                attestation_self_checks=attestation_self_checks,
-                attestation_crypto=attestation_crypto,
                 upload_url=upload_url,
                 activation_path=activation_path,
                 source_p2p_node_ids=source_p2p_node_ids,
@@ -150,9 +178,6 @@ class ActivationPublisher:
         tensor: torch.Tensor,
         activation_id: str,
         direction: str,
-        attestation_challenge_blob: str | None,
-        attestation_self_checks: list[str] | None,
-        attestation_crypto: str | None,
         upload_url: list[str] | None,
         activation_path: str | None,
         source_p2p_node_ids: list[str] | None = None,
@@ -187,15 +212,6 @@ class ActivationPublisher:
                 except Exception as e:
                     logger.error(f"Spot-check upload failed for {activation_id}: {e}")
 
-            # ── Enqueue activation for background send ───────────────────────
-            self._enqueue_for_send(
-                tensor_bytes=tensor_bytes,
-                activation_id=activation_id,
-                direction=direction,
-                source_p2p_node_ids=source_p2p_node_ids,
-                sample_path=sample_path,
-            )
-
             async with TimerLoggerMiner(
                 name="upload_activation",  # Name kept for metrics compatibility (no actual S3 upload)
                 metadata={
@@ -207,12 +223,19 @@ class ActivationPublisher:
                 attestation_payload: MinerAttestationPayload | MountedAttestationPayload | None = None
                 if self._run_flags.attest.isOn():
                     try:
-                        challenge = AttestationChallengeResponse(
-                            challenge_blob=attestation_challenge_blob,
-                            self_checks=attestation_self_checks,
-                            crypto=attestation_crypto,
+                        challenge_response = await self._miner_api_client.request_attestation_challenge(
+                            action="submit_activation",
                         )
-                        challenge_id = json.loads(attestation_challenge_blob)["challenge_id"]
+                        if challenge_response is None:
+                            raise AttestationUnavailableError(
+                                "Orchestrator did not issue an attestation challenge for submit_activation"
+                            )
+                        challenge = AttestationChallengeResponse(
+                            challenge_blob=challenge_response.attestation_challenge_blob,
+                            self_checks=challenge_response.self_checks,
+                            crypto=challenge_response.crypto,
+                        )
+                        challenge_id = json.loads(challenge_response.attestation_challenge_blob)["challenge_id"]
                         if self.miner and self.miner.is_mounted:
                             challenge_base64 = payload_base64_from_obj(challenge)
                             try:
@@ -248,21 +271,36 @@ class ActivationPublisher:
                 stats.timing.publish.end = publish_end
                 stats.timing.publish.duration = publish_end - publish_start
 
-            # ── Notify orchestrator (fully async — never blocks activation flow) ──
-            activation_stats = None
-            if self._stats_tracker is not None:
-                activation_stats = self._stats_tracker.get_activation_stats_payload(activation_id)
-            asyncio.create_task(
-                self._notify_orchestrator(
-                    activation_id=activation_id,
-                    activation_path=activation_path,
-                    direction=direction,
-                    activation_stats=activation_stats,
-                    attestation_payload=attestation_payload,
-                    input_hash=input_hash,
-                    output_hash=output_hash,
-                )
+            # Orchestrator notification is deferred: ``_enqueue_for_send`` returns the
+            # outbound item when a P2P push is scheduled, so notify fires from
+            # ``_process_outbound_item`` once we have real ``timing.p2p`` data. When no
+            # P2P send is needed (last-layer forward, layer-0 backward) we notify now.
+            enqueued = self._enqueue_for_send(
+                tensor_bytes=tensor_bytes,
+                activation_id=activation_id,
+                direction=direction,
+                source_p2p_node_ids=source_p2p_node_ids,
+                sample_path=sample_path,
+                activation_path=activation_path,
+                attestation_payload=attestation_payload,
+                input_hash=input_hash,
+                output_hash=output_hash,
             )
+            if not enqueued:
+                activation_stats = None
+                if self._stats_tracker is not None:
+                    activation_stats = self._stats_tracker.get_activation_stats_payload(activation_id)
+                asyncio.create_task(
+                    self._notify_orchestrator(
+                        activation_id=activation_id,
+                        activation_path=activation_path,
+                        direction=direction,
+                        activation_stats=activation_stats,
+                        attestation_payload=attestation_payload,
+                        input_hash=input_hash,
+                        output_hash=output_hash,
+                    )
+                )
 
             logger.success(f"Activation {activation_id} enqueued for send ({direction})")
 
@@ -282,11 +320,21 @@ class ActivationPublisher:
         direction: str,
         source_p2p_node_ids: list[str] | None,
         sample_path: str | None = None,
-    ) -> None:
-        """Build an ActivationPushMessage and place it on the outbound queue."""
+        activation_path: str | None = None,
+        attestation_payload: MinerAttestationPayload | MountedAttestationPayload | None = None,
+        input_hash: str | None = None,
+        output_hash: str = "",
+    ) -> bool:
+        """Build an ActivationPushMessage and place it on the outbound queue.
+
+        Returns ``True`` when an item was enqueued (P2P send pending), ``False`` when
+        no send is needed (last-layer forward, layer-0 backward, missing P2P, etc.).
+        Caller uses the return value to decide whether to fire an immediate orchestrator
+        notification or defer it to ``_process_outbound_item``.
+        """
         if not self.miner or not self.miner.p2p:
             logger.warning(f"P2P not available — skipping enqueue for {activation_id}")
-            return
+            return False
 
         my_p2p_node_ids: list[str] = self.miner.p2p.node_ids
         my_hotkey: str = self._miner_api_client.hotkey.ss58_address
@@ -301,10 +349,10 @@ class ActivationPublisher:
             next_layer = current_layer + 1
             if next_layer >= n_splits:
                 # Last layer — no forward push
-                return
+                return False
             if self._node_registry is None:
                 logger.warning(f"No node_registry — cannot route forward activation {activation_id}")
-                return
+                return False
             msg = ActivationPushMessage(
                 activation_id=activation_id,
                 direction=direction,
@@ -320,10 +368,14 @@ class ActivationPublisher:
                 target_p2p_node_ids=None,  # Needs peer selection at drain time
                 enqueued_at=time.time(),
                 next_layer=next_layer,
+                activation_path=activation_path,
+                attestation_payload=attestation_payload,
+                input_hash=input_hash,
+                output_hash=output_hash,
             )
         elif direction == "backward":
             if not source_p2p_node_ids:
-                return
+                return False
             target_layer = max(0, current_layer - 1)
             msg = ActivationPushMessage(
                 activation_id=activation_id,
@@ -340,154 +392,261 @@ class ActivationPublisher:
                 target_p2p_node_ids=source_p2p_node_ids,
                 enqueued_at=time.time(),
                 next_layer=None,
+                activation_path=activation_path,
+                attestation_payload=attestation_payload,
+                input_hash=input_hash,
+                output_hash=output_hash,
             )
         else:
-            return
+            return False
 
         self._outbound.put_nowait(item)
         logger.debug(f"Enqueued {direction} activation {activation_id} (queue size: {self._outbound.qsize()})")
+        return True
 
-    async def _drain_outbound(self, cache) -> None:
-        """Background loop: pull items from the priority queue and send them."""
+    async def _drain_outbound_worker(self, worker_id: int) -> None:
+        """Worker task: pull items from the priority queue and send them.
+
+        Multiple workers run concurrently so a single slow ``push_activation``
+        cannot block other queued sends.
+        """
         while True:
             try:
                 item = await self._outbound.get()
-
-                # TTL check
-                age = time.time() - item.enqueued_at
-                if age > miner_settings.ACTIVATION_SEND_TTL:
-                    logger.warning(
-                        f"Dropping expired {item.msg.direction} activation {item.msg.activation_id} "
-                        f"(age={age:.1f}s > TTL={miner_settings.ACTIVATION_SEND_TTL}s)"
-                    )
-                    continue
-
-                # Resolve target
-                if item.target_p2p_node_ids is not None:
-                    # Backward: target already known (from activation cache)
-                    target = item.target_p2p_node_ids
-                    if self._node_registry is not None and item.msg.target_layer is not None:
-                        nodes = self._node_registry.value.get_nodes_for_layer(item.msg.target_layer)
-                        p2p_set = set(item.target_p2p_node_ids)
-                        if not any(n.p2p_node_ids and p2p_set & set(n.p2p_node_ids) for n in nodes):
-                            logger.warning(
-                                f"Backward targets {item.target_p2p_node_ids} not found among "
-                                f"layer-{item.msg.target_layer} peers in registry "
-                                f"(activation {item.msg.activation_id}) — retrying"
-                            )
-                            await asyncio.sleep(1.0)
-                            self._outbound.put_nowait(item)
-                            continue
-                else:
-                    # Forward: select peer from registry
-                    if self._node_registry is None:
-                        logger.error(f"No node_registry — cannot forward-send activation {item.msg.activation_id}")
-                        continue
-                    layer_key = item.next_layer
-                    assert layer_key is not None
-                    registry = self._node_registry.value
-                    nodes = registry.get_nodes_for_layer(layer_key)
-                    eligible = [n for n in nodes if n.p2p_node_ids]
-                    if not eligible:
-                        self._forward_peer_lookup_was_empty[layer_key] = True
-                        all_nodes = registry.all_nodes()
-                        node_summary = (
-                            "; ".join(
-                                f"{n.node_id[:12]}… layer={n.training_layer} "
-                                f"groups={n.groups} p2p={len(n.p2p_node_ids)}"
-                                for n in all_nodes
-                            )
-                            or "(empty registry)"
-                        )
-                        logger.warning(
-                            f"No routable peers for layer-{layer_key} (activation {item.msg.activation_id}): "
-                            f"{len(nodes)} node(s) matched that layer, {len(all_nodes)} total in registry, "
-                            f"none with p2p_node_ids — retrying. "
-                            f"Registry contents: [{node_summary}]"
-                        )
-                        await asyncio.sleep(1.0)
-                        self._outbound.put_nowait(item)
-                        continue
-                    if self._forward_peer_lookup_was_empty.pop(layer_key, False):
-                        logger.warning(
-                            f"Registry flapping: peers became available for forward routing to layer {layer_key} "
-                            f"(activation {item.msg.activation_id}) after prior empty lookup"
-                        )
-                    chosen = self._peer_selector(eligible)
-                    if not _peer_matches_target_layer(chosen, layer_key):
-                        logger.error(
-                            f"Peer selection mismatch: chosen node {chosen.node_id} is not on layer-{layer_key} "
-                            f"(activation {item.msg.activation_id}) — retrying"
-                        )
-                        await asyncio.sleep(1.0)
-                        self._outbound.put_nowait(item)
-                        continue
-                    target = chosen.p2p_node_ids
-
-                # Send
-                try:
-                    await self.miner.push_activation(target_p2p_node_ids=target, msg=item.msg)
-                    logger.debug(f"Sent {item.msg.direction} activation {item.msg.activation_id}")
-                except SenderUnavailableError as send_exc:
-                    # Sender subprocess restarting — re-enqueue with same target
-                    remaining_ttl = miner_settings.ACTIVATION_SEND_TTL - (time.time() - item.enqueued_at)
-                    if remaining_ttl > 1.0:
-                        logger.warning(
-                            f"Sender unavailable for {item.msg.direction} activation {item.msg.activation_id} "
-                            f"({send_exc}), re-enqueuing ({remaining_ttl:.0f}s TTL remaining)"
-                        )
-                        await asyncio.sleep(1.0)
-                        self._outbound.put_nowait(item)
-                    else:
-                        logger.error(
-                            f"Sender unavailable for {item.msg.direction} activation {item.msg.activation_id} "
-                            f"({send_exc}), dropping (TTL expired)"
-                        )
-                except ActivationPushNackError as nack_exc:
-                    # Receiver explicitly rejected the push (e.g. queue full)
-                    remaining_ttl = miner_settings.ACTIVATION_SEND_TTL - (time.time() - item.enqueued_at)
-                    if remaining_ttl > 1.0:
-                        if item.msg.direction == "forward":
-                            item.target_p2p_node_ids = None  # re-select peer
-                        logger.warning(
-                            f"Push NACK for {item.msg.direction} {item.msg.activation_id} "
-                            f"({nack_exc.status.name}), re-enqueuing ({remaining_ttl:.0f}s TTL remaining)"
-                        )
-                        await asyncio.sleep(0.5)
-                        self._outbound.put_nowait(item)
-                    else:
-                        logger.error(f"Push NACK for {item.msg.activation_id}, dropping (TTL expired)")
-                except Exception as send_exc:
-                    # Peer unreachable / network error — re-enqueue, pick a different peer for forward sends
-                    remaining_ttl = miner_settings.ACTIVATION_SEND_TTL - (time.time() - item.enqueued_at)
-                    if remaining_ttl > 1.0:
-                        if item.msg.direction == "forward":
-                            # Clear the resolved target so peer selection runs again
-                            item.target_p2p_node_ids = None
-                            logger.warning(
-                                f"Peer unreachable for forward activation {item.msg.activation_id} "
-                                f"({send_exc}), re-enqueuing for different peer ({remaining_ttl:.0f}s TTL remaining)"
-                            )
-                        else:
-                            logger.warning(
-                                f"Peer unreachable for backward activation {item.msg.activation_id} "
-                                f"({send_exc}), re-enqueuing same target ({remaining_ttl:.0f}s TTL remaining)"
-                            )
-                        await asyncio.sleep(1.0)
-                        self._outbound.put_nowait(item)
-                    else:
-                        logger.error(
-                            f"Failed to send {item.msg.direction} activation {item.msg.activation_id} "
-                            f"({send_exc}), dropping (TTL expired)"
-                        )
-                        # remove activation if send failed
-                        cache.remove(item.msg.activation_id)
-
+                await self._process_outbound_item(item)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Unexpected error in outbound send loop")
+                logger.exception(f"Unexpected error in outbound send worker {worker_id}")
                 await asyncio.sleep(1.0)
+
+    @staticmethod
+    def _retry_backoff_seconds(tries: int) -> float:
+        """Exponential back-off keyed off attempt count: 0.25, 0.5, 1, 2, 4, capped at 5 s."""
+        return min(0.25 * (2 ** max(0, tries - 1)), 5.0)
+
+    async def _process_outbound_item(self, item: _OutboundItem) -> None:
+        """Send one outbound item; re-enqueue on retryable failures.
+
+        Owns the full per-item lifecycle: tries check, target resolution
+        (backward = known target, forward = peer selection from registry),
+        the send call, and exception handling.  Exceptions raised here
+        propagate to the worker's outer ``except`` which logs + sleeps.
+        """
+        deadline_sec = miner_settings.ACTIVATION_SEND_DEADLINE_SECONDS
+        if deadline_sec > 0:
+            elapsed = time.time() - item.enqueued_at
+            if elapsed > deadline_sec:
+                logger.warning(
+                    f"Dropping {item.msg.direction} activation {item.msg.activation_id} "
+                    f"after {elapsed:.0f}s without successful ACK (deadline={deadline_sec:.0f}s)"
+                )
+                if self.miner is not None:
+                    try:
+                        await self.miner.cache.remove(item.msg.activation_id)
+                    except Exception as exc:
+                        logger.debug(f"Cache remove after send deadline (non-fatal): {exc}")
+                return
+
+        max_tries = miner_settings.ACTIVATION_SEND_MAX_TRIES
+        item.tries += 1
+        if item.tries > max_tries:
+            logger.warning(
+                f"Dropping {item.msg.direction} activation {item.msg.activation_id} "
+                f"after {item.tries - 1} tries (max={max_tries})"
+            )
+            return
+
+        # Resolve target
+        target_ctx = ""
+        if item.target_p2p_node_ids is not None:
+            # Backward: target already known (from activation cache)
+            target = item.target_p2p_node_ids
+            target_ctx = f"peer=backward[{len(target)}] layer={item.msg.target_layer}"
+            if self._node_registry is not None and item.msg.target_layer is not None:
+                nodes = self._node_registry.value.get_nodes_for_layer(item.msg.target_layer)
+                p2p_set = set(item.target_p2p_node_ids)
+                if not any(n.p2p_node_ids and p2p_set & set(n.p2p_node_ids) for n in nodes):
+                    logger.warning(
+                        f"Backward targets {item.target_p2p_node_ids} not found among "
+                        f"layer-{item.msg.target_layer} peers in registry "
+                        f"(activation {item.msg.activation_id}) — retrying"
+                    )
+                    await asyncio.sleep(1.0)
+                    self._outbound.put_nowait(item)
+                    return
+        else:
+            # Forward: select peer from registry
+            if self._node_registry is None:
+                logger.error(f"No node_registry — cannot forward-send activation {item.msg.activation_id}")
+                return
+            layer_key = item.next_layer
+            assert layer_key is not None
+            registry = self._node_registry.value
+            nodes = registry.get_nodes_for_layer(layer_key)
+            # A peer is eligible only if it has BOTH a p2p node id and at least
+            # one address hint (relay URL or direct sockaddr). Iroh discovery is
+            # disabled, so a peer with only a node_id is not dialable — skip it
+            # until its address hints land in the registry.
+            eligible = [n for n in nodes if n.p2p_node_ids and (n.iroh_relay_url or n.iroh_direct_addresses)]
+            if not eligible:
+                self._forward_peer_lookup_was_empty[layer_key] = True
+                all_nodes = registry.all_nodes()
+                node_summary = (
+                    "; ".join(
+                        f"{n.node_id[:12]}… layer={n.training_layer} "
+                        f"groups={n.groups} p2p={len(n.p2p_node_ids)} "
+                        f"relay={'y' if n.iroh_relay_url else 'n'} "
+                        f"direct={len(n.iroh_direct_addresses)}"
+                        for n in all_nodes
+                    )
+                    or "(empty registry)"
+                )
+                logger.warning(
+                    f"No routable peers for layer-{layer_key} (activation {item.msg.activation_id}): "
+                    f"{len(nodes)} node(s) matched that layer, {len(all_nodes)} total in registry, "
+                    f"none with both p2p_node_ids and address hints — retrying. "
+                    f"Registry contents: [{node_summary}]"
+                )
+                await asyncio.sleep(1.0)
+                self._outbound.put_nowait(item)
+                return
+            if self._forward_peer_lookup_was_empty.pop(layer_key, False):
+                logger.warning(
+                    f"Registry flapping: peers became available for forward routing to layer {layer_key} "
+                    f"(activation {item.msg.activation_id}) after prior empty lookup"
+                )
+            chosen = self._peer_selector(eligible)
+            if not _peer_matches_target_layer(chosen, layer_key):
+                logger.error(
+                    f"Peer selection mismatch: chosen node {chosen.node_id} is not on layer-{layer_key} "
+                    f"(activation {item.msg.activation_id}) — retrying"
+                )
+                await asyncio.sleep(1.0)
+                self._outbound.put_nowait(item)
+                return
+            target = chosen.p2p_node_ids
+            target_ctx = (
+                f"peer={chosen.node_id[:8]} layer={layer_key} "
+                f"relay={'y' if chosen.iroh_relay_url else 'n'} "
+                f"direct={len(chosen.iroh_direct_addresses or [])}"
+            )
+
+        # Send. Per-attempt timings get hydrated by the sender; errors and the final
+        # attempt count accumulate on the OutboundItem across publisher-level retries.
+        attempt_timings = P2POperationTimings()
+        try:
+            logger.info(
+                f"Activation push OUTBOUND | P2P send | id={item.msg.activation_id} "
+                f"dir={item.msg.direction} attempt={item.tries}/{max_tries} "
+                f"candidate_peers={len(target)} tensor_bytes={len(item.msg.tensor_bytes)}"
+            )
+            await self.miner.push_activation(target_p2p_node_ids=target, msg=item.msg, timings=attempt_timings)
+            logger.info(
+                f"Activation push OUTBOUND | P2P send finished | id={item.msg.activation_id} "
+                f"dir={item.msg.direction} attempt={item.tries}"
+            )
+            logger.debug(f"Sent {item.msg.direction} activation {item.msg.activation_id}")
+            attempt_timings.errors = list(item.p2p_errors) + list(attempt_timings.errors)
+            attempt_timings.attempt_count = item.tries
+            attempt_timings.retry_count = max(0, item.tries - 1)
+            await self._record_and_notify(item, attempt_timings)
+            return
+        except SenderUnavailableError as send_exc:
+            item.p2p_errors.append(f"SenderUnavailable: {send_exc}")
+            # Sender subprocess restarting — re-enqueue with same target
+            if item.tries < max_tries:
+                backoff = self._retry_backoff_seconds(item.tries)
+                logger.warning(
+                    f"Sender unavailable for {item.msg.direction} activation {item.msg.activation_id} "
+                    f"({send_exc}), re-enqueuing in {backoff:.2f}s (tries={item.tries}/{max_tries}) "
+                    f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+                )
+                await asyncio.sleep(backoff)
+                self._outbound.put_nowait(item)
+                return
+            logger.error(
+                f"Sender unavailable for {item.msg.direction} activation {item.msg.activation_id} "
+                f"({send_exc}), dropping (tries exhausted) "
+                f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+            )
+        except ActivationPushNackError as nack_exc:
+            item.p2p_errors.append(f"NACK[{nack_exc.status.name}]: {nack_exc}")
+            # Receiver explicitly rejected the push (e.g. queue full)
+            if item.tries < max_tries:
+                if item.msg.direction == "forward":
+                    item.target_p2p_node_ids = None  # re-select peer
+                backoff = self._retry_backoff_seconds(item.tries)
+                logger.warning(
+                    f"Push NACK for {item.msg.direction} {item.msg.activation_id} "
+                    f"({nack_exc.status.name}), re-enqueuing in {backoff:.2f}s (tries={item.tries}/{max_tries}) "
+                    f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+                )
+                await asyncio.sleep(backoff)
+                self._outbound.put_nowait(item)
+                return
+            logger.error(
+                f"Push NACK for {item.msg.activation_id}, dropping (tries exhausted) "
+                f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+            )
+        except Exception as send_exc:
+            item.p2p_errors.append(f"{type(send_exc).__name__}: {send_exc}")
+            # Peer unreachable / network error — re-enqueue, pick a different peer for forward sends
+            if item.tries < max_tries:
+                backoff = self._retry_backoff_seconds(item.tries)
+                if item.msg.direction == "forward":
+                    # Clear the resolved target so peer selection runs again
+                    item.target_p2p_node_ids = None
+                    logger.warning(
+                        f"Peer unreachable for forward activation {item.msg.activation_id} "
+                        f"({send_exc}), re-enqueuing for different peer in {backoff:.2f}s "
+                        f"(tries={item.tries}/{max_tries}) "
+                        f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+                    )
+                else:
+                    logger.warning(
+                        f"Peer unreachable for backward activation {item.msg.activation_id} "
+                        f"({send_exc}), re-enqueuing same target in {backoff:.2f}s "
+                        f"(tries={item.tries}/{max_tries}) "
+                        f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+                    )
+                await asyncio.sleep(backoff)
+                self._outbound.put_nowait(item)
+                return
+            logger.error(
+                f"Failed to send {item.msg.direction} activation {item.msg.activation_id} "
+                f"({send_exc}), dropping (tries exhausted) "
+                f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
+            )
+            # remove activation if send failed
+            try:
+                await self.miner.cache.remove(item.msg.activation_id)
+            except Exception as exc:
+                logger.debug(f"Cache remove after send failure (non-fatal): {exc}")
+
+        # Terminal failure: record the final attempt's timings + accumulated errors
+        # and notify the orchestrator so the funnel reflects what actually happened.
+        attempt_timings.errors = list(item.p2p_errors)
+        attempt_timings.attempt_count = item.tries
+        attempt_timings.retry_count = max(0, item.tries - 1)
+        await self._record_and_notify(item, attempt_timings)
+
+    async def _record_and_notify(self, item: _OutboundItem, timings: P2POperationTimings) -> None:
+        """Persist P2P timings to stats and fire the deferred orchestrator notification."""
+        if self._stats_tracker is not None:
+            self._stats_tracker.record_p2p_operation(item.msg.activation_id, timings, direction=item.msg.direction)
+        activation_stats = None
+        if self._stats_tracker is not None:
+            activation_stats = self._stats_tracker.get_activation_stats_payload(item.msg.activation_id)
+        await self._notify_orchestrator(
+            activation_id=item.msg.activation_id,
+            activation_path=item.activation_path,
+            direction=item.msg.direction,  # type: ignore[arg-type]
+            activation_stats=activation_stats,
+            attestation_payload=item.attestation_payload,
+            input_hash=item.input_hash,
+            output_hash=item.output_hash,
+        )
 
     async def _notify_orchestrator(
         self,
@@ -495,7 +654,7 @@ class ActivationPublisher:
         activation_path: str | None,
         direction: Literal["forward", "backward"],
         activation_stats: dict | None,
-        attestation_payload: MinerAttestationPayload | None,
+        attestation_payload: MinerAttestationPayload | MountedAttestationPayload | None,
         input_hash: str | None,
         output_hash: str,
     ) -> None:

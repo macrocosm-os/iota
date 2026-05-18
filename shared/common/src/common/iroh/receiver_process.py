@@ -59,6 +59,7 @@ def _receiver_worker(
     p2p_auth_timeout_ms: int = 30000,
     peer_status_dict: DictProxy | None = None,
     push_queue: "multiprocessing.Queue | None" = None,
+    valid_hotkeys_dict: DictProxy | None = None,
 ) -> None:
     """Entry point for the receiver subprocess.
 
@@ -79,6 +80,7 @@ def _receiver_worker(
                 p2p_auth_timeout_ms,
                 peer_status_dict,
                 push_queue,
+                valid_hotkeys_dict,
             )
         )
     except KeyboardInterrupt:
@@ -99,6 +101,7 @@ async def _run_receiver(
     p2p_auth_timeout_ms: int = 30000,
     peer_status_dict: DictProxy | None = None,
     push_queue: "multiprocessing.Queue | None" = None,
+    valid_hotkeys_dict: DictProxy | None = None,
 ) -> None:
     """Async core of the receiver subprocess."""
     from common.iroh.receiver import Receiver
@@ -110,31 +113,57 @@ async def _run_receiver(
     router = P2PRouter()
 
     @router.handler("/activation/push")
-    def handle_activation_push(msg: ActivationPushMessage, node_id: str) -> bytes:
+    def handle_activation_push(msg: ActivationPushMessage, node_id: str) -> tuple[bytes, Callable[[], None]]:
         """Forward incoming push activation to the parent process via queue.
 
-        Returns a single-byte ack (SUCCESS or ERROR) so the sender knows
-        whether the activation was enqueued.
+        Returns ``(ack_bytes, post_ack_action)``: the protocol layer writes the
+        ACK and only then runs the enqueue. If the ACK write fails, the sender
+        will retry to a different peer — committing this peer to processing
+        before that point would cause both peers to process the same activation
+        and produce duplicate ``miner_submissions`` rows.
         """
         from common.iroh.activation_push import encode_push_ack
 
-        if push_queue is not None:
-            try:
-                push_queue.put_nowait(msg)
-                logger.debug(f"Received /activation/push {msg.activation_id} from {node_id[:16]}...")
-                return encode_push_ack(P2PResponseStatus.SUCCESS)
-            except Exception as exc:
-                logger.warning(f"Failed to enqueue activation push {msg.activation_id}: {exc}")
-                return encode_push_ack(P2PResponseStatus.ERROR)
-        else:
+        if push_queue is None:
             logger.warning(f"Received /activation/push but no push_queue configured (from {node_id[:16]}...)")
             return encode_push_ack(P2PResponseStatus.ERROR)
 
+        tb = len(msg.tensor_bytes)
+        logger.info(
+            f"Activation push RECV | receiver subprocess | handoff to parent queue | "
+            f"id={msg.activation_id} dir={msg.direction} from_peer={node_id[:16]}… "
+            f"tensor_bytes={tb} src_layer={msg.source_layer} tgt_layer={msg.target_layer}"
+        )
+
+        def _enqueue_after_ack() -> None:
+            try:
+                push_queue.put_nowait(msg)
+                logger.info(
+                    f"Activation push RECV | receiver subprocess | enqueued OK | id={msg.activation_id} "
+                    f"dir={msg.direction}"
+                )
+                logger.debug(f"Received /activation/push {msg.activation_id} from {node_id[:16]}...")
+            except Exception as exc:
+                logger.warning(f"Failed to enqueue activation push {msg.activation_id} after ack: {exc}")
+
+        return encode_push_ack(P2PResponseStatus.SUCCESS), _enqueue_after_ack
+
     @router.handler("/peer/status")
     def handle_peer_status(msg: PeerStatusBroadcast, node_id: str) -> None:
-        """Store incoming peer status broadcast in the shared dict."""
+        """Store incoming peer status broadcast in the shared dict.
+
+        Drops messages from hotkeys not present in *valid_hotkeys_dict* (when
+        configured) so peers from other runs cannot accumulate entries.
+        """
+        if not msg.source_hotkey:
+            return
+        if valid_hotkeys_dict is not None and msg.source_hotkey not in valid_hotkeys_dict:
+            logger.debug(
+                f"Dropping /peer/status from out-of-run hotkey {msg.source_hotkey[:8]}... " f"(node={node_id[:16]}...)"
+            )
+            return
         logger.debug(f"Received /peer/status from {msg.source_hotkey[:8]}... (node={node_id[:16]}...)")
-        if peer_status_dict is not None and msg.source_hotkey:
+        if peer_status_dict is not None:
             peer_status_dict[msg.source_hotkey] = (msg.model_dump(), time.time())
 
     @router.default
@@ -194,6 +223,52 @@ async def _run_receiver(
 
     await receiver.start(router=router, on_unhealthy=on_unhealthy)
     status_queue.put(("started", receiver.node_id))
+    status_queue.put(
+        (
+            "node_addr",
+            {
+                "relay_url": receiver.relay_url,
+                "direct_addresses": list(receiver.direct_addresses),
+            },
+        )
+    )
+
+    async def _refresh_node_addr() -> None:
+        # Initial relay_url is often None until the relay handshake completes
+        # a few seconds after start; re-publish once it's known so peers
+        # can dial through the relay without consulting n0 DNS.
+        last: tuple[str | None, tuple[str, ...]] = (
+            receiver.relay_url,
+            tuple(receiver.direct_addresses),
+        )
+        for _ in range(20):
+            await asyncio.sleep(1.0)
+            if receiver.node is None:
+                return
+            try:
+                addr = await receiver.node.net().node_addr()
+                relay_url = addr.relay_url()
+                direct = tuple(addr.direct_addresses() or [])
+            except Exception:
+                continue
+            current = (relay_url, direct)
+            if current != last and (relay_url is not None or direct):
+                receiver.relay_url = relay_url
+                receiver.direct_addresses = list(direct)
+                try:
+                    status_queue.put(
+                        (
+                            "node_addr",
+                            {"relay_url": relay_url, "direct_addresses": list(direct)},
+                        )
+                    )
+                except Exception:
+                    pass
+                last = current
+                if relay_url is not None and direct:
+                    return
+
+    asyncio.create_task(_refresh_node_addr(), name="refresh-node-addr")
     await receiver.serve_forever()
 
 
@@ -226,6 +301,7 @@ class ReceiverProcess(IrohSubprocess):
         external_metadata_dict: DictProxy | None = None,
         external_peer_status_dict: DictProxy | None = None,
         push_queue: "multiprocessing.Queue | None" = None,
+        external_valid_hotkeys_dict: DictProxy | None = None,
     ):
         super().__init__(process_name="P2PReceiver")
         self._seed = seed
@@ -241,6 +317,7 @@ class ReceiverProcess(IrohSubprocess):
         self._manager: SyncManager | None = None
         self._metadata_dict: DictProxy | None = external_metadata_dict
         self._peer_status_dict: DictProxy | None = external_peer_status_dict
+        self._valid_hotkeys_dict: DictProxy | None = external_valid_hotkeys_dict
         self._shm_blocks: dict[str, SharedMemory] = {}
         self._atexit_registered: bool = False
 
@@ -259,6 +336,7 @@ class ReceiverProcess(IrohSubprocess):
             self._p2p_auth_timeout_ms,
             self._peer_status_dict,
             self._push_queue,
+            self._valid_hotkeys_dict,
         )
 
     # ── lifecycle (overrides) ────────────────────────────────────
