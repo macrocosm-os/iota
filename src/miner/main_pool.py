@@ -8,6 +8,7 @@ if __name__ == "__main__":
 import argparse
 import asyncio
 import logging
+import os
 import warnings
 from loguru import logger
 
@@ -93,6 +94,15 @@ def main():
     )
     parser.set_defaults(auto_start=False, show_dashboard=True, use_btcli=True)
     args = parser.parse_args()
+
+    # Fall back to MINER_WALLET / MINER_HOTKEY env vars when the CLI flags
+    # aren't provided. Lets pm2 (or any orchestrator) pin a unique wallet/hotkey
+    # per instance without re-templating the launch script — required for running
+    # multiple pool miners on the same host with distinct hotkeys.
+    if not args.wallet:
+        args.wallet = os.environ.get("MINER_WALLET") or None
+    if not args.hotkey:
+        args.hotkey = os.environ.get("MINER_HOTKEY") or None
 
     kill_stale_gpu_processes()
     cleanup_stale_shared_memory()

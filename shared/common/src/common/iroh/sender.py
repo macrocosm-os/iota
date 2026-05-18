@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import OrderedDict
-from typing import Callable, TypeVar, overload
+from typing import Awaitable, Callable, TypeVar, overload
 
 from iroh import (
     Iroh,
+    NodeDiscoveryConfig,
     NodeOptions,
     iroh_ffi,
 )
@@ -17,16 +18,81 @@ from common.iroh.cleanup import _force_free_iroh_node
 from common.iroh.connection import PeerConnection
 from common.iroh.monitored_node import HealthCheckResult, MonitoredNode
 from common.iroh.protocol import PROTOCOL_ID_BI, PROTOCOL_ID_UNI
-from common.iroh.retry import P2PRetry, P2PRetryPolicy, P2PTimeouts
+from common.iroh.retry import P2PRetry, P2PRetryPolicy, P2PSendCancelledError, P2PTimeouts
 from common.iroh.timings import P2POperationTimings, TimingsPhaseField
 from common.iroh.serializer import Serializer, unwrap_envelope, wrap_envelope
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+T_Ret = TypeVar("T_Ret")
+
+_SEND_CANCELLED_MSG = "P2P send cancelled (parent timeout)"
+
+
+class PeerAddressUnknownError(Exception):
+    """Raised when a dial is attempted to a peer that has no registered address hints.
+
+    Iroh's default discovery is disabled, so the sender's per-peer address book
+    is the sole source of dialable addresses.  Callers should call
+    :meth:`PooledSender.register_peer` (or wait for the registry sync that does
+    so automatically) before attempting to send.
+    """
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _check_send_cancelled(cancel_event: asyncio.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise P2PSendCancelledError(_SEND_CANCELLED_MSG)
+
+
+async def _await_func_or_cancel(
+    aw: Awaitable[T_Ret],
+    timeout: float | None,
+    cancel_event: asyncio.Event | None,
+) -> T_Ret:
+    """Wait for *aw*, optionally capped by *timeout*, while *cancel_event* can abort early.
+
+    ``timeout is None`` means no extra cap (beyond whatever the awaitable does internally);
+    cancellation still wins when ``cancel_event`` is set.
+    """
+    if cancel_event is None:
+        return await asyncio.wait_for(aw, timeout=timeout)
+    step_task = asyncio.create_task(asyncio.wait_for(aw, timeout=timeout))
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {step_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_task in done:
+            step_task.cancel()
+            try:
+                await step_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise P2PSendCancelledError(_SEND_CANCELLED_MSG)
+        cancel_task.cancel()
+        try:
+            await cancel_task
+        except asyncio.CancelledError:
+            pass
+        return step_task.result()
+    finally:
+        if not cancel_task.done():
+            cancel_task.cancel()
+            try:
+                await cancel_task
+            except asyncio.CancelledError:
+                pass
+        if not step_task.done():
+            step_task.cancel()
+            try:
+                await step_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _timed(timings: P2POperationTimings | None, attr: TimingsPhaseField) -> float | None:
@@ -50,6 +116,20 @@ def _timed(timings: P2POperationTimings | None, attr: TimingsPhaseField) -> floa
 def _timed_end(timings: P2POperationTimings | None, attr: TimingsPhaseField, t0: float | None) -> None:
     if timings is not None and t0 is not None:
         setattr(timings, attr, _time.time() - t0)
+
+
+def _phase_ms(timings: P2POperationTimings | None, attr: TimingsPhaseField) -> str:
+    """Format ``timings.<attr>`` as ``Xms`` (or ``?ms``) for boundary log lines."""
+    val = getattr(timings, attr, None) if timings is not None else None
+    return f"{val * 1000:.0f}ms" if val is not None else "?ms"
+
+
+def _peer_label(node_id: str, hotkey: str | None) -> str:
+    """Render ``<iroh:16> hk=<hotkey:8>`` for log lines so each send line
+    shows both the iroh node identifier (used by the transport) and the
+    SS58 hotkey (the human-meaningful identity used elsewhere)."""
+    hk = (hotkey or "?")[:8] if hotkey else "?"
+    return f"{node_id[:16]}.. hk={hk}"
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +191,9 @@ class Sender:
                 if self._node is None:
                     iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
                     self._node = await asyncio.wait_for(
-                        Iroh.memory_with_options(NodeOptions(protocols={})),
+                        Iroh.memory_with_options(
+                            NodeOptions(protocols={}, node_discovery=NodeDiscoveryConfig.NONE),
+                        ),
                         timeout=self._NODE_CREATE_TIMEOUT,
                     )
                     self._monitored_node.set_node(self._node)
@@ -198,6 +280,7 @@ class Sender:
         node_id: str | list[str],
         message: bytes,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> None:
         """Send a unidirectional message (fire-and-forget) with retry.
 
@@ -205,21 +288,50 @@ class Sender:
         Timings are not tracked for multi-send.
         """
         if isinstance(node_id, list):
-            await asyncio.gather(*[self.send_message(nid, message) for nid in node_id])
+            await asyncio.gather(
+                *[
+                    self.send_message(nid, message, timings=timings, cancellation_event=cancellation_event)
+                    for nid in node_id
+                ]
+            )
             return
+
+        peer_lbl = _peer_label(node_id, getattr(self, "_peer_hotkeys", {}).get(node_id))
 
         async def _do_send() -> None:
             # Reset per-phase timings on each attempt (retries overwrite)
-            peer_conn = await self._get_connection(node_id, PROTOCOL_ID_UNI, timings)
+            _check_send_cancelled(cancellation_event)
+            peer_conn = await _await_func_or_cancel(
+                self._get_connection(node_id, PROTOCOL_ID_UNI, timings),
+                None,
+                cancellation_event,
+            )
+            logger.debug(f"[sender] uni {peer_lbl} conn ready ({_phase_ms(timings, 'connection_duration')})")
 
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "stream_open_duration")
-            send_stream = await peer_conn.open_uni(timeout=self._timeouts.stream_open)
+            send_stream = await _await_func_or_cancel(
+                peer_conn.open_uni(timeout=self._timeouts.stream_open),
+                None,
+                cancellation_event,
+            )
             _timed_end(timings, "stream_open_duration", t0)
+            logger.debug(f"[sender] uni {peer_lbl} stream_open done ({_phase_ms(timings, 'stream_open_duration')})")
 
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "send_duration")
-            await asyncio.wait_for(send_stream.write_all(message), timeout=self._timeouts.send)
-            await asyncio.wait_for(send_stream.finish(), timeout=self._timeouts.send)
+            await _await_func_or_cancel(
+                send_stream.write_all(message),
+                self._timeouts.send,
+                cancellation_event,
+            )
+            await _await_func_or_cancel(
+                send_stream.finish(),
+                self._timeouts.send,
+                cancellation_event,
+            )
             _timed_end(timings, "send_duration", t0)
+            logger.debug(f"[sender] uni {peer_lbl} send done ({_phase_ms(timings, 'send_duration')}, {len(message)}B)")
 
             if timings is not None:
                 timings.bytes_sent = len(message)
@@ -273,6 +385,7 @@ class Sender:
         max_message_size: int,
         callback: Callable[[bytes], bytes] | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> bytes:
         ...
 
@@ -284,6 +397,7 @@ class Sender:
         max_message_size: int,
         callback: Callable[[bytes], bytes] | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> list[bytes]:
         ...
 
@@ -294,45 +408,90 @@ class Sender:
         max_message_size: int,
         callback: Callable[[bytes], bytes] | None = None,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> bytes | list[bytes]:
         """Send a message and wait for response (bidirectional) with retry.
 
         Pass a list of node IDs to fan out to multiple peers concurrently,
         returning a list of responses in the same order. Timings are not
         tracked for multi-send.
+
+        ``cancellation_event`` is set by :class:`SenderProxy` when the parent
+        wait times out so the subprocess can abort between QUIC phases.
         """
         if isinstance(node_id, list):
             return list(
                 await asyncio.gather(
-                    *[self.send_message_bi(nid, message, max_message_size, callback) for nid in node_id]
+                    *[
+                        self.send_message_bi(
+                            nid,
+                            message,
+                            max_message_size,
+                            callback,
+                            timings=timings,
+                            cancellation_event=cancellation_event,
+                        )
+                        for nid in node_id
+                    ]
                 )
             )
 
+        peer_lbl = _peer_label(node_id, getattr(self, "_peer_hotkeys", {}).get(node_id))
+
         async def _do_send_bi() -> bytes:
-            peer_conn = await self._get_connection(node_id, PROTOCOL_ID_BI, timings)
+            _check_send_cancelled(cancellation_event)
+            peer_conn = await _await_func_or_cancel(
+                self._get_connection(node_id, PROTOCOL_ID_BI, timings),
+                None,
+                cancellation_event,
+            )
+            logger.debug(f"[sender] bi {peer_lbl} conn ready ({_phase_ms(timings, 'connection_duration')})")
 
             # ── stream open ──────────────────────────────────────
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "stream_open_duration")
-            stream = await peer_conn.open_bi(timeout=self._timeouts.stream_open)
+            stream = await _await_func_or_cancel(
+                peer_conn.open_bi(timeout=self._timeouts.stream_open),
+                None,
+                cancellation_event,
+            )
             _timed_end(timings, "stream_open_duration", t0)
+            logger.debug(f"[sender] bi {peer_lbl} stream_open done ({_phase_ms(timings, 'stream_open_duration')})")
 
             # ── send phase ───────────────────────────────────────
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "send_duration")
-            await asyncio.wait_for(stream.send().write_all(message), timeout=self._timeouts.send)
-            await asyncio.wait_for(stream.send().finish(), timeout=self._timeouts.send)
-            await asyncio.wait_for(stream.send().stopped(), timeout=self._timeouts.send)
+            await _await_func_or_cancel(
+                stream.send().write_all(message),
+                self._timeouts.send,
+                cancellation_event,
+            )
+            await _await_func_or_cancel(
+                stream.send().finish(),
+                self._timeouts.send,
+                cancellation_event,
+            )
+            await _await_func_or_cancel(
+                stream.send().stopped(),
+                self._timeouts.send,
+                cancellation_event,
+            )
             _timed_end(timings, "send_duration", t0)
+            logger.debug(f"[sender] bi {peer_lbl} send done ({_phase_ms(timings, 'send_duration')}, {len(message)}B)")
 
             if timings is not None:
                 timings.bytes_sent = len(message)
 
             # ── receive phase ────────────────────────────────────
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "receive_duration")
-            out = await asyncio.wait_for(
+            out = await _await_func_or_cancel(
                 stream.recv().read_to_end(max_message_size),
-                timeout=self._timeouts.receive,
+                self._timeouts.receive,
+                cancellation_event,
             )
             _timed_end(timings, "receive_duration", t0)
+            logger.debug(f"[sender] bi {peer_lbl} recv done ({_phase_ms(timings, 'receive_duration')}, {len(out)}B)")
 
             if timings is not None:
                 timings.bytes_received = len(out)
@@ -363,6 +522,7 @@ class Sender:
         serializer: Serializer,
         response_model_cls: type[ModelT],
         max_message_size: int,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> ModelT:
         ...
 
@@ -374,6 +534,7 @@ class Sender:
         serializer: Serializer,
         response_model_cls: type[ModelT],
         max_message_size: int,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> list[ModelT]:
         ...
 
@@ -384,6 +545,7 @@ class Sender:
         serializer: Serializer,
         response_model_cls: type[ModelT],
         max_message_size: int,
+        cancellation_event: asyncio.Event | None = None,
     ) -> ModelT | list[ModelT]:
         """Send a pydantic model and receive a pydantic model response (bidirectional).
 
@@ -392,9 +554,13 @@ class Sender:
         """
         wire_bytes = wrap_envelope(model, serializer)
         if isinstance(node_id, list):
-            responses = await self.send_message_bi(node_id, wire_bytes, max_message_size)
+            responses = await self.send_message_bi(
+                node_id, wire_bytes, max_message_size, cancellation_event=cancellation_event
+            )
             return [unwrap_envelope(r, response_model_cls) for r in responses]
-        response_bytes = await self.send_message_bi(node_id, wire_bytes, max_message_size)
+        response_bytes = await self.send_message_bi(
+            node_id, wire_bytes, max_message_size, cancellation_event=cancellation_event
+        )
         return unwrap_envelope(response_bytes, response_model_cls)
 
     @overload
@@ -407,6 +573,7 @@ class Sender:
         max_message_size: int,
         serializer: Serializer | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> ModelT:
         ...
 
@@ -420,6 +587,7 @@ class Sender:
         max_message_size: int,
         serializer: Serializer | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> list[ModelT]:
         ...
 
@@ -432,6 +600,7 @@ class Sender:
         max_message_size: int,
         serializer: Serializer | None = None,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> ModelT | list[ModelT]:
         """Send a typed BI request with routed envelope, receive a typed response.
 
@@ -443,7 +612,13 @@ class Sender:
 
         payload = wrap_routed_envelope(route, model, serializer)
         if isinstance(node_id, list):
-            responses = await self.send_message_bi(node_id, payload, max_message_size)
+            responses = await self.send_message_bi(
+                node_id,
+                payload,
+                max_message_size,
+                timings=timings,
+                cancellation_event=cancellation_event,
+            )
             return [
                 ser.deserialize(body, response_model_cls)
                 for _, body, ser in (unwrap_routed_envelope(r) for r in responses)
@@ -453,6 +628,7 @@ class Sender:
             payload,
             max_message_size,
             timings=timings,
+            cancellation_event=cancellation_event,
         )
         _, body, ser = unwrap_routed_envelope(response_bytes)
         return ser.deserialize(body, response_model_cls)
@@ -489,7 +665,7 @@ class PooledSender:
 
     def __init__(
         self,
-        max_connections: int = 5,
+        max_connections: int = 32,
         retry_policy: P2PRetryPolicy | None = None,
         timeouts: P2PTimeouts | None = None,
         health_check_interval: float = 30.0,
@@ -499,7 +675,19 @@ class PooledSender:
         self._node_lock = asyncio.Lock()
         # cache_key -> PeerConnection
         self._connections: OrderedDict[str, PeerConnection] = OrderedDict()
+        # Protects _connections dict mutation only — NOT held across connect().
         self._conn_lock = asyncio.Lock()
+        # Per-peer (cache_key) lock so concurrent dials to the same peer don't
+        # waste handshakes. Only one connect to a given peer at a time; dials
+        # to *different* peers run fully in parallel.
+        self._peer_connect_locks: dict[str, asyncio.Lock] = {}
+        # node_id -> (relay_url, direct_addresses) — populated via register_peer
+        # so dials skip n0 DNS discovery.
+        self._peer_addrs: dict[str, tuple[str | None, list[str]]] = {}
+        # iroh node_id -> SS58 hotkey, populated via register_peer.  Purely
+        # for log labelling so ``[sender]`` lines pair the iroh hex with the
+        # human-meaningful hotkey of the target.
+        self._peer_hotkeys: dict[str, str] = {}
 
         self._timeouts = timeouts or P2PTimeouts()
         self._retry_policy = retry_policy or P2PRetryPolicy()
@@ -521,6 +709,37 @@ class PooledSender:
     def retry_policy(self) -> P2PRetryPolicy:
         return self._retry_policy
 
+    # ── peer address book ────────────────────────────────────────────
+
+    def register_peer(
+        self,
+        node_id: str,
+        relay_url: str | None,
+        direct_addresses: list[str],
+        hotkey: str | None = None,
+    ) -> None:
+        """Cache a peer's relay + direct addresses so the next dial skips discovery.
+
+        New entries take effect on the next connect; existing cached connections
+        to *node_id* are invalidated so a stale (discovery-found) connection is
+        not reused.
+
+        ``hotkey`` (the peer's SS58) is recorded purely for log labelling.
+        """
+        if hotkey:
+            self._peer_hotkeys[node_id] = hotkey
+        prev = self._peer_addrs.get(node_id)
+        new = (relay_url, list(direct_addresses or []))
+        if prev == new:
+            return
+        self._peer_addrs[node_id] = new
+        # Drop any cached PeerConnection so the next connect uses the new hints
+        for proto in (PROTOCOL_ID_UNI, PROTOCOL_ID_BI):
+            cache_key = node_id + proto.decode()
+            existing = self._connections.pop(cache_key, None)
+            if existing is not None:
+                existing.close()
+
     # ── node management ──────────────────────────────────────────────
 
     _NODE_CREATE_TIMEOUT: float = 10.0
@@ -532,7 +751,9 @@ class PooledSender:
                 if self._node is None:
                     iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
                     self._node = await asyncio.wait_for(
-                        Iroh.memory_with_options(NodeOptions(protocols={})),
+                        Iroh.memory_with_options(
+                            NodeOptions(protocols={}, node_discovery=NodeDiscoveryConfig.NONE),
+                        ),
                         timeout=self._NODE_CREATE_TIMEOUT,
                     )
                     self._monitored_node.set_node(self._node)
@@ -563,36 +784,78 @@ class PooledSender:
     async def _get_connection(
         self, node_id: str, protocol_id: bytes, timings: P2POperationTimings | None = None
     ) -> PeerConnection:
-        """Get or create a PeerConnection to the given node."""
+        """Get or create a PeerConnection to the given node.
+
+        ``_conn_lock`` is held only across cache reads/writes and LRU
+        eviction — never across ``peer_conn.connect()``. A per-peer
+        ``_peer_connect_locks`` entry serializes concurrent dials to the
+        same peer so we don't waste handshakes; dials to *different*
+        peers run fully in parallel.
+        """
         cache_key = node_id + protocol_id.decode()
+
+        # ── fast path: cache hit under tight global lock ─────────────
         async with self._conn_lock:
-            # Check if we have an existing live connection
-            if cache_key in self._connections:
-                peer_conn = self._connections[cache_key]
-                if peer_conn.is_alive():
+            existing = self._connections.get(cache_key)
+            if existing is not None:
+                if existing.is_alive():
                     self._connections.move_to_end(cache_key)
-                    return peer_conn
-                # Connection closed, clean up
-                logger.debug(f"Removing stale connection: {peer_conn}")
-                peer_conn.close()
+                    return existing
+                logger.debug(f"Removing stale connection: {existing}")
+                existing.close()
                 del self._connections[cache_key]
 
-            # Evict oldest if at capacity
-            if len(self._connections) >= self.max_connections:
-                evicted_key, evicted_conn = self._connections.popitem(last=False)
-                evicted_conn.close()
-                logger.debug(f"Evicting connection to {evicted_key[:16]}... (LRU)")
+        # ── slow path: serialize per-peer dials ──────────────────────
+        peer_lock = self._peer_connect_locks.get(cache_key)
+        if peer_lock is None:
+            peer_lock = self._peer_connect_locks.setdefault(cache_key, asyncio.Lock())
 
-            # Create new PeerConnection using shared node
+        async with peer_lock:
+            # Re-check under peer lock — another task may have dialed while we waited.
+            async with self._conn_lock:
+                existing = self._connections.get(cache_key)
+                if existing is not None and existing.is_alive():
+                    self._connections.move_to_end(cache_key)
+                    return existing
+
+            # Iroh's default discovery is disabled, so we MUST have at least
+            # one address hint (relay URL or a direct sockaddr) for this peer
+            # — otherwise iroh will fail with the cryptic "No addressing
+            # information for NodeId(...)" error from inside the Rust runtime.
+            # Surface a clear error here instead so callers can attribute it.
+            relay_url, direct_addresses = self._peer_addrs.get(node_id, (None, []))
+            if relay_url is None and not direct_addresses:
+                raise PeerAddressUnknownError(
+                    f"No address hints registered for peer {node_id[:16]}... — "
+                    f"call PooledSender.register_peer() before dialing "
+                    f"(iroh discovery is disabled, so the address book is the only source)."
+                )
             node = await self._get_node()
             endpoint = node.node().endpoint()
-            peer_conn = PeerConnection(node_id, protocol_id, endpoint)
+            peer_conn = PeerConnection(
+                node_id,
+                protocol_id,
+                endpoint,
+                relay_url=relay_url,
+                direct_addresses=direct_addresses,
+            )
             t0 = _timed(timings, "connection_duration")
             await peer_conn.connect(timeout=self._timeouts.connection)
             _timed_end(timings, "connection_duration", t0)
 
-            self._connections[cache_key] = peer_conn
-            logger.debug(f"Created new connection to {node_id[:16]}...")
+            # Insert under tight global lock + apply LRU eviction.
+            async with self._conn_lock:
+                if len(self._connections) >= self.max_connections:
+                    evicted_key, evicted_conn = self._connections.popitem(last=False)
+                    evicted_conn.close()
+                    logger.debug(f"Evicting connection to {evicted_key[:16]}... (LRU)")
+                self._connections[cache_key] = peer_conn
+
+            logger.debug(
+                f"Created new connection to {node_id[:16]}... "
+                f"(hints: relay={'yes' if relay_url else 'no'}, "
+                f"direct={len(direct_addresses)})"
+            )
             return peer_conn
 
     async def invalidate_connection(self, node_id: str, protocol_id: bytes | None = None) -> None:
@@ -613,6 +876,7 @@ class PooledSender:
         node_id: str | list[str],
         message: bytes,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> None:
         """Send a unidirectional message (fire-and-forget) with retry.
 
@@ -620,20 +884,49 @@ class PooledSender:
         Timings are not tracked for multi-send.
         """
         if isinstance(node_id, list):
-            await asyncio.gather(*[self.send_message(nid, message) for nid in node_id])
+            await asyncio.gather(
+                *[
+                    self.send_message(nid, message, timings=timings, cancellation_event=cancellation_event)
+                    for nid in node_id
+                ]
+            )
             return
 
+        peer_lbl = _peer_label(node_id, getattr(self, "_peer_hotkeys", {}).get(node_id))
+
         async def _do_send() -> None:
-            peer_conn = await self._get_connection(node_id, PROTOCOL_ID_UNI, timings)
+            _check_send_cancelled(cancellation_event)
+            peer_conn = await _await_func_or_cancel(
+                self._get_connection(node_id, PROTOCOL_ID_UNI, timings),
+                None,
+                cancellation_event,
+            )
+            logger.debug(f"[sender] uni {peer_lbl} conn ready ({_phase_ms(timings, 'connection_duration')})")
 
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "stream_open_duration")
-            send_stream = await peer_conn.open_uni(timeout=self._timeouts.stream_open)
+            send_stream = await _await_func_or_cancel(
+                peer_conn.open_uni(timeout=self._timeouts.stream_open),
+                None,
+                cancellation_event,
+            )
             _timed_end(timings, "stream_open_duration", t0)
+            logger.debug(f"[sender] uni {peer_lbl} stream_open done ({_phase_ms(timings, 'stream_open_duration')})")
 
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "send_duration")
-            await asyncio.wait_for(send_stream.write_all(message), timeout=self._timeouts.send)
-            await asyncio.wait_for(send_stream.finish(), timeout=self._timeouts.send)
+            await _await_func_or_cancel(
+                send_stream.write_all(message),
+                self._timeouts.send,
+                cancellation_event,
+            )
+            await _await_func_or_cancel(
+                send_stream.finish(),
+                self._timeouts.send,
+                cancellation_event,
+            )
             _timed_end(timings, "send_duration", t0)
+            logger.debug(f"[sender] uni {peer_lbl} send done ({_phase_ms(timings, 'send_duration')}, {len(message)}B)")
 
             if timings is not None:
                 timings.bytes_sent = len(message)
@@ -687,6 +980,7 @@ class PooledSender:
         max_message_size: int,
         callback: Callable[[bytes], bytes] | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> bytes:
         ...
 
@@ -698,6 +992,7 @@ class PooledSender:
         max_message_size: int,
         callback: Callable[[bytes], bytes] | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> list[bytes]:
         ...
 
@@ -708,45 +1003,90 @@ class PooledSender:
         max_message_size: int,
         callback: Callable[[bytes], bytes] | None = None,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> bytes | list[bytes]:
         """Send a message and wait for response (bidirectional) with retry.
 
         Pass a list of node IDs to fan out to multiple peers concurrently,
         returning a list of responses in the same order. Timings are not
         tracked for multi-send.
+
+        ``cancellation_event`` is set by :class:`SenderProxy` when the parent
+        wait times out so the subprocess can abort between QUIC phases.
         """
         if isinstance(node_id, list):
             return list(
                 await asyncio.gather(
-                    *[self.send_message_bi(nid, message, max_message_size, callback) for nid in node_id]
+                    *[
+                        self.send_message_bi(
+                            nid,
+                            message,
+                            max_message_size,
+                            callback,
+                            timings=timings,
+                            cancellation_event=cancellation_event,
+                        )
+                        for nid in node_id
+                    ]
                 )
             )
 
+        peer_lbl = _peer_label(node_id, getattr(self, "_peer_hotkeys", {}).get(node_id))
+
         async def _do_send_bi() -> bytes:
-            peer_conn = await self._get_connection(node_id, PROTOCOL_ID_BI, timings)
+            _check_send_cancelled(cancellation_event)
+            peer_conn = await _await_func_or_cancel(
+                self._get_connection(node_id, PROTOCOL_ID_BI, timings),
+                None,
+                cancellation_event,
+            )
+            logger.debug(f"[sender] bi {peer_lbl} conn ready ({_phase_ms(timings, 'connection_duration')})")
 
             # ── stream open ──────────────────────────────────────
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "stream_open_duration")
-            stream = await peer_conn.open_bi(timeout=self._timeouts.stream_open)
+            stream = await _await_func_or_cancel(
+                peer_conn.open_bi(timeout=self._timeouts.stream_open),
+                None,
+                cancellation_event,
+            )
             _timed_end(timings, "stream_open_duration", t0)
+            logger.debug(f"[sender] bi {peer_lbl} stream_open done ({_phase_ms(timings, 'stream_open_duration')})")
 
             # ── send phase ───────────────────────────────────────
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "send_duration")
-            await asyncio.wait_for(stream.send().write_all(message), timeout=self._timeouts.send)
-            await asyncio.wait_for(stream.send().finish(), timeout=self._timeouts.send)
-            await asyncio.wait_for(stream.send().stopped(), timeout=self._timeouts.send)
+            await _await_func_or_cancel(
+                stream.send().write_all(message),
+                self._timeouts.send,
+                cancellation_event,
+            )
+            await _await_func_or_cancel(
+                stream.send().finish(),
+                self._timeouts.send,
+                cancellation_event,
+            )
+            await _await_func_or_cancel(
+                stream.send().stopped(),
+                self._timeouts.send,
+                cancellation_event,
+            )
             _timed_end(timings, "send_duration", t0)
+            logger.debug(f"[sender] bi {peer_lbl} send done ({_phase_ms(timings, 'send_duration')}, {len(message)}B)")
 
             if timings is not None:
                 timings.bytes_sent = len(message)
 
             # ── receive phase ────────────────────────────────────
+            _check_send_cancelled(cancellation_event)
             t0 = _timed(timings, "receive_duration")
-            out = await asyncio.wait_for(
+            out = await _await_func_or_cancel(
                 stream.recv().read_to_end(max_message_size),
-                timeout=self._timeouts.receive,
+                self._timeouts.receive,
+                cancellation_event,
             )
             _timed_end(timings, "receive_duration", t0)
+            logger.debug(f"[sender] bi {peer_lbl} recv done ({_phase_ms(timings, 'receive_duration')}, {len(out)}B)")
 
             if timings is not None:
                 timings.bytes_received = len(out)
@@ -777,6 +1117,7 @@ class PooledSender:
         serializer: Serializer,
         response_model_cls: type[ModelT],
         max_message_size: int,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> ModelT:
         ...
 
@@ -788,6 +1129,7 @@ class PooledSender:
         serializer: Serializer,
         response_model_cls: type[ModelT],
         max_message_size: int,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> list[ModelT]:
         ...
 
@@ -798,6 +1140,7 @@ class PooledSender:
         serializer: Serializer,
         response_model_cls: type[ModelT],
         max_message_size: int,
+        cancellation_event: asyncio.Event | None = None,
     ) -> ModelT | list[ModelT]:
         """Send a pydantic model and receive a pydantic model response (bidirectional).
 
@@ -806,9 +1149,13 @@ class PooledSender:
         """
         wire_bytes = wrap_envelope(model, serializer)
         if isinstance(node_id, list):
-            responses = await self.send_message_bi(node_id, wire_bytes, max_message_size)
+            responses = await self.send_message_bi(
+                node_id, wire_bytes, max_message_size, cancellation_event=cancellation_event
+            )
             return [unwrap_envelope(r, response_model_cls) for r in responses]
-        response_bytes = await self.send_message_bi(node_id, wire_bytes, max_message_size)
+        response_bytes = await self.send_message_bi(
+            node_id, wire_bytes, max_message_size, cancellation_event=cancellation_event
+        )
         return unwrap_envelope(response_bytes, response_model_cls)
 
     @overload
@@ -821,6 +1168,7 @@ class PooledSender:
         max_message_size: int,
         serializer: Serializer | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> ModelT:
         ...
 
@@ -834,6 +1182,7 @@ class PooledSender:
         max_message_size: int,
         serializer: Serializer | None = ...,
         timings: P2POperationTimings | None = ...,
+        cancellation_event: asyncio.Event | None = ...,
     ) -> list[ModelT]:
         ...
 
@@ -846,6 +1195,7 @@ class PooledSender:
         max_message_size: int,
         serializer: Serializer | None = None,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> ModelT | list[ModelT]:
         """Send a typed BI request with routed envelope, receive a typed response.
 
@@ -857,7 +1207,13 @@ class PooledSender:
 
         payload = wrap_routed_envelope(route, model, serializer)
         if isinstance(node_id, list):
-            responses = await self.send_message_bi(node_id, payload, max_message_size)
+            responses = await self.send_message_bi(
+                node_id,
+                payload,
+                max_message_size,
+                timings=timings,
+                cancellation_event=cancellation_event,
+            )
             return [
                 ser.deserialize(body, response_model_cls)
                 for _, body, ser in (unwrap_routed_envelope(r) for r in responses)
@@ -867,6 +1223,7 @@ class PooledSender:
             payload,
             max_message_size,
             timings=timings,
+            cancellation_event=cancellation_event,
         )
         _, body, ser = unwrap_routed_envelope(response_bytes)
         return ser.deserialize(body, response_model_cls)
@@ -879,6 +1236,7 @@ class PooledSender:
         max_message_size: int,
         serializer: Serializer | None = None,
         timings: P2POperationTimings | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> bytes:
         """Send a typed BI request with routed envelope, return raw response bytes.
 
@@ -889,7 +1247,13 @@ class PooledSender:
         from common.iroh.router import wrap_routed_envelope
 
         payload = wrap_routed_envelope(route, model, serializer)
-        return await self.send_message_bi(node_id, payload, max_message_size, timings=timings)
+        return await self.send_message_bi(
+            node_id,
+            payload,
+            max_message_size,
+            timings=timings,
+            cancellation_event=cancellation_event,
+        )
 
     # ── lifecycle ────────────────────────────────────────────────────
 

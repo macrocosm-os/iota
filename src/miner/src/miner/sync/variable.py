@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable, Generic, TypeVar
 from common import settings as common_settings
 from common.models.run_flags import RUN_FLAGS
+from miner import settings as miner_settings
 import httpx
 import msgpack
 from loguru import logger
@@ -110,9 +111,9 @@ def _write_spec_for_sv(sv: "SyncedVariable", *, expected_version: int) -> tuple[
 class PollingLoop:
     """Single background loop driving all SyncedVariable instances."""
 
-    def __init__(self, server_url: str, tick: float = 0.2) -> None:
+    def __init__(self, server_url: str, tick: float = 2.0) -> None:
         self._server_url = server_url
-        self._client = httpx.AsyncClient(base_url=self._server_url)
+        self._client = httpx.AsyncClient(base_url=self._server_url, timeout=30)
         self._svs: list[SyncedVariable] = []
         self._task: asyncio.Task | None = None
         # id(sv) → last server version seen (0 = never polled)
@@ -132,15 +133,44 @@ class PollingLoop:
         logger.info(f"Registering SyncedVariable: {sv._name}")
         if sv not in self._svs:
             self._svs.append(sv)
-        if self._task is None or self._task.done():
-            logger.info(f"Creating new PollingLoop task for variable: {sv._name}")
-            self._task = asyncio.get_event_loop().create_task(self._run())
-            logger.info(f"PollingLoop task created for variable: {sv._name}")
+        self.start()
 
     def unregister(self, sv: SyncedVariable) -> None:
         self._svs = [s for s in self._svs if s is not sv]
         self._versions.pop(id(sv), None)
         self._push_locks.pop(id(sv), None)
+
+    def unregister_all(self) -> None:
+        """Drop every registered SyncedVariable and all associated loop state.
+
+        The background task keeps running (use :meth:`stop` to cancel it), but
+        has nothing to push or pull until callers re-register variables via
+        :meth:`register`.
+        """
+        self._svs.clear()
+        self._versions.clear()
+        self._push_locks.clear()
+
+    def start(self) -> None:
+        """Ensure the background polling task is running. Safe to call repeatedly."""
+        if self._task is None or self._task.done():
+            logger.info("PollingLoop starting")
+            self._task = asyncio.get_event_loop().create_task(self._run())
+
+    async def stop(self) -> None:
+        """Cancel the background polling task and wait for it to exit. Safe if not running."""
+        task = self._task
+        self._task = None
+        if task is None or task.done():
+            return
+        logger.info("PollingLoop stopping")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("PollingLoop task raised during stop")
 
     async def _run(self) -> None:
         logger.info("PollingLoop started")
@@ -322,13 +352,14 @@ class PollingLoop:
                 commit_fns[sv._name] = (sv, commit_fn)
 
             try:
-                logger.debug(f"PollingLoop batch push: {vars_payload}")
+                # logger.debug(f"PollingLoop batch push: {vars_payload}")
                 resp = await self._client.post(
                     "/batch-write",
                     content=msgpack.packb({"vars": vars_payload}),
                     headers={"Content-Type": "application/msgpack"},
                 )
                 if resp.status_code != 200:
+                    logger.error(f"PollingLoop batch push failed: HTTP {resp.status_code}")
                     return
                 results = msgpack.unpackb(resp.content, raw=False).get("results", {})
             except Exception as exc:
@@ -373,6 +404,7 @@ class PollingLoop:
                 headers={"Content-Type": "application/msgpack"},
             )
             if resp.status_code != 200:
+                logger.error(f"PollingLoop batch fetch failed: HTTP {resp.status_code}")
                 return
             data = msgpack.unpackb(resp.content, raw=False)
         except Exception as exc:
@@ -421,7 +453,9 @@ class SyncedVariable(Generic[T]):
     # Shared polling loop for all instances that don't specify their own.
     # Must be set (e.g. SyncedVariable.polling_loop = PollingLoop(server_url))
     # before creating SyncedVariable instances without an explicit polling_loop.
-    polling_loop: PollingLoop | None = PollingLoop(server_url=common_settings.BRIDGE_URL)
+    polling_loop: PollingLoop | None = PollingLoop(
+        server_url=common_settings.BRIDGE_URL, tick=miner_settings.SYNC_POLL_TICK
+    )
 
     def __init__(
         self,
