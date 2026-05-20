@@ -65,7 +65,7 @@ ALL_LAYERS_TRAINING_CACHE_TTL_SEC = float(os.getenv("ALL_LAYERS_TRAINING_CACHE_T
 
 # Model Training Settings - not for miner's to change
 HF_TOKEN = os.getenv("HF_TOKEN")
-DATASET_NAME = "HuggingFaceFW/fineweb"
+DATASET_NAME = "HuggingFaceFW/fineweb-edu-2"
 SHUFFLE_DATASET = True
 WEIGHT_DECAY = 1e-1
 GRAD_CLIP_NORM = 1.0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import asyncio
 from collections import deque
 from typing import Optional
@@ -555,9 +556,6 @@ class ActivationQueue:
                     received_hash=received_hash,
                 )
             logger.debug(f"Hash verified for activation {activation_id}")
-
-        # Deserialize tensor from bytes
-        import io
 
         buffer = io.BytesIO(tensor_bytes)
         input_activations = torch.load(buffer, map_location="cpu", weights_only=True)
