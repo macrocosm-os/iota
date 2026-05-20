@@ -1,3 +1,4 @@
+import gzip
 import torch
 from loguru import logger
 
@@ -28,8 +29,6 @@ async def download_sample(
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        import gzip
-
         try:
             text = gzip.decompress(data).decode("utf-8")
         except Exception as e:

@@ -47,6 +47,13 @@ class DatasetMetadata(BaseModel):
     mini_batch_size: int | None = None
 
 
+class ActivationMetadata(BaseModel):
+    max_activation_cache_size: int | None = None
+    n_backwards_for_cache_increase_stop: int | None = None
+    max_forward_activations_in_queue: int | None = None
+    min_forward_activations_in_queue: int | None = None
+
+
 class ModelMetadata(BaseModel):
     model_splits: list[list[int]] | None = None
     model_size: str | None = None
@@ -59,4 +66,5 @@ class ModelMetadata(BaseModel):
     lr: LearningRateMetadata | None = None
     opt: OptimizerMetadata | None = None
     dataset: DatasetMetadata | None = None
+    activation: ActivationMetadata | None = None
     miners_per_layer: list[int] | None = None
