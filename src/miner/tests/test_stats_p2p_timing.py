@@ -1,6 +1,6 @@
 """Tests for P2P timing detail integration in the stats tracker."""
 
-from common.iroh.timings import P2POperationTimings
+from iota_sdk.p2p import P2POperationTimings
 from miner.utils.stats import ActivationTiming, ActivationTimingStage, P2PTimingDetail, StatsTracker
 
 

@@ -1,40 +1,18 @@
-"""Wire message for peer-to-peer activation push.
+"""Pydantic message: activation push between adjacent-layer miners.
 
-Miners push completed activations directly to a randomly selected peer in the
-next (or previous, for backward) layer instead of routing through the
-orchestrator's activation_state/activation_assignment tables.
+Moved here from `common.iroh.activation_push` as part of the iota-sdk
+migration — the model is iota_mvp's domain (training-layer specifics)
+and stays out of the SDK; only the SDK-generic pieces (
+`ActivationPushNackError`, `encode_push_ack`, `decode_push_ack`) live in
+`iota_sdk.p2p`.
 
-The message is serialised via msgpack inside the P2PRouter routed envelope.
+The message is serialised via msgpack inside the P2PRouter routed
+envelope — see `iota_sdk.p2p.wrap_routed_envelope`.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
-
-from common.iroh.p2p_protocol import P2PResponseStatus
-
-
-class ActivationPushNackError(Exception):
-    """Raised when receiver returns a non-SUCCESS ack for a push."""
-
-    def __init__(self, status: P2PResponseStatus, message: str = ""):
-        self.status = status
-        super().__init__(message or f"Activation push NACK: {status.name}")
-
-
-def encode_push_ack(status: P2PResponseStatus = P2PResponseStatus.SUCCESS) -> bytes:
-    """Encode a single-byte ack for an activation push."""
-    return bytes([status])
-
-
-def decode_push_ack(data: bytes) -> P2PResponseStatus:
-    """Decode a single-byte ack from an activation push response."""
-    if not data:
-        return P2PResponseStatus.ERROR
-    try:
-        return P2PResponseStatus(data[0])
-    except ValueError:
-        return P2PResponseStatus.ERROR
 
 
 class ActivationPushMessage(BaseModel):

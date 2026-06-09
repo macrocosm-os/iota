@@ -364,3 +364,30 @@ LLAMA32_CONFIG_100B = {
     "s3_upload_timeout": 600,
     "activation_timeout": 120,
 }
+
+LLAMA32_CONFIG_SIMULATED_100B = {
+    "model_name": "Llama-3.2-25B",
+    "total_global_params": 26_136_695_808,
+    "vocab_size": 128_256,
+    "context_length": 8192,
+    "orig_context_length": 8192,
+    "emb_dim": 9216,
+    "bottleneck_dim": 144,
+    "quantize_activations": False,
+    "quantize_activations_grads": False,
+    "quantize_weights": False,
+    "n_heads": 72,
+    "n_layers": 20,
+    "hidden_dim": 32256,
+    "n_kv_groups": 8,
+    "rope_base": 500_000.0,
+    "dtype": "torch.bfloat16",
+    "rope_freq": None,
+    "model_splits": [[-1, 4], [4, 10], [10, 16], [16, -1]],
+    "miners_per_layer": [1] * 4,
+    "s3_download_timeout": 600,
+    "s3_upload_timeout": 600,
+    "activation_timeout": 120,
+}
+
+#

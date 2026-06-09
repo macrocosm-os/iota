@@ -1,3 +1,4 @@
+import argparse
 import sys
 import os
 import asyncio
@@ -27,8 +28,30 @@ if common_settings.LOG_FILE_ENABLED:
     )
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Iota miner")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=os.environ.get("MINER_DRY_RUN", "").lower() in ("1", "true", "yes"),
+        help="Import everything and exit 0 without starting the miner. "
+        "Also enabled via MINER_DRY_RUN=1. Used by liquid-compute to "
+        "smoke-test packaged tarballs.",
+    )
+    return parser.parse_args(argv)
+
+
 def main():
     """Main entry point for the miner."""
+    args = _parse_args()
+    if args.dry_run:
+        logger.info(
+            "Dry-run: imports OK (run_id={}, wallet={}). Exiting.",
+            os.environ.get("RUN_ID") or os.environ.get("LC_RUN_ID", ""),
+            miner_settings.WALLET_NAME,
+        )
+        return
+
     kill_stale_gpu_processes()
     cleanup_stale_shared_memory()
     logger.info("Starting miner")

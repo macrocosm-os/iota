@@ -7,7 +7,7 @@ from common.models.api_models import ActivationResponse
 from common.models.run_flags import RUN_FLAGS
 from common.settings import MINI_BATCH_SIZE
 from common.utils.exceptions import ActivationHashMismatchError
-from common.iroh.activation_push import ActivationPushMessage
+from common.models.activation_push import ActivationPushMessage
 from miner.training.activation_cache import ActivationCache
 from miner.training.activation_queue import ActivationQueue
 from miner.utils.activation_hash import compute_activation_hash

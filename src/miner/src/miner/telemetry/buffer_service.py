@@ -15,6 +15,11 @@ from common.snowpipe.base import SnowpipeMessage
 from common.snowpipe.messages.lifecycle_events import LifecycleEvent
 from common.snowpipe.messages.training_metrics import TrainingMetric
 from miner.telemetry.metric_registry import MINER_REGISTRY, TELEMETRY_BUFFER_SIZE, TELEMETRY_FLUSHES_TOTAL
+from miner.telemetry.resource_metrics import (
+    HARDWARE_REGISTRY,
+    record_hardware_info,
+    sample_resource_usage,
+)
 from miner.telemetry.snapshot import snapshot_registry
 
 if TYPE_CHECKING:
@@ -39,15 +44,24 @@ class TelemetryBufferService:
         max_buffer_size: int = 1000,
         flush_interval_sec: float = 15.0,
         registry: CollectorRegistry = MINER_REGISTRY,
+        hardware_registry: CollectorRegistry | None = HARDWARE_REGISTRY,
         is_mounted: bool = False,
         electron_version: str | None = None,
+        disk_paths: list[str] | None = None,
+        hotkey_name: str | None = None,
     ):
         self._hotkey = hotkey
         self._max_buffer_size = max_buffer_size
         self._flush_interval_sec = flush_interval_sec
         self._registry = registry
+        # Separate registry so hardware/resource metrics don't pollute
+        # MINER_REGISTRY's training-only purpose. Pass None to disable
+        # (useful in tests that need a true no-op flush).
+        self._hardware_registry = hardware_registry
         self._is_mounted = is_mounted
         self._electron_version = electron_version
+        self._disk_paths = disk_paths if disk_paths else ["/"]
+        self._hotkey_name = hotkey_name
 
         # Typed buffers
         self._training_metrics: list[TrainingMetric] = []
@@ -82,6 +96,10 @@ class TelemetryBufferService:
         if self._running:
             return
         self._running = True
+        try:
+            record_hardware_info()
+        except Exception:
+            logger.warning("record_hardware_info raised during start; continuing", exc_info=True)
         self._flush_task = asyncio.create_task(self._flush_loop(), name="telemetry-flush")
         logger.info(
             f"TelemetryBufferService started (flush_interval={self._flush_interval_sec}s, "
@@ -119,8 +137,17 @@ class TelemetryBufferService:
                 await asyncio.sleep(5)
 
     async def _do_flush(self) -> None:
-        # Snapshot prometheus metrics right before flush
+        # Snapshot prometheus metrics right before flush. Training metrics
+        # come from MINER_REGISTRY; hardware + resource metrics come from
+        # HARDWARE_REGISTRY (kept separate so the registries stay
+        # single-concern). Hardware sampling refreshes live gauges first.
         prometheus_snapshots = snapshot_registry(self._registry)
+        if self._hardware_registry is not None:
+            try:
+                sample_resource_usage(self._disk_paths)
+            except Exception:
+                logger.warning("sample_resource_usage raised; continuing", exc_info=True)
+            prometheus_snapshots = prometheus_snapshots + snapshot_registry(self._hardware_registry)
 
         if self.buffer_size == 0 and not prometheus_snapshots:
             return
@@ -136,6 +163,7 @@ class TelemetryBufferService:
             training_metrics=training_batch,
             lifecycle_events=lifecycle_batch,
             prometheus_snapshots=prometheus_snapshots,
+            hotkey_name=self._hotkey_name,
         )
 
         try:

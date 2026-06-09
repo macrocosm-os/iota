@@ -24,6 +24,12 @@ class FleetTelemetryPayload(BaseModel):
     training_metrics: list[TrainingMetric] = []
     lifecycle_events: list[LifecycleEvent] = []
     prometheus_snapshots: list[PrometheusMetricSnapshot] = []
+    # Bittensor hotkey name reported by the miner (e.g. "miner-52"), distinct
+    # from the wallet/coldkey name. Operator-chosen, treated as display
+    # metadata only — the authenticated ss58 hotkey remains the trust
+    # boundary. Used as a Pushgateway grouping_key dimension so dashboards
+    # can label series by the human-readable per-miner identifier.
+    hotkey_name: str | None = None
 
 
 class FleetTelemetryResponse(BaseModel):

@@ -26,6 +26,13 @@ async def upload_parts(urls: list[str], data: bytes, upload_id: str | None, max_
     Returns:
         list[dict]: The parts that were uploaded.
     """
+    # Normalize to memoryview so subsequent slicing `data[i:j]` is zero-copy.
+    # If `data` is already bytes/bytearray/memoryview, memoryview(data) is a
+    # thin O(1) wrapper — no allocation. Avoids per-part bytes copies on
+    # multipart uploads of large tensors.
+    if not isinstance(data, memoryview):
+        data = memoryview(data)
+
     if len(urls) > 1 and upload_id is None:
         logger.exception("Upload ID is required for multipart uploads")
     if len(urls) == 1 and upload_id is None:
@@ -115,12 +122,12 @@ async def upload_parts(urls: list[str], data: bytes, upload_id: str | None, max_
     return parts
 
 
-async def upload_part(urls: list[str], data: bytes, upload_id: str, max_retries: int = 3) -> list[dict]:
+async def upload_part(urls: list[str], data: bytes | memoryview, upload_id: str, max_retries: int = 3) -> list[dict]:
     """Upload a single file to S3 storage with retry logic (non-multipart upload).
 
     Args:
         urls (list[str]): The URL to upload to (should contain a single URL).
-        data (bytes): The data to upload.
+        data (bytes | memoryview): The data to upload.
         upload_id (str): The upload ID.
         max_retries (int): Maximum number of retry attempts (default: 3).
 

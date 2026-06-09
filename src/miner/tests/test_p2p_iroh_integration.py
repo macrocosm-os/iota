@@ -8,7 +8,10 @@ import pytest
 from common import settings as common_settings
 from miner.new_miner import Miner
 from miner.sync.variable import SyncedVariable, PollingLoop
-from common.iroh.p2p_protocol import P2PNotFoundError
+
+# Production now raises the iota_sdk version; this test exercises that
+# code path so it must catch the same class.
+from iota_sdk.p2p import P2PNotFoundError
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +26,8 @@ def _relaxed_p2p_auth_timeout(monkeypatch):
     # Sender retries reuse the same pre-signed request bytes; under
     # heavy concurrent load on CI runners the elapsed sign→verify time
     # can exceed the 30s production default and trip UNAUTHORIZED.
-    monkeypatch.setattr("common.iroh.p2p_stack.P2P_AUTH_TIMEOUT_MS", 300_000)
+    # iota_sdk.p2p.p2p_auth_timeout_ms() reads this env var on every call.
+    monkeypatch.setenv("P2P_AUTH_TIMEOUT_MS", "300000")
 
 
 async def _cross_register_peer_addrs(*miners: Miner) -> None:

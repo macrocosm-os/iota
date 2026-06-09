@@ -1,18 +1,29 @@
+import aiohttp
+import httpx
 import pprint
 import asyncio
 import copy
+import gc
 import json
+import ctypes
 import multiprocessing
 import os
+import psutil
 import sys
+import random
 import threading
 import time
 import webbrowser
-import msgpack
+import torch
+from loguru import logger
+
+from bittensor import Wallet
+
 from common.snowpipe.messages.lifecycle_events import LifecycleEvent
 from common.utils.location_utils import resolve_node_location
 from common.utils.verify_enclave_signature import payload_base64_from_obj
-from loguru import logger
+from common.utils.epistula import sign_p2p_request
+
 from miner.sync import NodeRegistry, SyncedNode
 from miner.sync.variable import SyncedVariable, sync_run_sync_prefix
 from miner.utils.node_control_mixin import NodeControlMixin
@@ -21,15 +32,13 @@ from miner.utils.partition_merging import download_previous_optimizer_state_for_
 from miner.utils.partition_merging import get_partition_batch
 from miner.utils.partition_merging import download_pseudograds_for_partition_batch
 from miner.utils.partition_merging import upload_partition_batch
+from miner.p2p import SenderUnavailableError
 from subnet.utils.partition_utils import save_model_weights_and_optimizer_state
 from subnet.utils.vector_utils import reconstruct_optimizer_state, get_optimizer_tensor_shapes
 from miner.utils.timer_logger import TimerLoggerMiner
 from miner.telemetry import TelemetryBufferService
+from miner.telemetry.resource_metrics import disk_paths_from_env
 from miner.utils.stats import StatsTracker
-import torch
-import aiohttp
-import httpx
-from bittensor import Wallet
 from subnet.common_api_client import CommonAPIClient
 from miner.health_server import HealthServerMixin
 from miner.utils.partition_merging import (
@@ -47,7 +56,8 @@ from miner.utils.utils import (
 )
 from miner.utils.run_utils import identify_best_run
 from miner.utils.attestation_utils import collect_attestation_payload, AttestationUnavailableError
-from common.iroh.p2p_protocol import (
+from iota_sdk.p2p import (
+    P2PAuthFields,
     P2PExpiredError,
     P2PNotFoundError,
     P2PRequestError,
@@ -55,13 +65,13 @@ from common.iroh.p2p_protocol import (
     P2PUnauthorizedError,
     encode_activation_request,
     decode_activation_response,
-)
-from common.iroh import (
-    DEFAULT_MAX_MESSAGE_SIZE,
     P2POperationTimings,
-    P2PStack,
+    decode_push_ack,
+    ActivationPushNackError,
 )
-from common.iroh.activation_push import ActivationPushMessage
+
+from miner.p2p import P2PStack
+from common.models.activation_push import ActivationPushMessage
 from common.models.peer_status import PeerStatusBroadcast
 from common.models.api_models import (
     AttestationChallengeResponse,
@@ -182,6 +192,10 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 flush_interval_sec=miner_settings.TELEMETRY_FLUSH_INTERVAL_SEC,
                 is_mounted=miner_settings.IS_MOUNTED,
                 electron_version=miner_settings.ELECTRON_VERSION,
+                disk_paths=disk_paths_from_env(),
+                # Hotkey name (e.g. "miner-52"), NOT wallet.name (which is the
+                # coldkey/wallet identifier — often shared across miners).
+                hotkey_name=getattr(self.wallet, "hotkey_str", None),
             )
 
         self.node_control_port = node_control_port or 8010
@@ -381,33 +395,22 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             else:
                 setattr(self.run_flags, field_name, new_flag)
 
-    async def _start_p2p(self, timeout: float = 5.0) -> None:
+    async def _start_p2p(self, timeout: float = 30.0) -> None:
         """Initialize and start the P2P stack (receiver subprocess + sender)."""
         self.p2p = P2PStack(
             cache_ttl=float(miner_settings.P2P_ACTIVATION_CACHE_TTL),
             max_cache_size=miner_settings.MAX_ACTIVATION_CACHE_SIZE,
             max_sender_connections=P2P_MAX_SENDER_CONNECTIONS,
         )
-        self.p2p.set_on_sender_restarted(self._on_sender_restarted)
+        # The set_on_sender_restarted / _on_sender_restarted callback hook
+        # that lived here under the subprocess-RPC architecture is gone:
+        # the iota_sdk-backed Sender is native Rust with no subprocess to
+        # crash and no restart event to fire. Peer-address-book sync still
+        # happens via _sync_peer_addrs_to_sender on every node-registry
+        # tick, which is sufficient now that there's no subprocess to lose
+        # the address book in the first place.
         seed = f"iota-miner-{self.wallet.hotkey.ss58_address}"
         await self.p2p.start(seed=seed, timeout=timeout)
-
-    def _on_sender_restarted(self) -> None:
-        """Drop the peer-address-book cache when the sender subprocess restarts.
-
-        The new subprocess starts with an empty address book; without clearing
-        ``_registered_peer_addrs``, ``_sync_peer_addrs_to_sender`` would skip
-        every peer (cached value matches) and the next dial would fail with
-        ``PeerAddressUnknownError``. Re-push hints immediately so we don't
-        wait for the next registry tick.
-        """
-        self._registered_peer_addrs.clear()
-        if self.node_registry is None:
-            return
-        self._sync_peer_addrs_to_sender(
-            self.node_registry.value,
-            own_node_id=self.compute_node.compute_node.node_id,
-        )
 
     async def _initialize_node_registry(self) -> None:
         # Bridge: forward activation push messages from the multiprocessing
@@ -424,33 +427,27 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         logger.info(f"P2P node IDs: {self.p2p.node_ids}")
 
     async def _bridge_push_queue(self) -> None:
-        """Bridge multiprocessing.Queue -> asyncio.Queue for activation pushes.
+        """Forward activation pushes from the P2PStack queue to ActivationQueue's queue.
 
-        The receiver subprocess writes ActivationPushMessage objects into
-        ``self.p2p.push_queue`` (a multiprocessing.Queue).  This task polls
-        that queue in a thread-executor and forwards messages into the
-        asyncio ``self._p2p_push_queue`` consumed by ActivationQueue.
+        Originally bridged a multiprocessing.Queue from the receiver
+        subprocess onto an asyncio.Queue here. The in-process P2PStack
+        already exposes its push queue as an asyncio.Queue, so this is now
+        a straightforward asyncio→asyncio forwarder. Kept as a separate
+        task so ActivationQueue stays decoupled from the P2P plumbing.
         """
-        loop = asyncio.get_running_loop()
         while True:
             try:
-                # Block in executor with a short timeout so we can be cancelled
-                msg = await loop.run_in_executor(None, self.p2p.push_queue.get, True, 0.5)
-                # Defensive: if the router passed raw bytes (e.g. model_cls
-                # was None due to type-hint resolution failure), deserialize
-                # here so consumers always get a Pydantic model.
-                if isinstance(msg, (bytes, bytearray)):
-                    msg = ActivationPushMessage.model_validate(msgpack.unpackb(msg))
+                msg = await self.p2p.push_queue.get()
                 logger.info(
-                    f"Activation push RECV | bridge mp_queue→async | id={msg.activation_id} "
+                    f"Activation push RECV | id={msg.activation_id} "
                     f"dir={msg.direction} src_layer={msg.source_layer} tgt_layer={msg.target_layer} "
                     f"tensor_bytes={len(msg.tensor_bytes)}"
                 )
                 await self._p2p_push_queue.put(msg)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                # Queue.get timeout or other transient error — just retry
+            except Exception as exc:
+                logger.warning(f"_bridge_push_queue forwarding error: {exc}")
                 await asyncio.sleep(0.1)
 
     async def _broadcast_peer_status(self) -> None:
@@ -505,7 +502,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         async def _send_one(nid: str) -> float:
             t0 = time.monotonic()
             await asyncio.wait_for(
-                self.p2p.sender.send_routed("/peer/status", nid, msg),
+                # iota_sdk Sender.send_routed signature is (target, route, model);
+                # the auto-merged staging code used the old common.iroh order
+                # (route, node_id, msg) which made "/peer/status" get treated
+                # as the target node-id and threw PeerAddressUnknownError.
+                self.p2p.sender.send_routed(nid, "/peer/status", msg),
                 timeout=per_peer_timeout,
             )
             return time.monotonic() - t0
@@ -679,10 +680,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             Exception: If the send fails for other reasons (peer unreachable,
                 network error, etc.).  Callers may retry with a different peer.
         """
-        import random
-        from common.iroh.sender_subprocess import SenderUnavailableError
-        from common.iroh.activation_push import decode_push_ack, ActivationPushNackError
-
         if self.p2p is None or self.p2p.sender is None:
             raise SenderUnavailableError("Sender not available")
 
@@ -696,11 +693,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         )
         semaphore = await self._get_peer_semaphore(target)
         async with semaphore:
+            # iota_sdk.p2p.Sender.send_routed_bi_raw takes (target, route, request, ...).
+            # Note arg order differs from common.iroh's old (route, node_id, msg).
             ack_bytes = await self.p2p.sender.send_routed_bi_raw(
-                "/activation/push",
                 target,
+                "/activation/push",
                 msg,
-                max_message_size=128,
                 timeout=miner_settings.ACTIVATION_PUSH_TIMEOUT_SECONDS,
                 timings=timings,
             )
@@ -768,7 +766,15 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         async with semaphore:
             epistula_start = time.time()
-            request = encode_activation_request(activation_id, hotkey=self.wallet.hotkey)
+
+            id_bytes = activation_id.encode("utf-8")
+            timestamp_ms, ss58_address, signature = sign_p2p_request(self.wallet.hotkey, id_bytes)
+            auth = P2PAuthFields(
+                timestamp_ms=timestamp_ms,
+                ss58_address=ss58_address,
+                signature=signature,
+            )
+            request = encode_activation_request(activation_id, auth=auth)
             epistula_end = time.time()
 
             stats = self.stats_tracker.ensure_activation_stats(activation_id)
@@ -776,11 +782,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             stats.timing.epistula.end = epistula_end
             stats.timing.epistula.duration = epistula_end - epistula_start
 
-            # All retry + timeout logic lives inside Sender.send_message_bi()
+            # All retry + timeout logic lives inside Sender.send_message_bi().
+            # iota_sdk.p2p.Sender.send_message_bi takes (target, payload, protocol_id=PROTOCOL_ID_BI, ...);
+            # the receiver-side max-message-size cap is enforced at Receiver
+            # construction (DEFAULT_MAX_MESSAGE_SIZE), not per-call.
             response = await self.p2p.sender.send_message_bi(
                 source_node_id,
                 request,
-                DEFAULT_MAX_MESSAGE_SIZE,
                 timings=timings,
             )
 
@@ -839,82 +847,69 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
             if self.miner_api_client.layer_state == LayerPhase.TRAINING:
                 if self.need_to_pull_weights:
-                    # Only skip weight download on the very first epoch for miners that
-                    # registered at epoch 1 (no prior merge has happened yet).
-                    # epoch_counter is 0 before the first merge completes; after that,
-                    # merged weights always exist and must be downloaded.
-                    first_epoch_no_weights = (
-                        self.model_manager.epoch_on_registration == 1 and self.model_manager.epoch_counter == 0
-                    )
-                    if first_epoch_no_weights:
-                        logger.info(
-                            f"Miner {self.hotkey[:8]} registered on epoch 1 and has not completed a merge yet"
-                            " - no merged weights to download, proceeding with current model weights"
-                        )
-                    else:
-                        weight_download_tries = 3
-                        weight_download_success = False
-                        for i in range(weight_download_tries):
-                            try:
-                                async with TimerLoggerMiner(
-                                    name="download_and_set_global_weights",
-                                    metadata={"hotkey": self.hotkey[:8], "layer": self.state_manager.layer},
-                                    hotkey=self.hotkey[:8],
-                                ):
-                                    await self.download_and_set_global_weights(
-                                        device=self.device,
-                                        client=self.miner_api_client,
-                                    )
-                                    weight_download_success = True
-                                    break
-                            except (
-                                MinerNotRegisteredException,
-                                MinerInitializingException,
-                                MinerFrozenException,
-                                MinerBlockedException,
+                    weight_download_tries = 3
+                    weight_download_success = False
+                    for i in range(weight_download_tries):
+                        try:
+                            async with TimerLoggerMiner(
+                                name="download_and_set_global_weights",
+                                metadata={"hotkey": self.hotkey[:8], "layer": self.state_manager.layer},
+                                hotkey=self.hotkey[:8],
                             ):
-                                # Re-raise so the outer training_loop handler applies the
-                                # correct back-off (60s) and status update.
-                                raise
-                            except torch.cuda.OutOfMemoryError as e:
-                                torch.cuda.empty_cache()
-                                logger.error(
-                                    f"Miner {self.hotkey[:8]} CUDA OOM downloading weights "
-                                    f"(attempt {i + 1}/{weight_download_tries}): {e}"
+                                await self.download_and_set_global_weights(
+                                    device=self.device,
+                                    client=self.miner_api_client,
                                 )
-                                await asyncio.sleep(5)
-                                continue
-
-                            except Exception as e:
-                                logger.debug(
-                                    f"Miner {self.hotkey[:8]} will NOT train until global weights "
-                                    f"are downloaded successfully... Retrying "
-                                    f"(attempt {i + 1}/{weight_download_tries})"
-                                )
-                                logger.error(f"Unexpected error during weight download: {e}")
-                                await asyncio.sleep(1)
-                                continue
-
-                        if not weight_download_success:
+                                weight_download_success = True
+                                break
+                        except (
+                            MinerNotRegisteredException,
+                            MinerInitializingException,
+                            MinerFrozenException,
+                            MinerBlockedException,
+                        ):
+                            # Re-raise so the outer training_loop handler applies the
+                            # correct back-off (60s) and status update.
+                            raise
+                        except torch.cuda.OutOfMemoryError as e:
+                            torch.cuda.empty_cache()
                             logger.error(
-                                f"Miner {self.hotkey[:8]} hit {weight_download_tries} "
-                                f"consecutive failures — resetting to re-register"
+                                f"Miner {self.hotkey[:8]} CUDA OOM downloading weights "
+                                f"(attempt {i + 1}/{weight_download_tries}): {e}"
                             )
-                            raise MinerResetException(
-                                "Error: Unexpected persistent errors during weight download. Resetting miner state."
-                            )
+                            await asyncio.sleep(5)
+                            continue
 
-                        # If miner is new to this layer, download global optimizer state (if feature enabled)
-                        if self._needs_local_optimizer_state_download and self.run_flags.upload_optimizer_state.isOn():
-                            try:
-                                await self._download_and_apply_local_optimizer_state()
-                            except Exception as e:
-                                logger.warning(f"Failed to download global optimizer state (non-fatal): {e}")
-                            finally:
-                                self._needs_local_optimizer_state_download = False
-                        elif self._needs_local_optimizer_state_download:
-                            # Feature disabled, skip download
+                        except Exception as e:
+                            logger.debug(
+                                f"Miner {self.hotkey[:8]} will NOT train until global weights "
+                                f"are downloaded successfully... Retrying "
+                                f"(attempt {i + 1}/{weight_download_tries})"
+                            )
+                            logger.error(f"Unexpected error during weight download: {e}")
+                            await asyncio.sleep(1)
+                            continue
+
+                    if not weight_download_success:
+                        logger.error(
+                            f"Miner {self.hotkey[:8]} hit {weight_download_tries} "
+                            f"consecutive failures — resetting to re-register"
+                        )
+                        raise MinerResetException(
+                            "Error: Unexpected persistent errors during weight download. Resetting miner state."
+                        )
+
+                    # If miner is new to this layer, download global optimizer state (if feature enabled)
+                    if self._needs_local_optimizer_state_download and self.run_flags.upload_optimizer_state.isOn():
+                        try:
+                            await self._download_and_apply_local_optimizer_state()
+                        except Exception as e:
+                            logger.warning(f"Failed to download global optimizer state (non-fatal): {e}")
+                        finally:
                             self._needs_local_optimizer_state_download = False
+                    elif self._needs_local_optimizer_state_download:
+                        # Feature disabled, skip download
+                        self._needs_local_optimizer_state_download = False
 
                     # Always persist a snapshot at epoch start so submit_weights has previous weights
                     save_model_weights_and_optimizer_state(
@@ -929,6 +924,19 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 self.need_to_pull_weights = False
                 self.weights_submitted = False
                 self.partitions_submitted = False
+
+                # Safety net: drop any per-activation stats left over from the
+                # previous epoch (timeouts, error paths). The per-activation
+                # eviction in training.py handles the happy path.
+                self.stats_tracker.activation_stats.clear()
+
+                # Make sure that the epoch counter increases every time we start training.
+                # This is to avoid the edge case where nodes fail to get to the END of merging_partitions.
+                self.model_manager.epoch_counter += 1
+                logger.info(
+                    f"🔄 Miner {self.hotkey[:8]} incremented epoch counter to: {self.model_manager.epoch_counter}"
+                )
+
                 await self.training_phase.run()
                 await asyncio.sleep(1.1)
                 return
@@ -981,7 +989,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     logger.info(f"🔄 Miner {self.hotkey[:8]} already submitted partitions, skipping...")
                     await wait_for_state(state=LayerPhase.TRAINING, miner_api_client=self.miner_api_client)
 
-                self.model_manager.epoch_counter += 1
                 await self._clear_stale_p2p_state()
                 await self.training_phase.epoch_reset()
                 return
@@ -1173,6 +1180,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.model_manager.model_config = model_config
         self.model_manager.model_metadata = model_metadata
         self.model_manager.epoch_on_registration = current_epoch
+
         # Local merge-cycle count is per assignment; re-register / new run must not inherit the old value.
         self.model_manager.epoch_counter = 0
 
@@ -1417,6 +1425,22 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             f"✅ Miner {self.hotkey[:8]} successfully downloaded and applied local optimizer state from {response.optimizer_state_url} for layer {self.state_manager.layer}"
         )
 
+    def _log_resources(self, tag: str) -> None:
+        vm = psutil.virtual_memory()
+        ram_used = vm.used / 1024**3
+        ram_total = vm.total / 1024**3
+        disk = psutil.disk_usage("/")
+        disk_free = disk.free / 1024**3
+        disk_total = disk.total / 1024**3
+        vram_msg = ""
+        if torch.cuda.is_available():
+            vram_alloc = torch.cuda.memory_allocated() / 1024**3
+            vram_res = torch.cuda.memory_reserved() / 1024**3
+            vram_msg = f" | VRAM alloc={vram_alloc:.2f}GB res={vram_res:.2f}GB"
+        logger.debug(
+            f"[resources:{tag}] RAM {ram_used:.2f}/{ram_total:.2f}GB{vram_msg} | disk free {disk_free:.2f}/{disk_total:.2f}GB"
+        )
+
     async def submit_weights(self):
         """
         Uploads the weights to the orchestrator and submits them to the database
@@ -1430,9 +1454,53 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             metadata={"hotkey": self.hotkey[:8], "layer": self.state_manager.layer},
             hotkey=self.hotkey[:8],
         ):
+            # Baseline RAM before any of submit_weights' large CPU allocations.
+            # Compare across epochs to confirm/refute the glibc-retention theory:
+            # epoch 2's baseline here should match epoch 1's if the heap returns
+            # cleanly between epochs, and be noticeably higher if it doesn't.
+            self._log_resources("submit_weights_start")
+
             if self.training_phase.backwards_since_reset == 0:
                 logger.warning(f"Backwards since reset for miner {self.hotkey[:8]} is 0, skipping")
                 return
+
+            # Pull the epoch-boundary cleanup forward.
+            #
+            # The full cleanup (_clear_stale_p2p_state + training_phase.epoch_reset)
+            # normally only runs AFTER the layer transitions back to TRAINING
+            # (see training_loop_tick around line 981). During the
+            # weights_uploading phase — where this method runs — none of
+            # that stale state is cleared yet, so it stacks on top of the
+            # ~12 GB weight buffer and ~24 GB optimizer-state buffer we are
+            # about to allocate. On 2026-05-24 this combination pushed
+            # ~30 miners past the 96 GB host-RAM ceiling on Paperspace and
+            # triggered fleet-wide OOM kills.
+            #
+            # Each piece below is safe to drop here:
+            #   - activation cache  : backward passes for these forwards
+            #                         won't run, the epoch is over
+            #   - forward/backward
+            #     queues            : same
+            #   - publisher state   : peers have already transitioned phase,
+            #                         queued sends are moot. Comment on
+            #                         publisher.reset() notes this state
+            #                         "accumulates host RAM across the whole run"
+            #   - p2p shared-memory
+            #     cache + queues    : stale activations from the prior epoch
+            log_gpu_memory_usage(note="submit_weights entry, before cleanup")
+            try:
+                await self._clear_stale_p2p_state()
+            except Exception as e:
+                logger.warning(f"submit_weights: failed to clear stale p2p state: {e}")
+            try:
+                await self.training_phase._cache.reset()
+                self.training_phase._queue._forward_queue.clear()
+                self.training_phase._queue._backward_queue.clear()
+                await self.training_phase._publisher.reset()
+            except Exception as e:
+                logger.warning(f"submit_weights: failed to drop stale training state: {e}")
+            gc.collect()
+            log_gpu_memory_usage(note="submit_weights, after cleanup")
 
             current_weights = (
                 torch.nn.utils.parameters_to_vector(parameters=self.model_manager.model.parameters()).detach().to("cpu")
@@ -1448,17 +1516,31 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             # creating changes
             pseudo_gradients = torch.zeros_like(previous_weights).to(torch.bfloat16)
 
-            # iterate over pseudo gradients in batches and fill them - this avoids using unnecessary memory usage
-            for i in range(miner_settings.PSEUDO_GRADIENTS_BATCH_SIZE):
-                logger.debug(f"Getting pseudo gradients for batch {i}")
-                previous_weights_batch = previous_weights[i :: miner_settings.PSEUDO_GRADIENTS_BATCH_SIZE]
-                current_weights_batch = current_weights[i :: miner_settings.PSEUDO_GRADIENTS_BATCH_SIZE]
+            # Iterate over contiguous chunks to fill pseudo_gradients.
+            #
+            # Previously this used strided slicing ``previous_weights[i :: B]``,
+            # which produces a non-contiguous view. The subsequent ``.to(fp32)``
+            # then has to allocate a fresh contiguous fp32 buffer AND walk the
+            # strided source with cache-hostile reads — empirically this caused
+            # ~8× the expected allocation footprint (e.g. 800 MB of resident
+            # growth for a ~95 MB fp32 result tensor) and the freed pages did
+            # not get returned to the OS cleanly, inflating RSS heading into
+            # the S3 upload.
+            #
+            # Contiguous chunking gives identical math, makes ``.to(fp32)`` a
+            # cache-friendly sequential read, and lets PyTorch's CPU allocator
+            # reuse the same chunk-sized pool every iteration without growth.
+            total_elems = previous_weights.numel()
+            chunk_size = -(-total_elems // miner_settings.PSEUDO_GRADIENTS_BATCH_SIZE)  # ceil div
+            for start in range(0, total_elems, chunk_size):
+                end = min(start + chunk_size, total_elems)
+                logger.debug(f"Getting pseudo gradients for chunk [{start}:{end}]")
+                previous_weights_batch = previous_weights[start:end]
+                current_weights_batch = current_weights[start:end]
                 pseudo_gradients_batch = previous_weights_batch.to(torch.float32) - current_weights_batch.to(
                     torch.float32
                 )
-                pseudo_gradients[i :: miner_settings.PSEUDO_GRADIENTS_BATCH_SIZE] = pseudo_gradients_batch.to(
-                    torch.bfloat16
-                )
+                pseudo_gradients[start:end] = pseudo_gradients_batch.to(torch.bfloat16)
 
             if self.run_flags.clip_pseudo_gradients.isOn():
                 pseudo_gradients = await self.model_manager.clip_pseudo_gradients(pseudo_gradients)
@@ -1475,6 +1557,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             )
             logger.info(f"Pseudo gradients shape: {pseudo_gradients.shape}")
 
+            # Free the two ~Nx bf16 buffers now that pseudo_gradients is fully materialized.
+            # On a 6.5B-param stage these are ~13 GB each; holding them through S3 upload
+            # has previously caused host OOM kills (no swap on Paperspace hosts).
+            del previous_weights_batch, current_weights_batch, pseudo_gradients_batch
+            del previous_weights, current_weights
+            gc.collect()
+
             try:
                 self.model_manager.optimizer.zero_grad()
                 await self.training_phase.optimization_reset()
@@ -1487,20 +1576,25 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 attestation_payload: MinerAttestationPayload | None = await self._collect_attestation_payload(
                     action="weights"
                 )
+                self._log_resources("after_collect_attestation")
 
                 check_for_nans_and_infs(
                     tensor=pseudo_gradients,
                     name=f"pseudo gradients for miner {self.hotkey[:8]}",
                     exception_type=NanInfException,
                 )
+                self._log_resources("after_check_nan_inf")
 
                 metadata: dict = create_metadata(tensor=pseudo_gradients, num_sections=self.num_partitions)
+                self._log_resources("after_create_metadata")
                 metadata["local_optimization_steps"] = self.training_phase.local_optimization_steps
+                self._log_resources("after_set_local_optimization_steps")
 
                 logger.info(
                     f"submit_weights: uploading weights for {self.num_partitions} partitions "
                     f"(1 weights S3 upload + 1 metadata S3 upload + 1 API submit call)"
                 )
+                self._log_resources("before_upload_tensor")
                 # Convert tensor to bytes, handling bfloat16 compatibility
                 path = await upload_tensor(
                     tensor=pseudo_gradients,
@@ -1564,6 +1658,39 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             except Exception as e:
                 logger.error(f"Generic error submitting weights: {e}")
                 raise
+
+            finally:
+                # End-of-submit_weights cleanup: drop the large CPU buffers that
+                # were alive during upload (pseudo_gradients ~11 GB, and
+                # flat_optimizer_state ~22 GB if this miner was selected to
+                # upload optimizer state). Python would free these on frame
+                # unwind anyway, but doing it explicitly + gc.collect() before
+                # malloc_trim() gives us a defined ordering.
+                #
+                # Then ask glibc to actually return free pages to the OS so
+                # epoch 2 doesn't inherit an inflated RSS baseline from epoch
+                # 1's transient allocations. This is the direct counter to the
+                # heap-retention symptom (RSS stays high after large bf16
+                # allocations are freed internally but not returned to the
+                # kernel).
+                self._log_resources("submit_weights_end_before_cleanup")
+                try:
+                    del pseudo_gradients
+                except NameError:
+                    pass
+                try:
+                    del flat_optimizer_state
+                except NameError:
+                    pass
+                gc.collect()
+                # malloc_trim is glibc-specific. Best-effort: skip silently on
+                # macOS, musl-libc Alpine, etc. The call is safe on glibc and
+                # typically costs <100 ms.
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+                self._log_resources("submit_weights_end_after_cleanup")
 
     async def run_miner(self):
         """
@@ -1646,18 +1773,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     logger.info("P2P stopped")
                 except Exception as e:
                     logger.error(f"Failed to stop P2P: {e}")
+
+                # Stop the telemetry service
                 try:
                     if self.telemetry_service:
                         await self.telemetry_service.stop()
                         logger.info("Telemetry service stopped")
                 except Exception as e:
                     logger.error(f"Failed to stop telemetry service: {e}")
-
-                try:
-                    delete_saved_model_weights_and_optimizer_state(hotkey=self.hotkey)
-                    logger.info("Deleted local weight and optimizer state files")
-                except Exception as e:
-                    logger.error(f"Failed to delete saved weights on shutdown: {e}")
 
             except Exception as e:
                 logger.error(f"Failed to shutdown miner: {e}")
@@ -1721,7 +1844,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     layer_idx=self.state_manager.layer,
                 )
         else:
-            delete_saved_model_weights_and_optimizer_state(hotkey=self.hotkey, current_run_id=self.state_manager.run_id)
+            delete_saved_model_weights_and_optimizer_state(hotkey=self.hotkey)
             logger.info(f"Deleted stale weight files from previous run/layer (old run={old_run_id}, layer={old_layer})")
 
         self.model_manager.reset()
@@ -1803,6 +1926,9 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             # Grab a batch of partitions to download the weights for
             for batch in range(n_batches):
                 logger.debug(f"Merging batch {batch} of {n_batches}")
+                # Baseline RAM at start of this batch. With the end-of-batch trim
+                # below, this should stay roughly flat across iterations.
+                self._log_resources(f"merge_batch_{batch}_start")
 
                 # Grab a batch of partitions to merge (no downloading yet)
                 batch_partitions: list[MergingPartition] = get_partition_batch(batch_index=batch, partitions=partitions)
@@ -1822,24 +1948,32 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 merging_partitions = await download_previous_optimizer_state_for_partition_batch(merging_partitions)
                 logger.debug(f"{len(merging_partitions)} batch partitions downloaded previous optimizer state")
 
-                # Determine if we have enough memory in the GPU to merge the partitions on GPU or CPU
+                # Determine if we have enough memory in the GPU to merge the partitions on GPU or CPU.
                 device = self.device
                 if device != "cpu":
                     gpu_device.synchronize()
                     gpu_device.empty_cache()
                     avail_memory = gpu_device.available_memory()
+
                     # TODO: @cassova: correct this calculation - 100x is just to push it to cpu for now
                     need_to_merge_on_gpu = (
                         100
                         * torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters()).numel()
                         * len(merging_partitions)
                     )
+
                     if need_to_merge_on_gpu > avail_memory:
                         logger.warning(
                             "Not enough memory available to merge partitions on GPU"
                             f" - needed {need_to_merge_on_gpu / 1024**3:.2f}GB, available {avail_memory / 1024**3:.2f}GB"
                         )
                         device = "cpu"
+                    else:
+                        logger.debug(
+                            "Merging partitions on GPU"
+                            f" - needed {need_to_merge_on_gpu / 1024**3:.2f}GB, available {avail_memory / 1024**3:.2f}GB"
+                            f" ({len(merging_partitions)} partition(s))"
+                        )
 
                 # Load old weights into model
                 if device == "cpu":
@@ -1847,6 +1981,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 else:
                     old_model = copy.deepcopy(self.model_manager.model)
                     log_gpu_memory_usage(note="after copying old model")
+
                 torch.nn.utils.vector_to_parameters(
                     load_model_weights(
                         hotkey=self.hotkey, run_id=self.state_manager.run_id, layer_idx=self.state_manager.layer
@@ -1856,7 +1991,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
                 # Do the actual merging (apply the optimizer state to the weights)
                 weights_length = sum([p.numel() for p in old_model.parameters()])
-                current_global_epoch = self.model_manager.epoch_on_registration + self.model_manager.epoch_counter
+
+                # TODO: Epoch counter starts at 0 but we increment at the START of the epoch.
+                # For the "current global epoch" to be correct, we just need to subtract 1 from the epoch counter.
+                # However, this is dumb but we are going to re-write the miner code soon.
+                current_global_epoch = self.model_manager.epoch_on_registration + self.model_manager.epoch_counter - 1
+
                 merged_partitions = await merge_partition_batch(
                     partition_batch=merging_partitions,
                     filtered_metadata=filtered_metadata,
@@ -1885,7 +2025,30 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 del old_model
                 del merged_partitions  # TODO: @cassova: do a better job of cleaning this up
                 del final_partitions
+
+                # End-of-batch cleanup: explicitly drop the partition-batch holders
+                # (each MergingPartition pins ~340 MB pseudograds + ~340 MB old/new
+                # optimizer state + ~340 MB weights). Without these dels the prior
+                # iteration's tensors stay alive in the function frame until the
+                # next iteration's downloads rebind the variable — i.e. peak
+                # memory is briefly ~2× during the rebind.
+                del batch_partitions, merging_partitions
+
+                # Trim glibc's heap so pages from this batch's transient fp32
+                # buffers (per-partition averaging, optimizer-state slicing,
+                # serialization) get returned to the OS before the next batch.
+                # Without this the heap inflated ~50 GB across 32 batches and
+                # OOM-killed the process when the post-merge download tried to
+                # allocate its target tensor. Mirrors the cleanup in
+                # submit_weights's `finally` block.
+                gc.collect()
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass  # macOS / musl / non-glibc — skip silently
+
                 log_gpu_memory_usage(note="after merging partitions")
+                self._log_resources(f"merge_batch_{batch}_end_after_trim")
 
             # Wait for all background submission tasks to complete
             await asyncio.gather(*submission_tasks)
