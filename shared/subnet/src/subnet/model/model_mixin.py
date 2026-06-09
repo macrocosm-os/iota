@@ -446,7 +446,7 @@ class ModelManager:
         logger.info(f"loaded vocab info: vocab size | {self.vocab_size} | EOS token id | {self.eos_token_id}")
 
     async def local_optimization_step(self, learning_rate: float):
-        """Perform a local optimization step every 32 backward passes."""
+        """Perform a local optimization step every N backward passes."""
 
         with logger.contextualize(gpu="local optimization step"):
             logger.info(f"{self.logger_attributes['hotkey'][:8]} is beginning local optimization step")

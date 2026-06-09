@@ -92,7 +92,7 @@ def main():
         action="store_true",
         help="Force-enable btcli integrations if previously disabled.",
     )
-    parser.set_defaults(auto_start=False, show_dashboard=True, use_btcli=True)
+    parser.set_defaults(auto_start=True, show_dashboard=False, use_btcli=True)
     args = parser.parse_args()
 
     # Fall back to MINER_WALLET / MINER_HOTKEY env vars when the CLI flags

@@ -59,12 +59,30 @@ class AioHttpClientWithOpenSession:
 async def process_response(
     response: aiohttp.ClientResponse, dtype: torch.dtype, device: str = "cuda", run_flags: RunFlags = RUN_FLAGS
 ) -> torch.Tensor:
-    """Process the response from aiohttp and return a tensor."""
+    """Process the response from aiohttp and return a tensor.
+
+    Memory note: the previous implementation used ``torch.tensor(np.frombuffer(content, ...))``,
+    which empirically allocates ~1.5× the source size (PyTorch makes intermediate copies
+    when constructing a tensor from a numpy array). With 32 partitions downloaded
+    concurrently for first/last-layer miners (which have vocab-size weights — large
+    ``tok_emb`` / ``out_head``), this caused ~20 GB of transient host RAM during the
+    download phase and contributed to OOM kills on the most heap-pressured miners.
+
+    ``torch.from_numpy`` is zero-copy: it constructs a tensor that shares storage with
+    the numpy array, which itself shares storage with ``content`` (the bytes object).
+    The whole chain stays alive via PyTorch's storage refcount until the returned
+    tensor is dropped. The resulting tensor is read-only (because ``bytes`` is
+    immutable), but we only ever read from it downstream (nan/inf check and an
+    ``index_copy`` into ``target_tensor``), so that is safe.
+    """
     content = await response.read()
     if run_flags.compress_s3_files.isOn():
         content = gzip.decompress(content)
-    loaded_tensor = np.frombuffer(content, dtype=np.uint8)
-    loaded_tensor = torch.tensor(loaded_tensor).view(dtype).to(device)
+    np_view = np.frombuffer(content, dtype=np.uint8)
+    # Zero-copy: torch.from_numpy shares storage with np_view, which shares
+    # storage with `content`. ``.view(dtype)`` reinterprets bytes without copying.
+    # ``.to(device)`` is a no-op when device is already CPU (the common case here).
+    loaded_tensor = torch.from_numpy(np_view).view(dtype).to(device)
     return loaded_tensor
 
 

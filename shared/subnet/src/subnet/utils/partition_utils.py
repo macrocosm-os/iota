@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 import math
 import os
+import psutil
 from typing import Literal
 
 from common import settings as common_settings
@@ -18,6 +19,24 @@ from platformdirs import user_data_dir
 from loguru import logger
 from subnet.utils.vector_utils import check_for_nans_and_infs
 from subnet.utils.s3_torch import download_tensor
+
+
+def _log_download_ram(tag: str, layer: int | None = None, extra: str = "") -> None:
+    """Log CPU RAM at instrumented points in download_merged_partitions.
+
+    The download phase has been implicated in OOM kills on first/last-layer
+    miners (which have vocab-sized weights and therefore the largest target
+    tensors). These markers tell us whether the spike comes from:
+      - a high baseline going in (heap retention from the merge phase), or
+      - the concurrent-download batch itself doubling memory.
+    """
+    vm = psutil.virtual_memory()
+    layer_msg = f"layer={layer} " if layer is not None else ""
+    extra_msg = f" | {extra}" if extra else ""
+    logger.info(
+        f"[download_merged_partitions:{tag}] {layer_msg}"
+        f"RAM {vm.used / 1024**3:.2f}/{vm.total / 1024**3:.2f}GB{extra_msg}"
+    )
 
 
 def get_data_dir():
@@ -88,6 +107,12 @@ async def download_merged_partitions(
     logger.info(
         f"Downloading {download_type} for layer {layer}. Target tensor shape: {target_tensor.shape} with {num_partitions} partitions"
     )
+    target_bytes = target_tensor.numel() * target_tensor.element_size()
+    _log_download_ram(
+        "entry",
+        layer=layer,
+        extra=f"target={target_bytes / 1024**3:.2f}GB partitions={len(merged_partitions) if merged_partitions else 0}",
+    )
     partition_download_error_counter: int = 0
 
     # Total parts is the number of partitions that have been uploaded to the db,
@@ -118,9 +143,15 @@ async def download_merged_partitions(
         for batch_start in range(0, len(merged_partitions), BATCH_DOWNLOAD_SIZE):
             batch_end = min(batch_start + BATCH_DOWNLOAD_SIZE, len(merged_partitions))
             batch_partitions = merged_partitions[batch_start:batch_end]
+            batch_idx = batch_start // BATCH_DOWNLOAD_SIZE
 
             logger.info(
-                f"Processing batch {batch_start // BATCH_DOWNLOAD_SIZE + 1}/{(len(merged_partitions) + BATCH_DOWNLOAD_SIZE - 1) // BATCH_DOWNLOAD_SIZE}: partitions {batch_start} to {batch_end - 1}"
+                f"Processing batch {batch_idx + 1}/{(len(merged_partitions) + BATCH_DOWNLOAD_SIZE - 1) // BATCH_DOWNLOAD_SIZE}: partitions {batch_start} to {batch_end - 1}"
+            )
+            _log_download_ram(
+                f"batch_{batch_idx}_before_gather",
+                layer=layer,
+                extra=f"concurrent={len(batch_partitions)}",
             )
 
             try:
@@ -134,6 +165,10 @@ async def download_merged_partitions(
                         for partition in batch_partitions
                     ],
                     return_exceptions=True,
+                )
+                _log_download_ram(
+                    f"batch_{batch_idx}_after_gather",
+                    layer=layer,
                 )
 
                 downloaded_tensors, batch_partitions = filter_exceptions(downloaded_tensors, batch_partitions)
@@ -241,6 +276,7 @@ async def download_merged_partitions(
 
         # Cast the model weights and optimizer state to the correct device.
         target_tensor: torch.Tensor = target_tensor.to(device)
+        _log_download_ram("done", layer=layer)
         return target_tensor
 
     except Exception:

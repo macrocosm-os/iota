@@ -73,10 +73,16 @@ class TestBufferService:
 
     @pytest.mark.asyncio
     async def test_flush_empty_buffer_noop(self, mock_keypair, empty_registry):
-        """Flush with no messages and empty registry should not make any HTTP call."""
+        """Flush with no messages and empty registry should not make any HTTP call.
+
+        Hardware registry is explicitly disabled here because the global
+        HARDWARE_REGISTRY emits non-empty samples (unlabeled gauges default
+        to 0), which would otherwise trigger a flush even with no traffic.
+        """
         svc = TelemetryBufferService(
             hotkey=mock_keypair,
             registry=empty_registry,
+            hardware_registry=None,
         )
 
         with patch("subnet.common_api_client.CommonAPIClient") as mock_client:
@@ -200,6 +206,73 @@ class TestBufferService:
             mock_client.orchestrator_request.assert_called_once()
 
         assert svc.buffer_size == 0
+
+    @pytest.mark.asyncio
+    async def test_record_hardware_info_populates_static_gauges(self, mock_keypair, empty_registry):
+        """start() should call record_hardware_info(), populating static HW_* gauges."""
+        from miner.telemetry.resource_metrics import HARDWARE_REGISTRY
+
+        svc = TelemetryBufferService(
+            hotkey=mock_keypair,
+            registry=empty_registry,
+            flush_interval_sec=999,
+        )
+
+        with patch("subnet.common_api_client.CommonAPIClient") as mock_client:
+            mock_client.orchestrator_request = AsyncMock(return_value={})
+            await svc.start()
+            try:
+                names = {sample.name for fam in HARDWARE_REGISTRY.collect() for sample in fam.samples}
+                # hw_info is a labeled gauge — it only emits a sample after
+                # record_hardware_info() called .labels(...).set(1).
+                assert "miner_hw_info" in names
+            finally:
+                await svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_flush_includes_hardware_snapshots(self, mock_keypair, empty_registry):
+        """_do_flush() should include HARDWARE_REGISTRY samples in prometheus_snapshots."""
+        svc = TelemetryBufferService(
+            hotkey=mock_keypair,
+            registry=empty_registry,
+        )
+        # Force at least one buffered message so flush actually fires regardless of
+        # what the hardware registry contributes — the assertion below targets the
+        # presence of hardware-side snapshots in the outbound payload.
+        svc.log(_make_training_metric())
+
+        with patch("subnet.common_api_client.CommonAPIClient") as mock_client:
+            mock_client.orchestrator_request = AsyncMock(return_value={})
+            await svc.start()
+            try:
+                await svc.flush()
+                # First non-empty call after start. start() itself triggers no
+                # flush, but the flush-loop may have. Inspect the most recent call.
+                assert mock_client.orchestrator_request.called
+                body = mock_client.orchestrator_request.call_args.kwargs["body"]
+                snap_names = {s["name"] for s in body["prometheus_snapshots"]}
+                # Live RAM gauge is always present (no labels, set during sampling).
+                assert "miner_ram_total_bytes" in snap_names
+            finally:
+                await svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_hardware_registry_can_be_disabled(self, mock_keypair, empty_registry):
+        """Passing hardware_registry=None must skip sampling and produce no HW snapshots."""
+        svc = TelemetryBufferService(
+            hotkey=mock_keypair,
+            registry=empty_registry,
+            hardware_registry=None,
+        )
+        svc.log(_make_training_metric())
+
+        with patch("subnet.common_api_client.CommonAPIClient") as mock_client:
+            mock_client.orchestrator_request = AsyncMock(return_value={})
+            await svc.flush()
+            body = mock_client.orchestrator_request.call_args.kwargs["body"]
+            snap_names = {s["name"] for s in body["prometheus_snapshots"]}
+            assert "miner_ram_total_bytes" not in snap_names
+            assert "miner_hw_info" not in snap_names
 
     @pytest.mark.asyncio
     async def test_flush_on_time_interval(self, mock_keypair, empty_registry):

@@ -2,6 +2,7 @@ import asyncio
 import json
 import gzip
 import platform
+import psutil
 import subprocess
 import sys
 from urllib.parse import urlparse
@@ -37,6 +38,23 @@ def _sysctl(key: str) -> str | None:
         return None
 
 
+def _log_upload_ram(tag: str, file_type: str, payload_bytes: int | None = None) -> None:
+    """Log CPU RAM at instrumented points in upload_tensor / upload_file.
+
+    Used to validate that the memoryview refactor actually reduces peak memory
+    relative to the old .tobytes() path. With the old path, RAM at
+    `after_memoryview` would jump by ~tensor-size relative to `before_memoryview`.
+    With the new memoryview path, the two should be ~identical.
+    """
+    vm = psutil.virtual_memory()
+    ram_used_gb = vm.used / 1024**3
+    ram_total_gb = vm.total / 1024**3
+    payload_msg = f" | payload={payload_bytes / 1024**3:.2f}GB" if payload_bytes is not None else ""
+    logger.info(
+        f"[_log_upload_ram:upload_tensor:{tag}:{file_type}] RAM {ram_used_gb:.2f}/{ram_total_gb:.2f}GB{payload_msg}"
+    )
+
+
 def run_speedtest() -> dict[str, float] | None:
     """Run an upload/download speed test.
 
@@ -64,47 +82,78 @@ def run_speedtest() -> dict[str, float] | None:
         return None
 
 
-def collect_system_data() -> str | None:
-    """Collect device info and return as MinerSystemData-compatible JSON."""
+def collect_hardware_info() -> dict:
+    """Collect static hardware info. No speedtest; never raises.
+
+    Returns dict with keys: machine, cpu_brand, cpu_cores, memory_bytes,
+    gpu_count, gpu_name. Missing fields are None/0. Safe to call from
+    telemetry hot paths.
+    """
+    info: dict = {
+        "machine": platform.machine(),
+        "cpu_brand": None,
+        "cpu_cores": None,
+        "memory_bytes": None,
+        "gpu_count": 0,
+        "gpu_name": None,
+    }
     try:
-        machine = platform.machine()
-        gpus: list[str] = []
-        cpu_brand: str | None = None
-        cores: int | None = None
-        memory_gb: int | None = None
-
         if sys.platform == "darwin":
-            cpu_brand = _sysctl("machdep.cpu.brand_string")
-            if not cpu_brand:
-                cpu_brand = platform.processor() or None
-            if cpu_brand:
-                gpus.append(cpu_brand)
-
+            info["cpu_brand"] = _sysctl("machdep.cpu.brand_string") or platform.processor() or None
             ncpu = _sysctl("hw.ncpu")
             if ncpu:
-                cores = int(ncpu)
-
+                info["cpu_cores"] = int(ncpu)
             memsize = _sysctl("hw.memsize")
             if memsize:
-                memory_gb = int(memsize) // (1024**3)
+                info["memory_bytes"] = int(memsize)
         else:
-            cpu_brand = platform.processor() or None
+            info["cpu_brand"] = platform.processor() or None
+            try:
+                import os as _os
 
-        # CUDA: get GPU name
-        try:
-            if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                if gpu_name:
-                    gpus.append(gpu_name)
-        except Exception:
-            pass
+                info["cpu_cores"] = _os.cpu_count()
+            except Exception:
+                pass
+            try:
+                import psutil as _psutil
 
+                info["memory_bytes"] = int(_psutil.virtual_memory().total)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"collect_hardware_info: host probe failed: {e}")
+
+    try:
+        if torch.cuda.is_available():
+            info["gpu_count"] = int(torch.cuda.device_count())
+            if info["gpu_count"] > 0:
+                info["gpu_name"] = torch.cuda.get_device_name(0)
+    except Exception as e:
+        logger.debug(f"collect_hardware_info: cuda probe failed: {e}")
+
+    return info
+
+
+def collect_system_data() -> str | None:
+    """Collect device info and return as MinerSystemData-compatible JSON.
+
+    Thin wrapper around collect_hardware_info() that preserves the legacy
+    {gpus, chip_info, bandwidth?} shape used by older callers.
+    """
+    try:
+        hw = collect_hardware_info()
+        gpus: list[str] = []
+        if sys.platform == "darwin" and hw["cpu_brand"]:
+            gpus.append(hw["cpu_brand"])
+        if hw["gpu_name"]:
+            gpus.append(hw["gpu_name"])
+        memory_gb = hw["memory_bytes"] // (1024**3) if hw["memory_bytes"] else None
         data: dict = {
             "gpus": gpus,
             "chip_info": {
-                "machine": machine,
-                "cpu": cpu_brand,
-                "cores": cores,
+                "machine": hw["machine"],
+                "cpu": hw["cpu_brand"],
+                "cores": hw["cpu_cores"],
                 "memory_gb": memory_gb,
             },
         }
@@ -148,42 +197,31 @@ def create_metadata(tensor: torch.Tensor, num_sections: int) -> dict:
     Returns:
         dict: The metadata for the tensor.
     """
-    # Create metadata about the tensor
+    num_elements = tensor.numel()
+    element_size = tensor.itemsize
+
     tensor_metadata = {
         "dtype": str(tensor.dtype),
-        "size": tensor.size(),
-        "num_elements": tensor.numel(),
-        "element_size": tensor.itemsize,
-        "total_bytes": tensor.nbytes,  # this is just weights_tensor.numel() * weights_tensor.itemsize
+        "size": list(tensor.shape),  # plain list, no torch.Size reference
+        "num_elements": num_elements,
+        "element_size": element_size,
+        "total_bytes": num_elements * element_size,
     }
 
-    # Number of sections to split into (in elements, or indices)
-    section_size = tensor.numel() // num_sections
-    # Create section metadata
+    section_size = num_elements // num_sections
     sections_metadata = {}
 
     for i in range(int(num_sections)):
         start_idx = i * section_size
-        end_idx = start_idx + section_size if i < num_sections - 1 else tensor.numel()
-
-        # Calculate corresponding tensor indices
-        start_byte = start_idx * tensor_metadata["element_size"]
-        end_byte = end_idx * tensor_metadata["element_size"]
-
-        assert start_byte is not None and end_byte is not None, "Start byte and end byte are missing"
-        assert start_idx is not None and end_idx is not None, "Start idx and end idx are missing"
-
+        end_idx = start_idx + section_size if i < num_sections - 1 else num_elements
         sections_metadata[i] = {
-            "start_byte": start_byte,
-            "end_byte": end_byte,
-            "start_idx": start_idx,  # e.g for a (100,100) matrix divided into 10 sections, the indices are: 0-999. 1000 - 1999. 2000 - 2999. 3000 - 3999. 4000 - 4999. 5000 - 5999. 6000 - 6999. 7000 - 7999. 8000 - 8999. 9000 - 9999.
+            "start_byte": start_idx * element_size,
+            "end_byte": end_idx * element_size,
+            "start_idx": start_idx,
             "end_idx": end_idx,
         }
 
-    # Save full tensor metadata
-    full_metadata = {"tensor": tensor_metadata, "sections": sections_metadata}
-
-    return full_metadata
+    return {"tensor": tensor_metadata, "sections": sections_metadata}
 
 
 @async_lru(maxsize=5000)
@@ -335,6 +373,8 @@ async def upload_tensor(
     initiate_response = None
     existing_upload_urls = upload_urls is not None
 
+    _log_upload_ram("entry", file_type)
+
     # Reinterpret tensor memory as bytes in a consistent format (bfloat16 → uint8 bytes)
     # Always upload as bfloat16-backed bytes to match the downloader's default expectation.
     check_for_nans_and_infs(
@@ -342,9 +382,23 @@ async def upload_tensor(
         name=f"Uploading tensor of file type {file_type}",
         exception_type=NanInfException,
     )
+    _log_upload_ram("after_nan_inf_check", file_type)
 
     tensor = tensor.detach().to("cpu").to(torch.bfloat16).contiguous()
-    tensor = tensor.view(torch.uint8).numpy().tobytes()
+    _log_upload_ram("after_contiguous", file_type)
+
+    # Zero-copy buffer-protocol view of the tensor's raw bytes — avoids the
+    # ~11 GB Python `bytes` copy that .tobytes() would create here. The
+    # memoryview keeps the underlying tensor alive via its reference chain,
+    # so the buffer stays valid for the entire upload. gzip.compress, len(),
+    # slicing, and aiohttp.session.put(data=...) all accept memoryview.
+    #
+    # Validation signal: with .tobytes() the next log line would jump by
+    # ~len(tensor) GB vs. after_contiguous. With memoryview it should be flat.
+    _log_upload_ram("before_memoryview", file_type)
+    tensor = memoryview(tensor.view(torch.uint8).numpy())
+    _log_upload_ram("after_memoryview", file_type, payload_bytes=len(tensor))
+
     num_parts = calculate_num_parts(data=tensor)
     logger.info(f"Uploading {file_type} tensor with {num_parts} parts")
     multipart = num_parts > 1
@@ -355,6 +409,8 @@ async def upload_tensor(
 
     if run_flags.compress_s3_files.isOn():
         payload = gzip.compress(tensor)
+        del tensor
+        _log_upload_ram("after_gzip_compress", file_type, payload_bytes=len(payload))
     else:
         payload = tensor
 
@@ -386,6 +442,7 @@ async def upload_tensor(
                 raise Exception("Error initiating file upload")
 
         # Upload data to presigned urls
+        _log_upload_ram("before_s3_upload", file_type, payload_bytes=len(payload))
         async with TimerLoggerMiner(
             name="upload_multipart_to_s3", metadata={"file_type": file_type}, hotkey=hotkey.ss58_address[:8]
         ):
@@ -393,6 +450,7 @@ async def upload_tensor(
             parts: list[dict] | None = await MinerAPIClient.upload_to_s3(
                 urls=upload_urls, data=payload, upload_id=upload_id
             )
+        _log_upload_ram("after_s3_upload", file_type)
 
         # for multipart uploads, we need to manually complete the upload request
         if multipart:

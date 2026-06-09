@@ -19,7 +19,7 @@ import torch
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from common.iroh.timings import P2POperationTimings
+    from iota_sdk.p2p import P2POperationTimings
 
 
 @dataclass(slots=True)
@@ -310,6 +310,15 @@ class StatsTracker:
         if stats is None:
             return None
         return stats.model_dump()
+
+    def discard_activation_stats(self, activation_id: str) -> None:
+        """Evict the per-activation stats entry once its lifecycle ends.
+
+        The dict is keyed by unique activation_id and was previously never
+        pruned, causing host RAM to grow linearly with effective batch size
+        (microbatches × gradient_accumulation_steps) until OOM.
+        """
+        self.activation_stats.pop(activation_id, None)
 
     def _prune_activations(self, current_time: float, window_seconds: float) -> None:
         """Drop activation samples older than the requested window."""

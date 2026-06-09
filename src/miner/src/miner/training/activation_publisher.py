@@ -21,9 +21,9 @@ from common.models.run_flags import RunFlags, RUN_FLAGS
 from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
 from miner.utils.attestation_utils import AttestationUnavailableError, collect_attestation_payload
 from miner.utils.activation_hash import compute_activation_hash
-from common.iroh.activation_push import ActivationPushMessage, ActivationPushNackError
-from common.iroh.sender_subprocess import SenderUnavailableError
-from common.iroh.timings import P2POperationTimings
+from common.models.activation_push import ActivationPushMessage
+from miner.p2p import SenderUnavailableError
+from iota_sdk.p2p import ActivationPushNackError, P2POperationTimings
 from subnet.miner_api_client import MinerAPIClient
 from miner.sync import ComputeNode, NodeRegistry, SyncedVariable
 from miner.training.peer_selection import select_random

@@ -487,6 +487,11 @@ class TrainingPhase:
                     # Cleanup cache
                     del self._cache[activation_data.activation_id]
 
+                    # End of activation lifecycle: drop its stats entry so the
+                    # StatsTracker dict doesn't grow unboundedly with microbatches.
+                    if self._stats_tracker is not None:
+                        self._stats_tracker.discard_activation_stats(activation_data.activation_id)
+
                     # auto_max_cache: freeze max cache size after N backward activations
                     if self._run_flags.auto_max_cache.isOn() and not self._auto_max_cache_frozen:
                         if self.backwards_since_reset >= common_settings.N_BACKWARDS_FOR_CACHE_INCREASE_STOP:
@@ -651,10 +656,25 @@ class TrainingPhase:
         and queued work from the previous epoch are stale and must be discarded.
         """
         logger.debug("🗑️ Resetting for new epoch")
+        logger.info(
+            f"epoch_reset clearing: publishing_tasks={len(self._publisher._publishing_tasks)} "
+            f"outbound_qsize={self._publisher._outbound.qsize()} "
+            f"removal_tasks={len(self._cache._removal_tasks)} "
+            f"forward_queue={len(self._queue._forward_queue)} "
+            f"backward_queue={len(self._queue._backward_queue)}"
+        )
         self.local_optimization_steps = 0
         await self._cache.reset()
         self._queue._forward_queue.clear()
         self._queue._backward_queue.clear()
+
+        # Publisher state (outbound queue, _publishing_tasks, peer-lookup dict)
+        # otherwise only clears on re-registration, so it accumulates host RAM
+        # across the whole run. publisher.reset() cancels pending publishes,
+        # drains the outbound queue, clears the task list, and restarts the
+        # send loop so new activations can be drained after epoch reset.
+        await self._publisher.reset()
+
         log_gpu_memory_usage(note="after epoch reset")
 
     async def optimization_reset(self):

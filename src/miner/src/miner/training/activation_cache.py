@@ -154,4 +154,7 @@ class ActivationCache:
             logger.error(f"Error during cache reset, waiting for removal tasks to complete: {e}")
             raise
         finally:
+            # The gather above only awaits the tasks; without an explicit clear
+            # the list grows for the lifetime of the cache instance.
+            self._removal_tasks.clear()
             gpu_device.empty_cache()

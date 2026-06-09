@@ -23,10 +23,9 @@ from common.utils.exceptions import LayerStateException, MinerNotRegisteredExcep
 from common.utils.shared_states import LayerPhase
 from miner import settings as miner_settings
 
-from common.iroh.activation_push import ActivationPushMessage
-from common.iroh.timings import P2POperationTimings
+from common.models.activation_push import ActivationPushMessage
+from iota_sdk.p2p import P2POperationTimings, P2PRequestError
 from miner.utils.stats import StatsTracker, tensor_num_bytes
-from common.iroh.p2p_protocol import P2PRequestError
 from miner.telemetry.metric_registry import S3_DOWNLOAD_SPEED_BYTES_PER_SEC
 from common.models.run_flags import RunFlags
 from typing import TYPE_CHECKING
