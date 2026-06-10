@@ -39,8 +39,10 @@ class EpistulaHeaders(BaseModel):
 
         Args:
             body: The body of the request
-            now: The current time
-            timeout: The timeout in milliseconds
+            now: The current time in epoch seconds (`time.time()`)
+            timeout: Maximum request age in seconds
+
+        The Epistula-Timestamp header is epoch milliseconds (see generate_header).
 
         Returns:
             None if the signature is valid, otherwise an error message
@@ -61,7 +63,7 @@ class EpistulaHeaders(BaseModel):
 
             keypair = Keypair(ss58_address=self.signed_by)
 
-            if timestamp + timeout < now:
+            if timestamp + timeout * 1000 < now * 1000:
                 raise ValueError("Request is too stale")
             message = f"{sha256(body).hexdigest()}.{self.timestamp}."
 
