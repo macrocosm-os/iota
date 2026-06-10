@@ -1040,6 +1040,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 except aiohttp.ClientResponseError as e:
                     logger.info(f"🔄 Miner {self.hotkey[:8]} Client response error: {e}")
                     continue
+                except httpx.HTTPStatusError as e:
+                    logger.warning(
+                        f"🔄 Miner {self.hotkey[:8]} HTTP status error "
+                        f"({e.response.status_code} from {e.request.url}): {e}. Retrying..."
+                    )
+                    await asyncio.sleep(1)
+                    continue
                 except (aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
                     logger.warning(f"🔄 Miner {self.hotkey[:8]} Connection error (DNS/network): {e}. Retrying...")
                     await asyncio.sleep(5)
