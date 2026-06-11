@@ -9,28 +9,30 @@ from common.models.run_flags import RUN_FLAGS, RunFlags
 from common import settings as common_settings
 
 
-def _should_skip_ssl(url: str) -> bool:
+def should_skip_ssl(url: str) -> bool:
     """Return True if SSL verification should be skipped for localhost/minio URLs."""
     return "localhost" in url or "minio" in url or "127.0.0.1" in url
 
 
-async def upload_parts(urls: list[str], data: bytes, upload_id: str | None, max_retries: int = 3) -> list[dict]:
+async def upload_parts(urls: list[str], data: Any, upload_id: str | None, max_retries: int = 3) -> list[dict]:
     """Upload parts to S3 storage with retry logic.
 
     Args:
         urls (list[str]): The URLs to upload the parts to.
-        data (bytes): The data to upload.
+        data: The data to upload. bytes/bytearray/memoryview, or a ChainedBuffer
+            (zero-copy sliceable wrapper around header + tensor + trailer segments).
         upload_id (str): The upload ID.
         max_retries (int): Maximum number of retry attempts per part (default: 3).
 
     Returns:
         list[dict]: The parts that were uploaded.
     """
-    # Normalize to memoryview so subsequent slicing `data[i:j]` is zero-copy.
-    # If `data` is already bytes/bytearray/memoryview, memoryview(data) is a
-    # thin O(1) wrapper — no allocation. Avoids per-part bytes copies on
-    # multipart uploads of large tensors.
-    if not isinstance(data, memoryview):
+    # Wrap raw bytes/bytearray in a memoryview so per-part slicing `data[i:j]`
+    # is zero-copy. memoryview and ChainedBuffer (the wire-format blob wrapper)
+    # already return memoryview-backed slices and are passed through as-is —
+    # ChainedBuffer in particular does not implement the C buffer protocol, so
+    # an unconditional memoryview(data) would TypeError.
+    if isinstance(data, (bytes, bytearray)):
         data = memoryview(data)
 
     if len(urls) > 1 and upload_id is None:
@@ -47,7 +49,7 @@ async def upload_parts(urls: list[str], data: bytes, upload_id: str | None, max_
     # Configure timeout for S3 uploads - allow for larger files with reasonable timeout
     timeout = aiohttp.ClientTimeout(total=common_settings.S3_UPLOAD_TIMEOUT, connect=30)
     # Skip SSL verification for localhost/minio (self-signed certs in local dev)
-    connector = aiohttp.TCPConnector(ssl=False) if urls and _should_skip_ssl(urls[0]) else None
+    connector = aiohttp.TCPConnector(ssl=False) if urls and should_skip_ssl(urls[0]) else None
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         parts = []
 
@@ -140,7 +142,7 @@ async def upload_part(urls: list[str], data: bytes | memoryview, upload_id: str,
     # Configure timeout for S3 uploads
     timeout = aiohttp.ClientTimeout(total=common_settings.S3_UPLOAD_TIMEOUT, connect=30)
     # Skip SSL verification for localhost/minio (self-signed certs in local dev)
-    connector = aiohttp.TCPConnector(ssl=False) if _should_skip_ssl(url) else None
+    connector = aiohttp.TCPConnector(ssl=False) if should_skip_ssl(url) else None
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # Retry logic for the upload
         for attempt in range(max_retries + 1):  # +1 to include initial attempt
@@ -194,7 +196,7 @@ async def download_file(presigned_url: str, max_retries: int = 3, run_flags: Run
     """Download a file from S3 storage with retry logic."""
     timeout = aiohttp.ClientTimeout(total=common_settings.S3_DOWNLOAD_TIMEOUT)
     # Skip SSL verification for localhost/minio (self-signed certs in local dev)
-    connector = aiohttp.TCPConnector(ssl=False) if _should_skip_ssl(presigned_url) else None
+    connector = aiohttp.TCPConnector(ssl=False) if should_skip_ssl(presigned_url) else None
 
     for attempt in range(max_retries + 1):
         try:

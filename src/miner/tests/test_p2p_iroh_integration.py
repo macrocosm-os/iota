@@ -1,24 +1,15 @@
 """Integration tests for P2P activation transfer using iroh-cosmos."""
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 
 from common import settings as common_settings
 from miner.new_miner import Miner
-from miner.sync.variable import SyncedVariable, PollingLoop
 
 # Production now raises the iota_sdk version; this test exercises that
 # code path so it must catch the same class.
 from iota_sdk.p2p import P2PNotFoundError
-
-
-@pytest.fixture(autouse=True)
-def _stub_polling_loop(monkeypatch):
-    """Replace the shared PollingLoop with a no-op mock so tests don't
-    hit the bridge HTTP server (which isn't running locally)."""
-    monkeypatch.setattr(SyncedVariable, "polling_loop", MagicMock(spec=PollingLoop))
 
 
 @pytest.fixture(autouse=True)

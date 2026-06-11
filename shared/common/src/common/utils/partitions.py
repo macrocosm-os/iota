@@ -53,8 +53,7 @@ class MinerPartition(BaseModel):
     layer: int | None = None
     chunk_number: int | Literal["all"] = None
     miner_hotkey: str | None = None
-    weight_path: str | None = None
-    optimizer_state_path: str | None = None
+    blob_path: str | None = None
     other_miner_hotkey: str | None = None
 
     def matches(self, other: "MinerPartition") -> bool:
@@ -65,9 +64,7 @@ class MinerPartition(BaseModel):
         )
 
     def is_valid(self) -> bool:
-        if self.weight_path is None or self.optimizer_state_path is None:
-            return False
-        return True
+        return self.blob_path is not None
 
 
 async def get_start_and_end_indices(tensor_length: int, num_sections: int, target_section: int) -> tuple[int, int]:

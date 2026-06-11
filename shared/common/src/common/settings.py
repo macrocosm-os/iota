@@ -48,6 +48,8 @@ else:
 
     BRIDGE_URL = os.getenv("BRIDGE_URL", "https://iota.api.macrocosmos.ai/sync")
 
+BRIDGE_V2_URL = BRIDGE_URL.replace("/sync", "/bridge", 1).rstrip("/")
+
 ORCHESTRATOR_URL = f"{ORCHESTRATOR_SCHEMA}://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}"
 REQUEST_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", "3"))
 
@@ -56,6 +58,10 @@ CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", "40"))  # TODO:
 
 MIN_PART_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_PART_SIZE = 100 * 1024 * 1024  # 100MB
+
+# Self-describing blob wire format (see shared/common/src/common/utils/blob_format.py)
+BLOB_VERSION = 1
+BLOB_HEADER_LEN = 12  # version u16 + reserved u16 + trailer_offset u64
 
 # System Settings
 MAX_RETRIES = 3

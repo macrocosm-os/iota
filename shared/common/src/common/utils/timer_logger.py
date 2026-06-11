@@ -31,6 +31,8 @@ TIMER_NAMES = Literal[
     "compute_last_layer_loss",
     "submit_weights",
     "initiate_activation_upload",
+    "initiate_blob_upload",
+    "upload_multipart_blob_to_s3",
     "merge_partitions",
     "complete_file_upload_request",
 ]

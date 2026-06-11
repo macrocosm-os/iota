@@ -53,7 +53,7 @@ class FileUploadResponse(BaseModel):
 
 class FileUploadRequest(BaseModel):
     num_parts: int
-    file_type: Literal["weights", "optimizer_state", "activation", "weights_metadata"]
+    file_type: Literal["weights", "optimizer_state", "activation", "partition"]
     multipart: bool = True
 
     @model_validator(mode="after")
@@ -72,7 +72,6 @@ class GetTargetsRequest(BaseModel):
 
 class WeightUpdate(BaseModel):
     weights_path: str
-    weights_metadata_path: str
     attestation: "MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None" = None
 
 
@@ -150,8 +149,6 @@ class ActivationResponse(BaseModel):
 class SubmittedWeightsAndOptimizerPresigned(BaseModel):
     layer: int
     weights_path_presigned: str
-    weight_metadata_path_presigned: str
-    weight_metadata_path: str
     weighting_factor: int | None = None
 
 

@@ -10,7 +10,7 @@ import math
 
 import random
 
-from miner.sync.registry import ComputeNode
+from common.models.compute_node import ComputeNode
 
 
 def select_random(eligible: list[ComputeNode]) -> ComputeNode:
