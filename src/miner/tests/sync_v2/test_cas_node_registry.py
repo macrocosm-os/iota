@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 
 from common.models.compute_node import ComputeNode
-from miner.sync_v2.elastic_device_mesh import ElasticDeviceMesh
+from miner.sync_v2.elastic_device_mesh import _STALE_KEEPALIVE_SECONDS, ElasticDeviceMesh
 from miner.sync_v2.utils import sync_run_sync_prefix
 from miner.sync_v2.variable_manager import VariableManager
 
@@ -51,7 +51,7 @@ class _FakeBridgeStore:
             vid = update["var_id"]
             entry = self.vars.get(vid)
             if entry is None:
-                results.append({"var_id": vid, "status": "error", "error": "not found"})
+                results.append({"var_id": vid, "status": "error", "error": "VariableNotFound"})
                 continue
             if entry["write_rule"] == "CAS":
                 expected = update.get("current_version")
@@ -349,7 +349,7 @@ async def test_pull_evicts_peer_with_stale_keepalive():
     reg, mgr, store = await _started_registry()
     peer_slug = "stale_peer"
     try:
-        _seed_peer(store, peer_slug, last_keepalive=time.time() - 60)
+        _seed_peer(store, peer_slug, last_keepalive=time.time() - _STALE_KEEPALIVE_SECONDS - 60)
 
         await reg.pull()
 
@@ -377,11 +377,66 @@ async def test_pull_keeps_peer_with_recent_keepalive():
         await reg.stop()
 
 
+async def test_repulls_full_entry_after_eviction_by_peer():
+    """A live miner whose slug was evicted re-publishes its full record, not just last_keepalive."""
+    reg, _, store = await _started_registry()
+    try:
+        node = ComputeNode(node_id=OWN_NODE, p2p_node_ids=["abc123"], groups=["all", "layer-2"])
+        await reg.initialize(node)
+
+        # A peer evicts this miner: every leaf under its slug is deleted on the bridge.
+        for vid in [v for v in store.vars if v.startswith(f"{RUN_KEY}/node_registry/{OWN_NODE}/")]:
+            del store.vars[vid]
+
+        # The keepalive tick recreates only the dirty last_keepalive leaf.
+        d = reg._require_started()
+        d[OWN_NODE]["last_keepalive"].set(time.time())
+        await d.push_dirty()
+        assert set(store.vars) == {_leaf_var_id(OWN_NODE, "last_keepalive")}
+
+        # The next background pull sees the stripped entry and re-publishes the full record.
+        await d._after_pull(await d.wildcard_fetch("node_registry/*"))
+        await d.push_dirty()
+
+        assert store.vars[_leaf_var_id(OWN_NODE, "p2p_node_ids")]["value"] == ["abc123"]
+        assert store.vars[_leaf_var_id(OWN_NODE, "groups")]["value"] == ["all", "layer-2"]
+        assert store.vars[_leaf_var_id(OWN_NODE, "node_id")]["value"] == OWN_NODE
+        assert store.vars[_leaf_var_id(OWN_NODE, "joined_at")]["value"] == node.joined_at
+        assert OWN_NODE in {n.node_id for n in reg.all_nodes()}
+    finally:
+        await reg.stop()
+
+
+async def test_backfills_leaves_lost_to_partial_delete():
+    """Leaves missing from an otherwise-visible own entry are restored from the stored record."""
+    reg, _, store = await _started_registry()
+    try:
+        node = ComputeNode(node_id=OWN_NODE, p2p_node_ids=["abc123"])
+        await reg.initialize(node)
+
+        # A partial delete stripped joined_at, p2p_node_ids, and last_keepalive but left node_id.
+        del store.vars[_leaf_var_id(OWN_NODE, "joined_at")]
+        del store.vars[_leaf_var_id(OWN_NODE, "p2p_node_ids")]
+        del store.vars[_leaf_var_id(OWN_NODE, "last_keepalive")]
+
+        before_repair = time.time()
+        d = reg._require_started()
+        await d._after_pull(await d.wildcard_fetch("node_registry/*"))
+        await d.push_dirty()
+
+        assert store.vars[_leaf_var_id(OWN_NODE, "joined_at")]["value"] == node.joined_at
+        assert store.vars[_leaf_var_id(OWN_NODE, "p2p_node_ids")]["value"] == ["abc123"]
+        # Restored keepalive must be stamped fresh, not taken from the stored snapshot.
+        assert store.vars[_leaf_var_id(OWN_NODE, "last_keepalive")]["value"] >= before_repair
+    finally:
+        await reg.stop()
+
+
 async def test_pull_does_not_evict_own_entry_when_stale():
     reg, _, store = await _started_registry()
     try:
         ka_vid = _leaf_var_id(OWN_NODE, "last_keepalive")
-        store.vars[ka_vid]["value"] = time.time() - 120
+        store.vars[ka_vid]["value"] = time.time() - _STALE_KEEPALIVE_SECONDS - 60
 
         await reg.pull()
 
@@ -461,7 +516,7 @@ async def test_get_leader_after_eviction():
     reg, _, store = await _started_registry(own_node_id="node-newer")
     try:
         # Seed older peer with a stale keepalive so it gets evicted on pull
-        _seed_peer(store, "node-older", groups=["all"], last_keepalive=time.time() - 60)
+        _seed_peer(store, "node-older", groups=["all"], last_keepalive=time.time() - _STALE_KEEPALIVE_SECONDS - 60)
         store.vars[_leaf_var_id("node-older", "joined_at")] = {"value": 50.0, "version": 1, "write_rule": "CAS"}
         # Own node joined later
         store.vars[_leaf_var_id("node-newer", "joined_at")] = {"value": 200.0, "version": 1, "write_rule": "CAS"}

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 _REL_PREFIX = "node_registry"
 _KEEPALIVE_INTERVAL = 5.0
 _FRESH_PULL_WINDOW_SECONDS = 5.0
-_STALE_KEEPALIVE_SECONDS = 30.0
+_STALE_KEEPALIVE_SECONDS = 300.0
 
 
 def _bridge_key_segment(node_id: str) -> str:
@@ -64,6 +64,7 @@ class ElasticDeviceMesh:
     ) -> None:
         self._own_node_id = own_node_id
         self._own_slug = _bridge_key_segment(own_node_id)
+        self._own_node: ComputeNode | None = None  # last fully-published own record, for re-publication
         self._on_update = on_update
         self._run_key = sync_run_sync_prefix(run_id)
         self.p2p: P2PStack | None = p2p
@@ -182,6 +183,7 @@ class ElasticDeviceMesh:
         registration is complete and the compute node is fully configured.
         """
         d = self._require_started()
+        self._own_node = node
         entry = node.model_dump()
         entry["last_keepalive"] = time.time()
         for field, value in entry.items():
@@ -191,6 +193,8 @@ class ElasticDeviceMesh:
     async def register(self, node: ComputeNode) -> None:
         """Add or update any *node* — writes each ComputeNode field as its own leaf."""
         d = self._require_started()
+        if node.node_id == self._own_node_id:
+            self._own_node = node
         slug = _bridge_key_segment(node.node_id)
         for field, value in node.model_dump().items():
             d[slug][field].set(value)
@@ -335,6 +339,16 @@ class ElasticDeviceMesh:
     def _on_miner_update(self) -> None:
         """Re-stamp own entry and sync peer addresses after each pull."""
         entry = self.get(self._own_node_id)
+        if self._own_node is not None:
+            if entry is None:
+                # Evicted by a peer (or bridge lost state) — re-publish the full record.
+                logger.warning("[ElasticDeviceMesh] Own registry entry missing after pull — re-publishing full record")
+                entry = self._own_node.model_dump()
+            else:
+                # Backfill leaves lost to a partial delete.
+                for field, value in self._own_node.model_dump().items():
+                    entry.setdefault(field, value)
+            entry["last_keepalive"] = time.time()
         if entry is not None:
             self._stamp_own_entry(entry)
             self[self._own_node_id] = entry
