@@ -14,13 +14,13 @@ def calculate_n_partitions(n_miners: int, n_splits: int) -> int:
     return (n_miners // n_splits) * 2
 
 
-def calculate_num_parts(data: bytes) -> int:
-    """Calculate the number of parts to upload a file to S3.
+def compute_multipart_layout(total_bytes: int) -> tuple[int, bool]:
+    """Decide how many parts a blob of `total_bytes` should be split into.
 
-    Args:
-        data (bytes): The data to upload.
-
-    Returns:
-        int: The number of parts to upload.
+    Uses MIN_PART_SIZE as the target part size (more parts → more parallelism)
+    and clamps to MAX_NUM_PARTS. Returns `(num_parts, multipart)`.
     """
-    return int(math.ceil(len(data) / common_settings.MAX_PART_SIZE))
+    assert total_bytes > 0, "total_bytes must be positive"
+    num_parts = max(1, math.ceil(total_bytes / common_settings.MIN_PART_SIZE))
+    num_parts = min(num_parts, common_settings.MAX_NUM_PARTS)
+    return num_parts, num_parts > 1

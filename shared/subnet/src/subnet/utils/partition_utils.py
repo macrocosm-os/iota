@@ -10,6 +10,8 @@ from common.utils.exceptions import NanInfWarning, WeightPartitionException
 from common.utils.partitions import MinerPartition
 from common.utils.s3_utils import filter_exceptions
 from common.utils.partitions import get_start_and_end_indices
+from common.utils.blob_format import download_blob_trailer
+from subnet.utils.blob_format import download_blob_region
 from common.snowpipe.messages.training_metrics import TrainingMetric
 
 import torch
@@ -18,7 +20,6 @@ from platformdirs import user_data_dir
 
 from loguru import logger
 from subnet.utils.vector_utils import check_for_nans_and_infs
-from subnet.utils.s3_torch import download_tensor
 
 
 def _log_download_ram(tag: str, layer: int | None = None, extra: str = "") -> None:
@@ -79,7 +80,15 @@ def get_cosine_similarity(old_shard: torch.Tensor, new_shard: torch.Tensor) -> f
 
 
 async def download_partition_optimizer(partition: MinerPartition) -> torch.Tensor:
-    optimizer_state = await download_tensor(partition.optimizer_state_path, device="cpu", dtype=torch.bfloat16)
+    """Fetch the optimizer_state region from a partition blob."""
+    trailer = await download_blob_trailer(partition.blob_path)
+    region = trailer["regions"]["optimizer_state"]
+    optimizer_state = await download_blob_region(
+        partition.blob_path,
+        offset=region["offset"],
+        length=region["length"],
+        dtype=region["dtype"],
+    )
     return optimizer_state
 
 
@@ -154,16 +163,19 @@ async def download_merged_partitions(
                 extra=f"concurrent={len(batch_partitions)}",
             )
 
+            async def _fetch_partition_region(partition: MinerPartition) -> torch.Tensor:
+                trailer = await download_blob_trailer(partition.blob_path)
+                region = trailer["regions"][download_type]
+                return await download_blob_region(
+                    partition.blob_path,
+                    offset=region["offset"],
+                    length=region["length"],
+                    dtype=region["dtype"],
+                )
+
             try:
                 downloaded_tensors = await asyncio.gather(
-                    *[
-                        download_tensor(
-                            path=partition.weight_path,
-                            device="cpu",
-                            dtype=torch.bfloat16,
-                        )
-                        for partition in batch_partitions
-                    ],
+                    *[_fetch_partition_region(partition) for partition in batch_partitions],
                     return_exceptions=True,
                 )
                 _log_download_ram(

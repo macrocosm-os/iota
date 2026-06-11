@@ -25,7 +25,8 @@ from common.models.activation_push import ActivationPushMessage
 from miner.p2p import SenderUnavailableError
 from iota_sdk.p2p import ActivationPushNackError, P2POperationTimings
 from subnet.miner_api_client import MinerAPIClient
-from miner.sync import ComputeNode, NodeRegistry, SyncedVariable
+from common.models.compute_node import ComputeNode
+from miner.sync_v2.elastic_device_mesh import ElasticDeviceMesh
 from miner.training.peer_selection import select_random
 from miner import settings as miner_settings
 
@@ -37,8 +38,6 @@ if False:
 
 def _peer_matches_target_layer(node: ComputeNode, target_layer: int) -> bool:
     """Return True if ``node`` is considered to belong to ``target_layer``."""
-    if node.training_layer is not None:
-        return int(node.training_layer) == target_layer
     return f"layer-{target_layer}" in node.groups
 
 
@@ -97,7 +96,7 @@ class ActivationPublisher:
         miner_api_client: MinerAPIClient,
         miner: Miner,  # ty: ignore[invalid-type-form]
         run_flags: RunFlags | None = None,
-        node_registry: SyncedVariable[NodeRegistry] | None = None,
+        node_registry: ElasticDeviceMesh | None = None,
         peer_selector=None,
     ):
         self._miner_api_client = miner_api_client
@@ -464,17 +463,14 @@ class ActivationPublisher:
             target = item.target_p2p_node_ids
             target_ctx = f"peer=backward[{len(target)}] layer={item.msg.target_layer}"
             if self._node_registry is not None and item.msg.target_layer is not None:
-                nodes = self._node_registry.value.get_nodes_for_layer(item.msg.target_layer)
+                nodes = self._node_registry.get_group(f"layer-{item.msg.target_layer}")
                 p2p_set = set(item.target_p2p_node_ids)
                 if not any(n.p2p_node_ids and p2p_set & set(n.p2p_node_ids) for n in nodes):
                     logger.warning(
                         f"Backward targets {item.target_p2p_node_ids} not found among "
                         f"layer-{item.msg.target_layer} peers in registry "
-                        f"(activation {item.msg.activation_id}) — retrying"
+                        f"(activation {item.msg.activation_id}) — sending anyway"
                     )
-                    await asyncio.sleep(1.0)
-                    self._outbound.put_nowait(item)
-                    return
         else:
             # Forward: select peer from registry
             if self._node_registry is None:
@@ -482,8 +478,7 @@ class ActivationPublisher:
                 return
             layer_key = item.next_layer
             assert layer_key is not None
-            registry = self._node_registry.value
-            nodes = registry.get_nodes_for_layer(layer_key)
+            nodes = self._node_registry.get_group(f"layer-{layer_key}")
             # A peer is eligible only if it has BOTH a p2p node id and at least
             # one address hint (relay URL or direct sockaddr). Iroh discovery is
             # disabled, so a peer with only a node_id is not dialable — skip it
@@ -491,11 +486,10 @@ class ActivationPublisher:
             eligible = [n for n in nodes if n.p2p_node_ids and (n.iroh_relay_url or n.iroh_direct_addresses)]
             if not eligible:
                 self._forward_peer_lookup_was_empty[layer_key] = True
-                all_nodes = registry.all_nodes()
+                all_nodes = self._node_registry.all_nodes()
                 node_summary = (
                     "; ".join(
-                        f"{n.node_id[:12]}… layer={n.training_layer} "
-                        f"groups={n.groups} p2p={len(n.p2p_node_ids)} "
+                        f"{n.node_id[:12]}… groups={n.groups} p2p={len(n.p2p_node_ids)} "
                         f"relay={'y' if n.iroh_relay_url else 'n'} "
                         f"direct={len(n.iroh_direct_addresses)}"
                         for n in all_nodes

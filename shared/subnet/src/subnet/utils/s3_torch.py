@@ -3,22 +3,16 @@ from time import time
 from loguru import logger
 
 import asyncio
-from asyncio.exceptions import TimeoutError
 
 import aiohttp
 from common.utils.exceptions import NanInfWarning
-from common.models.miner_models import ChunkMetadata
 from common.models.run_flags import RUN_FLAGS, RunFlags
+from common.utils.s3_utils import should_skip_ssl
 from subnet.model.utils import log_gpu_memory_usage
 from subnet.utils.vector_utils import check_for_nans_and_infs
 
 import torch
 import numpy as np
-
-
-def _should_skip_ssl(url: str) -> bool:
-    """Return True if SSL verification should be skipped for localhost/minio URLs."""
-    return "localhost" in url or "minio" in url or "127.0.0.1" in url
 
 
 class AioHttpClientWithOpenSession:
@@ -50,7 +44,7 @@ class AioHttpClientWithOpenSession:
         return self.session
 
     async def get(self, url: str):
-        skip_ssl = _should_skip_ssl(url)
+        skip_ssl = should_skip_ssl(url)
         session = await self._get_or_create_session(skip_ssl)
         response = await session.get(url)
         return response
@@ -157,74 +151,6 @@ async def download_tensor(
 
         except Exception as e:
             logger.error(f"Error downloading tensor: {e}")
-            raise
-
-
-async def download_weights_or_optimizer_state(
-    metadata_info: ChunkMetadata,
-    max_retries: int = 3,
-) -> torch.Tensor:
-    """Download weights from S3 storage with retry logic."""
-    start_time = time()
-    timeout = aiohttp.ClientTimeout(total=3000)  # 5 minute timeout
-    # Skip SSL verification for localhost/minio (self-signed certs in local dev)
-    connector = aiohttp.TCPConnector(ssl=False) if _should_skip_ssl(metadata_info.tensor_path) else None
-
-    for attempt in range(max_retries + 1):
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                # if partition is not specified, download the full tensor
-                byte_range = f"bytes={metadata_info.start_byte}-{metadata_info.end_byte - 1}"
-                async with session.get(metadata_info.tensor_path, headers={"Range": byte_range}) as response:
-                    if response.status > 299:
-                        response.raise_for_status()
-                    binary_data = await response.read()
-
-            if RUN_FLAGS.compress_s3_files.isOn():
-                binary_data = gzip.decompress(binary_data)
-
-            section_numpy = np.frombuffer(binary_data, dtype=np.uint8)
-            section_torch = torch.from_numpy(section_numpy.copy())
-            # assumes default dtype if not specified
-            section_torch = section_torch.view(getattr(torch, metadata_info.chunk_dtype))
-            return section_torch
-
-        except TimeoutError as e:
-            logger.error(
-                f"Timeout error downloading weights or optimizer state: {e}. Time taken: {time() - start_time} seconds. Started download at {start_time}."
-            )
-            raise
-        except (aiohttp.ClientResponseError, aiohttp.ClientConnectorDNSError, aiohttp.ClientConnectorError) as e:
-            # Determine if error is retryable
-            is_retryable = False
-            error_type = "Unknown error"
-
-            if isinstance(e, aiohttp.ClientResponseError):
-                if e.status >= 500 or e.status == 429:
-                    is_retryable = True
-                    error_type = f"HTTP {e.status}"
-                else:
-                    logger.error(f"HTTP error downloading weights or optimizer state: {e}")
-                    raise
-            else:  # ClientConnectorDNSError or ClientConnectorError
-                is_retryable = True
-                error_type = "DNS/network"
-
-            if is_retryable:
-                if attempt < max_retries:
-                    delay = 2**attempt
-                    logger.warning(
-                        f"Retryable error ({error_type}) downloading weights or optimizer state from R2: {e}. Retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logger.warning(
-                        f"Retryable error ({error_type}) downloading weights or optimizer state from R2: {e}. Failed after {max_retries + 1} attempts. This is likely a temporary issue."
-                    )
-                    raise
-        except Exception as e:
-            logger.error(f"Error downloading weights or optimizer state: {e}")
             raise
 
 

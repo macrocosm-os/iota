@@ -23,9 +23,11 @@ from common.snowpipe.messages.lifecycle_events import LifecycleEvent
 from common.utils.location_utils import resolve_node_location
 from common.utils.verify_enclave_signature import payload_base64_from_obj
 from common.utils.epistula import sign_p2p_request
-
-from miner.sync import NodeRegistry, SyncedNode
-from miner.sync.variable import SyncedVariable, sync_run_sync_prefix
+from miner.sync_v2.utils import sync_run_sync_prefix
+from miner.sync_v2.elastic_device_mesh import ElasticDeviceMesh
+from common.models.compute_node import ComputeNode
+from miner.sync_v2.variable_manager import VariableManager
+from common import settings as common_settings
 from miner.utils.node_control_mixin import NodeControlMixin
 from miner.utils.miner_dashboard_api import start_visualization_server
 from miner.utils.partition_merging import download_previous_optimizer_state_for_partition_batch, merge_partition_batch
@@ -42,16 +44,13 @@ from miner.utils.stats import StatsTracker
 from subnet.common_api_client import CommonAPIClient
 from miner.health_server import HealthServerMixin
 from miner.utils.partition_merging import (
-    filter_bad_metadata,
     get_weight_partition_info,
 )
 from miner import settings as miner_settings
 from miner.state_manager import StateManager
 from miner.utils.utils import (
     collect_system_data,
-    create_metadata,
-    upload_file,
-    upload_tensor,
+    upload_weights_blob,
     wait_for_state,
 )
 from miner.utils.run_utils import identify_best_run
@@ -86,7 +85,6 @@ from common.models.api_models import (
     WeightUpdate,
 )
 from subnet.utils.vector_utils import flatten_optimizer_state
-from common.models.miner_models import ChunkMetadata
 from common.utils.exceptions import (
     APIException,
     LayerStateException,
@@ -106,7 +104,6 @@ from common.utils.exceptions import (
 from common.utils.partitions import MinerPartition
 from common.utils.shared_states import LayerPhase
 from common.models.run_flags import RUN_FLAGS, RunFlags
-from common import settings as common_settings
 from subnet.base.base_neuron import BaseNeuron
 from subnet.miner_api_client import MinerAPIClient
 from subnet.model.utils import _clean_gpu_memory, log_gpu_memory_usage
@@ -166,12 +163,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.need_to_pull_weights = True
         self._needs_local_optimizer_state_download: bool = False
 
-        # Initialize compute node and node registry before referencing them elsewhere
-        self.compute_node = SyncedNode(node_id=self.wallet.hotkey.ss58_address, server_url=common_settings.BRIDGE_URL)
-        self.compute_node.peer_eviction_enabled = self.run_flags.peer_eviction.isOn()
-        self.compute_node.set_stamp_entry(self._stamp_registry_entry)
-
-        self.node_registry: SyncedVariable[NodeRegistry] | None = None
+        # Initialize own identity and node registry before referencing them elsewhere
+        self._own_node_id: str = self.wallet.hotkey.ss58_address
+        self._own_compute_node = ComputeNode(node_id=self._own_node_id)
+        self.elastic_device_mesh: ElasticDeviceMesh | None = None
+        self._bridge_manager = VariableManager(url=common_settings.BRIDGE_V2_URL)
 
         self.stats_tracker = StatsTracker()
 
@@ -225,77 +221,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self._peer_semaphores: dict[str, asyncio.Semaphore] = {}
         self._peer_semaphores_lock = asyncio.Lock()
         self._max_concurrent_per_peer = 2  # Based on benchmark: BI degrades at concurrency >= 5
-
-        # Tracks the (relay_url, direct_addresses) we last pushed to the sender
-        # subprocess for each peer, so we don't fire IPC calls when nothing changed.
-        self._registered_peer_addrs: dict[str, tuple[str | None, tuple[str, ...]]] = {}
-
-    def _stamp_registry_entry(self, entry: dict) -> dict:
-        """Ensure all miner-owned fields are present on a registry entry.
-
-        Called both from explicit write sites and from the ``on_update``
-        callback so that fields this miner is authoritative for
-        (``p2p_node_ids``, layer ``groups``) are never lost — not even when a
-        remote fetch or :meth:`~miner.sync.registry.NodeRegistry.apply_full_value`
-        re-injection overwrites the dict with stale data.
-        """
-        if self.p2p is not None:
-            entry["p2p_node_ids"] = self.p2p.node_ids
-            entry["iroh_relay_url"] = self.p2p.relay_url
-            entry["iroh_direct_addresses"] = self.p2p.direct_addresses
-        if self.state_manager.run_id is not None:
-            entry["groups"] = ["all", f"layer-{self.state_manager.layer}"]
-            entry["training_layer"] = self.state_manager.layer
-        return entry
-
-    def _on_registry_update(self, registry: NodeRegistry) -> None:
-        """Re-stamp our own entry after every remote fetch.
-
-        The miner is authoritative for its own ``p2p_node_ids``.  A
-        fetch from Redis may carry stale values for this field; this
-        callback restores it immediately so the next push sends the
-        correct data back.
-
-        Also forwards peer ``(relay_url, direct_addresses)`` hints from the
-        registry into the sender subprocess's address book so dials skip
-        n0 DNS discovery on first contact.
-        """
-        node_id = self.compute_node.compute_node.node_id
-        entry = registry.get(node_id)
-        if entry is not None:
-            self._stamp_registry_entry(entry)
-            registry[node_id] = entry
-
-        self._sync_peer_addrs_to_sender(registry, own_node_id=node_id)
-
-    def _sync_peer_addrs_to_sender(self, registry: NodeRegistry, own_node_id: str) -> None:
-        """Push every peer's iroh address hints into the sender subprocess.
-
-        Skips the own node and skips peers whose hints are unchanged since the
-        last call (so this is safe to invoke on every registry fetch).
-        """
-        sender = self.p2p.sender if self.p2p is not None else None
-        if sender is None:
-            return
-        for raw in registry.values():
-            if not isinstance(raw, dict):
-                continue
-            peer_hotkey = raw.get("node_id")
-            if peer_hotkey == own_node_id:
-                continue
-            relay_url = raw.get("iroh_relay_url")
-            direct_addresses = tuple(raw.get("iroh_direct_addresses") or [])
-            if relay_url is None and not direct_addresses:
-                continue
-            for p2p_node_id in raw.get("p2p_node_ids") or []:
-                key = (relay_url, direct_addresses)
-                if self._registered_peer_addrs.get(p2p_node_id) == key:
-                    continue
-                self._registered_peer_addrs[p2p_node_id] = key
-                asyncio.create_task(
-                    sender.register_peer(p2p_node_id, relay_url, list(direct_addresses), hotkey=peer_hotkey),
-                    name=f"register-peer-{p2p_node_id[:8]}",
-                )
 
     async def _collect_attestation_payload(
         self, action: str
@@ -423,7 +348,8 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         # Advertise P2PStack receiver IDs so peers can push activations
         # and route status broadcasts to us.
-        self.compute_node._write_own_entry()
+        if self.elastic_device_mesh is not None:
+            await self.elastic_device_mesh.initialize(node=self._own_compute_node)
         logger.info(f"P2P node IDs: {self.p2p.node_ids}")
 
     async def _bridge_push_queue(self) -> None:
@@ -480,7 +406,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         for adj in [layer - 1, layer + 1]:
             if adj < 0:
                 continue
-            peers = self.node_registry.value.get_nodes_for_layer(adj)
+            peers = self.elastic_device_mesh.get_group(f"layer-{adj}")
             for peer in peers:
                 if peer.p2p_node_ids:
                     for nid in peer.p2p_node_ids:
@@ -544,65 +470,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             f"sample: [{'; '.join(sample_lines)}]"
         )
 
-    def _sync_valid_hotkeys(self) -> None:
-        """Publish currently-registered hotkeys into the receiver's run-scope filter.
-
-        ``/peer/status`` from any hotkey not present in this dict is dropped at the
-        receiver subprocess (see ``handle_peer_status``), keeping cross-run noise
-        out of ``peer_status_dict``.
-        """
-        if self.p2p is None:
-            return
-        valid_dict = self.p2p.valid_hotkeys_dict
-        if valid_dict is None:
-            return
-
-        registered = {node.node_id for node in self.node_registry.value.all_nodes()}
-        try:
-            existing = set(valid_dict.keys())
-        except Exception:
-            return
-        for hotkey in registered - existing:
-            valid_dict[hotkey] = True
-        for hotkey in existing - registered:
-            valid_dict.pop(hotkey, None)
-
-    def _sync_peer_status_into_registry(self) -> None:
-        """Read received peer status from the shared dict and merge into ComputeNode entries."""
-        if self.p2p is None:
-            return
-        peer_dict = self.p2p.peer_status_dict
-        if peer_dict is None:
-            return
-
-        # Snapshot the shared dict to avoid holding the proxy lock
-        try:
-            snapshot = dict(peer_dict)
-        except Exception:
-            return
-
-        # Build hotkey → node_id index from registry
-        hotkey_to_node_id: dict[str, str] = {}
-        for node in self.node_registry.value.all_nodes():
-            hotkey_to_node_id[node.node_id] = node.node_id  # node_id IS the hotkey
-
-        for source_hotkey, (status_dict, received_at) in snapshot.items():
-            node_id = hotkey_to_node_id.get(source_hotkey)
-            if node_id is None:
-                continue
-            entry = self.node_registry.value.get(node_id)
-            if entry is None:
-                continue
-            entry = dict(entry)
-            status_dict["last_status_received"] = received_at
-            entry["runtime_metrics"] = status_dict
-            self.node_registry.value[node_id] = entry
-
     async def _peer_status_broadcast_loop(self) -> None:
         """Background task: broadcast peer status to adjacent-layer miners
         and sync received status into the node registry.
 
-        Stale node eviction is handled by SyncedNode._lead_check_loop.
+        Stale node eviction: entries linger until each peer's own push overwrites them.
         """
         broadcast_interval = miner_settings.PEER_STATUS_BROADCAST_INTERVAL_SECONDS
         while True:
@@ -612,12 +484,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 logger.debug(f"Peer status broadcast error: {exc}")
 
             try:
-                self._sync_valid_hotkeys()
+                if self.elastic_device_mesh is not None:
+                    self.elastic_device_mesh.sync_valid_hotkeys()
             except Exception as exc:
                 logger.debug(f"Valid hotkeys sync error: {exc}")
 
             try:
-                self._sync_peer_status_into_registry()
+                if self.elastic_device_mesh is not None:
+                    self.elastic_device_mesh.sync_peer_status_into_registry()
             except Exception as exc:
                 logger.debug(f"Peer status sync error: {exc}")
 
@@ -640,6 +514,8 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         if self.p2p is not None:
             await self.p2p.stop()
             self.p2p = None
+            if self.elastic_device_mesh is not None:
+                self.elastic_device_mesh.p2p = None
 
     @property
     def p2p_node_id(self) -> str | None:
@@ -843,7 +719,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             logger.info(
                 f"🔄 Miner {self.hotkey[:8]} in Layer {self.state_manager.layer} is in state: {self.miner_api_client.layer_state}"
             )
-            logger.info(f"🔄 Node registry: {pprint.pformat(self.node_registry.value)}")
+            logger.info(f"🔄 Node registry: {pprint.pformat(self.elastic_device_mesh.to_dict())}")
 
             if self.miner_api_client.layer_state == LayerPhase.TRAINING:
                 if self.need_to_pull_weights:
@@ -1114,17 +990,9 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         if self.visualization_auto_open:
             self._open_visualization_tab(f"http://localhost:{self.visualization_port}/vis.html")
 
-        if self.telemetry_service:
-            try:
-                await self.telemetry_service.start()
-            except Exception as e:
-                logger.error(f"Failed to start telemetry service, continuing without telemetry: {e}")
-                self.telemetry_service = None
-
         await self.report_training_state(state="resetting")
         await self.reset_miner_state()
 
-        await self.compute_node.start()
         await self._initialize_node_registry()
 
         logger.info(f"🚀 Starting miner {self.hotkey[:8]} on layer {self.layer} | Timeout: {miner_settings.TIMEOUT}s")
@@ -1141,18 +1009,19 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             )
             await self.training_loop()
         finally:
-            await self.compute_node.stop()
+            if self.elastic_device_mesh is not None:
+                await self.elastic_device_mesh.stop()
 
-    async def _create_node_registry(self, run_id: str):
-        if self.node_registry is not None:
-            self.node_registry._polling_loop.unregister(self.node_registry)
-        self.node_registry = SyncedVariable(
-            variable_id=f"{sync_run_sync_prefix(run_id)}/node_registry",
-            default=NodeRegistry(),
-            on_update=self._on_registry_update,
+    async def _create_node_registry(self, run_id: str, layer: int, p2p: P2PStack) -> None:
+        if self.elastic_device_mesh is not None:
+            await self.elastic_device_mesh.stop()
+        self.elastic_device_mesh = ElasticDeviceMesh(
+            run_id=run_id,
+            own_node_id=self._own_node_id,
+            groups=["all", f"layer-{layer}"],
+            p2p=p2p,
         )
-        self.compute_node.bind_registry(self.node_registry)
-        self.compute_node._write_own_entry()
+        await self.elastic_device_mesh.start_background_sync(self._bridge_manager)
 
     async def _apply_registration_response(self, response: MinerRegistrationResponse):
         """
@@ -1192,9 +1061,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.model_manager.epoch_counter = 0
 
         layer_groups = ["all", f"layer-{assigned_layer}"]
-        self.compute_node.compute_node = self.compute_node.compute_node.model_copy(
-            update={"groups": layer_groups, "training_layer": assigned_layer}
-        )
+        self._own_compute_node = self._own_compute_node.model_copy(update={"groups": layer_groups})
 
         self._update_run_flags(response.run_flags)
 
@@ -1205,19 +1072,17 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             run_id=self.run_id,
         )
 
-        await self._create_node_registry(run_id=response.run_id)
+        await self._create_node_registry(run_id=response.run_id, layer=assigned_layer, p2p=self.p2p)
         await self._setup_training_phase()
 
         if sync_run_sync_prefix(old_run_id) != sync_run_sync_prefix(response.run_id):
-            self.node_registry.rebind_namespace(sync_run_sync_prefix(response.run_id))
             # Pull existing registry from the bridge so we merge with peers
             # that already registered under this run, rather than overwriting
             # with a single-node snapshot.
             try:
-                await self.node_registry.pull()
+                await self.elastic_device_mesh.pull()
             except Exception as exc:
-                logger.warning(f"Failed to pull node_registry after rebind (proceeding with local): {exc}")
-            self.node_registry.value.register(self.compute_node.compute_node)
+                logger.warning(f"Failed to pull node_registry after run change (proceeding with local): {exc}")
 
         logger.success(
             f"✅ Miner {self.hotkey[:8]} registered successfully in layer {assigned_layer} on training epoch {current_epoch}"
@@ -1225,11 +1090,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         logger.debug(f"Run flags for miner {self.hotkey[:8]}: {self.run_flags}")
 
         try:
-            # Temp try/except to catch errors in the node registry push
-            # Advertise layer membership so peers can find us for push routing.
-            self.compute_node._write_own_entry()
-
-            await self.node_registry.push()
+            await self.elastic_device_mesh.initialize(self._own_compute_node)
         except Exception as e:
             logger.error(f"Error pushing node registry: {e}")
             raise
@@ -1297,7 +1158,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             run_flags=self.run_flags,
             mock=self.mock,
             is_mounted=miner_settings.IS_MOUNTED,
-            node_registry=self.node_registry,
+            node_registry=self.elastic_device_mesh,
             miner=self,
         )
         self.training_phase.attach_stats_tracker(self.stats_tracker)
@@ -1352,6 +1213,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         await self._apply_registration_response(response)
         await self.register_set_status(status="registered")
+
+        if self.telemetry_service:
+            try:
+                await self.telemetry_service.start()
+            except Exception as e:
+                logger.error(f"Failed to start telemetry service, continuing without telemetry: {e}")
+                self.telemetry_service = None
 
         # Emit a location lifecycle event so geographic data is persisted to Snowflake
         if self._node_location is not None and self.telemetry_service is not None:
@@ -1592,38 +1460,23 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 )
                 self._log_resources("after_check_nan_inf")
 
-                metadata: dict = create_metadata(tensor=pseudo_gradients, num_sections=self.num_partitions)
-                self._log_resources("after_create_metadata")
-                metadata["local_optimization_steps"] = self.training_phase.local_optimization_steps
-                self._log_resources("after_set_local_optimization_steps")
-
                 logger.info(
-                    f"submit_weights: uploading weights for {self.num_partitions} partitions "
-                    f"(1 weights S3 upload + 1 metadata S3 upload + 1 API submit call)"
+                    f"submit_weights: uploading self-describing weights blob "
+                    f"for {self.num_partitions} partitions (1 S3 upload + 1 API submit call)"
                 )
-                self._log_resources("before_upload_tensor")
-                # Convert tensor to bytes, handling bfloat16 compatibility
-                path = await upload_tensor(
+                path = await upload_weights_blob(
                     tensor=pseudo_gradients,
+                    num_sections=self.num_partitions,
                     file_type="weights",
                     hotkey=self.wallet.hotkey,
                     miner_api_client=self.miner_api_client,
-                    run_flags=self.run_flags,
-                )
-
-                # Upload metadata as activation type since orchestrator doesn't have a metadata type
-                metadata_path = await upload_file(
-                    miner_api_client=self.miner_api_client,
-                    data=json.dumps(metadata).encode(),
-                    file_type="weights_metadata",
-                    hotkey=self.wallet.hotkey,
+                    local_optimization_steps=self.training_phase.local_optimization_steps,
                     run_flags=self.run_flags,
                 )
 
                 response: WeightSubmitResponse = await self.miner_api_client.submit_weights(
                     weight_update=WeightUpdate(
                         weights_path=path.object_path,
-                        weights_metadata_path=metadata_path,
                         attestation=attestation_payload,
                     ),
                 )
@@ -1641,12 +1494,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                             dtype=torch.bfloat16,
                         )
 
-                        # Upload optimizer state tensor
-                        optimizer_state_upload = await upload_tensor(
+                        # Upload optimizer state as a self-describing single-section blob
+                        optimizer_state_upload = await upload_weights_blob(
                             tensor=flat_optimizer_state,
+                            num_sections=1,
                             file_type="optimizer_state",
                             hotkey=self.wallet.hotkey,
                             miner_api_client=self.miner_api_client,
+                            local_optimization_steps=self.training_phase.local_optimization_steps,
                             run_flags=self.run_flags,
                         )
 
@@ -1789,6 +1644,18 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 except Exception as e:
                     logger.error(f"Failed to stop telemetry service: {e}")
 
+                try:
+                    if self.elastic_device_mesh is not None:
+                        await self.elastic_device_mesh.stop()
+                except Exception as e:
+                    logger.error(f"Failed to stop node registry: {e}")
+
+                try:
+                    await self._bridge_manager.stop()
+                    logger.info("Bridge v2 variable manager stopped")
+                except Exception as e:
+                    logger.error(f"Failed to stop bridge variable manager: {e}")
+
             except Exception as e:
                 logger.error(f"Failed to shutdown miner: {e}")
 
@@ -1805,22 +1672,22 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         logger.info("🔄 Resetting miner entire state!")
         self.need_to_pull_weights = True
 
+        if self.elastic_device_mesh is not None:
+            await self.elastic_device_mesh.stop()
+
+        # Stop the telemetry service
+        try:
+            if self.telemetry_service:
+                await self.telemetry_service.stop()
+                logger.info("Telemetry service stopped")
+        except Exception as e:
+            logger.error(f"Failed to stop telemetry service: {e}")
+
         old_run_id = self.state_manager.run_id
         old_layer = self.state_manager.layer
 
-        # Stop the SyncedVariable PollingLoop while we re-register so it can't keep
-        # pushing stale state under the old run's namespace. register_loop()
-        # rebinds variables to the new run; we restart the loop after it returns.
-        polling_loop = SyncedVariable.polling_loop
-
-        if polling_loop is not None:
-            polling_loop.unregister_all()
-            await polling_loop.stop()
-
         # We provide the model config and metadata so that all miners are aligned.
         model_config, model_metadata = await self.register_loop()
-        if polling_loop is not None:
-            polling_loop.start()
         # Determine if miner is new to this layer (needs to download layer-specific local optimizer state)
         # This is true if:
         # - Brand new registration (old_run_id is None)
@@ -1903,22 +1770,17 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             metadata={"hotkey": self.hotkey[:8], "layer": self.state_manager.layer},
             hotkey=self.hotkey[:8],
         ):
-            filtered_metadata: dict[str, dict[int, dict[str, ChunkMetadata]]] = await filter_bad_metadata(
-                partitions=partitions,
-                submitted_weights_and_optimizers=weight_path_per_layer,
-                run_flags=self.run_flags,
-            )
             n_batches = min(miner_settings.N_PARTITION_BATCHES, len(partitions))
-            total_pseudograd_downloads = len(partitions) * len(filtered_metadata)
+            total_pseudograd_downloads = len(partitions) * len(weight_path_per_layer)
             total_optimizer_downloads = len(partitions)
-            total_s3_uploads = len(partitions) * 3
+            total_s3_uploads = len(partitions)
             logger.info(
                 f"merge_partitions: {len(partitions)} partitions across {n_batches} batches | "
-                f"{len(filtered_metadata)} miners contributing | "
-                f"expected requests: {len(weight_path_per_layer)} metadata + "
+                f"{len(weight_path_per_layer)} miners contributing | "
+                f"expected requests: {len(weight_path_per_layer)} blob-trailer (cached) + "
                 f"{total_pseudograd_downloads} pseudograd + "
                 f"{total_optimizer_downloads} optimizer downloads + "
-                f"{total_s3_uploads} S3 uploads + {n_batches} API submit calls"
+                f"{total_s3_uploads} blob S3 uploads + {n_batches} API submit calls"
             )
 
             async def submit_batch(final_partitions: list[MinerPartition]) -> None:
@@ -1941,9 +1803,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 batch_partitions: list[MergingPartition] = get_partition_batch(batch_index=batch, partitions=partitions)
                 logger.debug(f"{len(batch_partitions)} batch partitions grabbed")
 
-                # Download the weights for the batch (fills partitions.weights with a list of all pseudograds from all the other miners)
-                merging_partitions: list[MergingPartition] = await download_pseudograds_for_partition_batch(
-                    batch_partitions=batch_partitions, filtered_metadata=filtered_metadata
+                # Download the weights for the batch. Returns the (filtered) source
+                # miner list whose trailer fetch succeeded; this is positionally
+                # aligned with each partition.pseudograds, and is reused below for
+                # weighted averaging.
+                merging_partitions, valid_sources = await download_pseudograds_for_partition_batch(
+                    batch_partitions=batch_partitions,
+                    submitted_weights_list=weight_path_per_layer,
+                    run_flags=self.run_flags,
                 )
                 logger.debug(f"{len(merging_partitions)} batch partitions downloaded successfully")
 
@@ -2006,7 +1873,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
                 merged_partitions = await merge_partition_batch(
                     partition_batch=merging_partitions,
-                    filtered_metadata=filtered_metadata,
+                    submitted_weights_list=valid_sources,
                     old_model=old_model,
                     weights_length=weights_length,
                     num_partitions=self.num_partitions,

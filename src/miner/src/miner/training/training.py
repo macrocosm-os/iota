@@ -24,8 +24,9 @@ from miner.training.activation_cache import ActivationData, ActivationCache
 from miner.training.activation_queue import ActivationQueue
 from miner.training.activation_publisher import ActivationPublisher
 from miner.training.peer_selection import select_by_capacity
-from miner.sync import DistributedCounter, NodeRegistry, SyncedVariable
-from miner.sync.variable import sync_run_sync_prefix
+from miner.sync_v2.counter import SyncedCounter
+from miner.sync_v2.elastic_device_mesh import ElasticDeviceMesh
+from miner.sync_v2.utils import sync_run_sync_prefix
 from miner.telemetry.metric_registry import (
     ACTIVATIONS_PROCESSED_TOTAL,
     BACKWARD_PASS_DURATION_SECONDS,
@@ -46,7 +47,7 @@ class TrainingPhase:
         device: str,
         run_flags: RunFlags,
         mock: bool,
-        node_registry: SyncedVariable[NodeRegistry],
+        node_registry: ElasticDeviceMesh,
         miner: Miner,  # ty: ignore[invalid-type-form]
         is_mounted: bool = False,
     ):
@@ -92,7 +93,7 @@ class TrainingPhase:
         self._loss_on_cpu: bool = False
         self.node_registry = node_registry
         # Counter is created lazily after registration so Redis keys include ``run_id``.
-        self._backward_counter: DistributedCounter | None = None
+        self._backward_counter: SyncedCounter | None = None
         self._counter_started: bool = False
         self._lr_scheduler = make_lr_scheduler()
 
@@ -103,7 +104,7 @@ class TrainingPhase:
             self._backward_counter = None
         self._counter_started = False
 
-    async def _ensure_backward_counter(self) -> DistributedCounter:
+    async def _ensure_backward_counter(self) -> SyncedCounter:
         """Build or replace the backward counter for the current run and layer."""
         ns = sync_run_sync_prefix(self._state_manager.run_id)
         name = f"global_backward_count_{self._state_manager.layer}"
@@ -115,11 +116,10 @@ class TrainingPhase:
             return self._backward_counter
         if self._backward_counter is not None:
             await self._backward_counter.stop()
-        self._backward_counter = DistributedCounter(
+        self._backward_counter = SyncedCounter(
             name=name,
-            server_url=common_settings.BRIDGE_URL.rstrip("/"),
             namespace=ns,
-            poll_interval=5,
+            manager=self.miner._bridge_manager,
         )
         return self._backward_counter
 
@@ -193,7 +193,7 @@ class TrainingPhase:
 
                 # Loop until LayerStateException is raised by `get_activation`
                 logger.debug(
-                    f"Node registry contains nodes: {[node.node_id for node in self.node_registry.value.all_nodes()]}"
+                    f"Node registry contains nodes: {[node.node_id for node in self.node_registry.all_nodes()]}"
                 )
         except Exception:
             logger.info("Finishing training phase")
@@ -293,7 +293,7 @@ class TrainingPhase:
                     f"✅ FORWARD complete | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                 )
                 logger.debug(
-                    f"Node registry in forward contains: {[m.node_id for m in self.node_registry.value.all_nodes()]}"
+                    f"Node registry in forward contains: {[m.node_id for m in self.node_registry.all_nodes()]}"
                 )
 
     async def backward(self, activation_data: ActivationData):
