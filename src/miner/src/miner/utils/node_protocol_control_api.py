@@ -38,6 +38,8 @@ from common.models.api_models import (
     EnclaveGetKeyIdResponse,
     EnclaveSignRequest,
     EnclaveSignResponse,
+    MinerKickedEvent,
+    MinerKickedResponse,
     MountedAttestationPayload,
     MountedAttestationRequest,
     RegisterSetBestRunRequest,
@@ -197,6 +199,15 @@ class ProtocolServer:
         req = TrainingStateRequest(state=state, detail=detail, run_id=run_id, layer=layer)
         resp_env = await self.request("training.state", req.model_dump(by_alias=True, exclude_none=True))
         return TrainingStateResponse(status=resp_env.data["status"])
+
+    async def emit_miner_kicked(self, event: MinerKickedEvent) -> MinerKickedResponse:
+        env = Envelope(
+            kind="event",
+            name="miner.kicked",
+            data=event.model_dump(by_alias=True, exclude_none=True),
+        )
+        await self.send(env)
+        return MinerKickedResponse(status=200)
 
     # --- enclave helpers (KeySigner-aligned) ---
 
@@ -640,6 +651,15 @@ async def http_register_set_best_run(req: RegisterSetBestRunRequest) -> Dict[str
 async def http_training_set_state(req: TrainingStateRequest) -> Dict[str, Any]:
     try:
         resp = await protocol.training_set_state(state=req.state, detail=req.detail, run_id=req.run_id, layer=req.layer)
+        return resp.model_dump()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/miner/kicked")
+async def http_miner_kicked(req: MinerKickedEvent) -> Dict[str, Any]:
+    try:
+        resp = await protocol.emit_miner_kicked(req)
         return resp.model_dump()
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

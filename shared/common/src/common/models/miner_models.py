@@ -11,3 +11,4 @@ class MinerStatus(str, Enum):
     MERGING_PARTITIONS = "merging_partitions"
     INITIALIZING = "initializing"
     FROZEN = "frozen"
+    KICKED = "kicked"

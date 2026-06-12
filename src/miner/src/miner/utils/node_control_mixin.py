@@ -10,6 +10,7 @@ from common.models.api_models import (
     TrainingStateResponse,
     EnclaveGetKeyIdResponse,
     EnclaveSignResponse,
+    MinerKickedResponse,
     MountedAttestationPayload,
     RegisterSetBestRunResponse,
     RegisterSetStatusResponse,
@@ -209,6 +210,49 @@ class NodeControlMixin:
 
         logger.warning(f"report_training_state exhausted retries ({retries}): {last_err}")
         return TrainingStateResponse(status=503)
+
+    async def report_miner_kicked(
+        self,
+        *,
+        reason: str = "miner_not_registered",
+        detail: Optional[str] = None,
+        run_id: Optional[str] = None,
+        layer: Optional[int] = None,
+        phase: Optional[str] = None,
+        source: Optional[str] = None,
+        hotkey: Optional[str] = None,
+        timeout_s: float = 5.0,
+        retries: int = 2,
+    ) -> MinerKickedResponse:
+        if not self._is_mounted:
+            return MinerKickedResponse(status=200)
+
+        payload: Dict[str, Any] = {"status": "kicked", "reason": reason}
+        if detail is not None:
+            payload["detail"] = detail
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if layer is not None:
+            payload["layer"] = layer
+        if phase is not None:
+            payload["phase"] = phase
+        if source is not None:
+            payload["source"] = source
+        if hotkey is not None:
+            payload["hotkey"] = hotkey
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                res = await self._control_post_json("/miner/kicked", payload, timeout_s=timeout_s)
+                return MinerKickedResponse(**res)
+            except Exception as e:
+                last_err = e
+                if attempt < retries:
+                    await asyncio.sleep(attempt)
+
+        logger.warning(f"report_miner_kicked exhausted retries ({retries}): {last_err}")
+        return MinerKickedResponse(status=503)
 
     async def enclave_get_key_id(
         self, *, purpose: str, preferred_algorithms=None, dp_keychain=None, cache: bool = True

@@ -118,6 +118,19 @@ class ActivationPublisher:
         """Attach a stats tracker for dashboard metrics."""
         self._stats_tracker = tracker
 
+    async def _report_miner_not_registered(self, exc: MinerNotRegisteredException, *, source: str) -> None:
+        if not self.miner:
+            return
+
+        report = getattr(self.miner, "report_miner_not_registered_if_active", None)
+        if report is None:
+            return
+
+        try:
+            await report(exc, source=source)
+        except Exception as report_exc:
+            logger.warning(f"Failed to report miner kicked event from {source}: {report_exc}")
+
     # ── Send-loop lifecycle ──────────────────────────────────────────────────
 
     def start_send_loop(self) -> None:
@@ -307,6 +320,8 @@ class ActivationPublisher:
                 await self.miner.clear_input_hash(activation_id)
 
         except (LayerStateException, MinerNotRegisteredException) as e:
+            if isinstance(e, MinerNotRegisteredException):
+                await self._report_miner_not_registered(e, source="activation_publish")
             logger.warning(f"Anticipated exception while publishing activation (swallowed): {e}")
         except Exception as e:
             logger.exception(f"Failed to publish activation: {e}")
@@ -675,6 +690,8 @@ class ActivationPublisher:
                 )
                 logger.debug(f"Notified orchestrator of activation {activation_id}")
         except (LayerStateException, MinerNotRegisteredException) as e:
+            if isinstance(e, MinerNotRegisteredException):
+                await self._report_miner_not_registered(e, source="activation_notify_orchestrator")
             logger.warning(f"Anticipated exception while notifying orchestrator (swallowed): {e}")
         except Exception as e:
             logger.error(f"Failed to notify orchestrator of activation {activation_id}: {e}")
@@ -694,6 +711,8 @@ class ActivationPublisher:
 
         except (LayerStateException, MinerNotRegisteredException) as e:
             # Swallow expected exceptions
+            if isinstance(e, MinerNotRegisteredException):
+                await self._report_miner_not_registered(e, source="publish_loss")
             logger.warning(f"Anticipated exception has occurred while publishing loss (swallowed): {e}")
             pass
         except Exception as e:
