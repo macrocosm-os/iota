@@ -336,6 +336,7 @@ ServerCapability = Literal[
     "control.start",
     "control.stop",
     "control.configure",
+    "miner.kicked",
     "training.state",
     "register.status",
     "register.best_run",
@@ -351,6 +352,7 @@ NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES: Final[tuple[ServerCapability, ...]] =
     "control.start",
     "control.stop",
     "control.configure",
+    "miner.kicked",
     "training.state",
     # Registration messages
     "register.status",
@@ -366,7 +368,7 @@ NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES: Final[tuple[ServerCapability, ...]] =
 
 # --- Register payloads ---
 
-RegisterStatus = Literal["initializing", "initialized", "frozen", "registered"]
+RegisterStatus = Literal["initializing", "initialized", "frozen", "registered", "kicked"]
 
 
 class RegisterSetStatusRequest(BaseModel):
@@ -397,6 +399,23 @@ class TrainingStateRequest(BaseModel):
 
 
 class TrainingStateResponse(BaseModel):
+    status: int
+
+
+class MinerKickedEvent(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: Literal["kicked"] = "kicked"
+    reason: str = "miner_not_registered"
+    detail: str | None = None
+    run_id: str | None = Field(default=None, alias="runId", serialization_alias="runId")
+    layer: int | None = None
+    phase: str | None = None
+    source: str | None = None
+    hotkey: str | None = None
+
+
+class MinerKickedResponse(BaseModel):
     status: int
 
 

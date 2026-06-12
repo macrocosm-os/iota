@@ -120,6 +120,13 @@ from subnet.utils.s3_torch import download_tensor
 from miner.training import TrainingPhase
 from common.settings import P2P_MAX_SENDER_CONNECTIONS
 
+_ACTIVE_KICK_DETECTION_PHASES = {
+    LayerPhase.TRAINING.value,
+    LayerPhase.WEIGHTS_UPLOADING.value,
+    LayerPhase.MERGING_PARTITIONS.value,
+}
+_KICK_REPORT_DEDUPE_SECONDS = 30.0
+
 
 class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
     def __init__(
@@ -221,6 +228,8 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self._peer_semaphores: dict[str, asyncio.Semaphore] = {}
         self._peer_semaphores_lock = asyncio.Lock()
         self._max_concurrent_per_peer = 2  # Based on benchmark: BI degrades at concurrency >= 5
+        self._last_kick_report_key: tuple[str | None, int | None, str | None] | None = None
+        self._last_kick_report_at: float = 0.0
 
     async def _collect_attestation_payload(
         self, action: str
@@ -530,6 +539,48 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         if self.training_phase is None:
             return None
         return self.training_phase._cache
+
+    def _current_layer_phase_value(self) -> str | None:
+        phase = getattr(self.miner_api_client, "layer_state", None)
+        if phase is None:
+            return None
+        if isinstance(phase, LayerPhase):
+            return phase.value
+        return str(phase)
+
+    async def report_miner_not_registered_if_active(
+        self,
+        exc: MinerNotRegisteredException,
+        *,
+        source: str,
+    ) -> None:
+        phase = self._current_layer_phase_value()
+        if phase not in _ACTIVE_KICK_DETECTION_PHASES:
+            return
+
+        run_id = self.state_manager.run_id
+        layer = self.state_manager.layer
+        report_key = (run_id, layer, phase)
+        now = time.time()
+        if self._last_kick_report_key == report_key and now - self._last_kick_report_at < _KICK_REPORT_DEDUPE_SECONDS:
+            return
+
+        self._last_kick_report_key = report_key
+        self._last_kick_report_at = now
+
+        logger.warning(
+            f"Miner {self.hotkey[:8]} appears to have been kicked during active work "
+            f"(phase={phase}, run_id={run_id}, layer={layer}, source={source}): {exc}"
+        )
+        await self.report_miner_kicked(
+            reason="miner_not_registered",
+            detail=str(exc),
+            run_id=run_id,
+            layer=layer,
+            phase=phase,
+            source=source,
+            hotkey=self.hotkey,
+        )
 
     async def push_activation(
         self,
@@ -901,6 +952,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     continue
                 except MinerNotRegisteredException as e:
                     logger.info(f"🔄 Miner {self.hotkey[:8]} miner not registered error: {e}")
+                    await self.report_miner_not_registered_if_active(e, source="training_loop")
                     await self.reset_miner_state()
                     continue
                 except MinerResetException as e:
@@ -956,7 +1008,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     continue
                 except MinerFrozenException as e:
                     logger.warning(
-                        f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (initializing) and cannot perform work: {e}"
+                        f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (frozen) and cannot perform work: {e}"
                     )
                     await self.register_set_status(status="frozen")
                     await asyncio.sleep(60)
