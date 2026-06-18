@@ -30,4 +30,5 @@ class PeerStatusBroadcast(BaseModel):
     cache_capacity: int = 0
     uptime_seconds: float = 0.0
     layer_phase: str = "training"
+    miner_status: str = "training"
     last_status_received: float = 0.0

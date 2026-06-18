@@ -153,7 +153,6 @@ class TrainingPhase:
                 if self._stats_tracker is not None:
                     self._stats_tracker.set_phase(self._miner_api_client.layer_state)
                     self._stats_tracker.set_layer(self._state_manager.layer)
-                    self._stats_tracker.set_local_epoch(getattr(self._model_manager, "epoch_counter", None))
                 self._publisher.layer_idx = str(self._state_manager.layer)
 
                 # Check if training phase is complete
@@ -524,11 +523,16 @@ class TrainingPhase:
                                 counter = await self._ensure_backward_counter()
                                 await counter.start()
                                 self._counter_started = True
+
                             global_step = await self._backward_counter.increment()
                             logger.debug(f"Global step for miner {self._hotkey[:8]}: {global_step}")
                             learning_rate = self._lr_scheduler.step(global_step)
                             logger.debug(f"LR at global step {global_step}: {learning_rate}")
-                            await self._model_manager.local_optimization_step(learning_rate=learning_rate)
+
+                            await self._model_manager.local_optimization_step(
+                                learning_rate=learning_rate,
+                                current_epoch=self._model_manager.current_epoch,
+                            )
                             await self.optimization_reset()
 
                             log_gpu_memory_usage(note="after local optimization step")
@@ -543,7 +547,12 @@ class TrainingPhase:
                         )
 
                 if self._stats_tracker is not None:
-                    self._stats_tracker.set_local_epoch(getattr(self._model_manager, "epoch_counter", None))
+                    cached_epoch = self._model_manager.current_epoch
+                    epoch_on_registration = getattr(self._model_manager, "epoch_on_registration", 0) or 0
+                    if cached_epoch is None:
+                        self._stats_tracker.set_local_epoch(None)
+                    else:
+                        self._stats_tracker.set_local_epoch(max(0, cached_epoch - epoch_on_registration))
 
     async def compute_last_layer_loss(
         self, activation_data: ActivationData, logits: torch.Tensor, targets: torch.Tensor

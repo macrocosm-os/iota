@@ -526,6 +526,17 @@ class ActivationPublisher:
                     f"(activation {item.msg.activation_id}) after prior empty lookup"
                 )
             chosen = self._peer_selector(eligible)
+            if chosen is None:
+                # All eligible peers have broadcast a non-training miner_status
+                # (initializing / frozen). Defer the push until at least one peer
+                # is back in TRAINING — same retry pattern as "no routable peers".
+                logger.warning(
+                    f"All eligible peers on layer-{layer_key} are not accepting activations "
+                    f"(activation {item.msg.activation_id}) — deferring push"
+                )
+                await asyncio.sleep(1.0)
+                self._outbound.put_nowait(item)
+                return
             if not _peer_matches_target_layer(chosen, layer_key):
                 logger.error(
                     f"Peer selection mismatch: chosen node {chosen.node_id} is not on layer-{layer_key} "

@@ -115,6 +115,19 @@ class HeartbeatResponse(BaseModel):
     phase: str
 
 
+class RunEpochResponse(BaseModel):
+    """Authoritative current epoch for a run, served by /common/get_run_epoch.
+
+    Layers within a run advance their epoch independently but stay
+    near-lockstep in healthy operation; the orchestrator reports the maximum
+    epoch across the run's layers as the "current" epoch so a miner that
+    queries before its own layer has ticked still sees forward progress.
+    """
+
+    run_id: str
+    epoch: int
+
+
 class ValidatorRegistrationResponse(BaseModel):
     layer: int | None = None
     miner_uid_to_track: int

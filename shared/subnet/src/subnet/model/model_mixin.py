@@ -133,7 +133,8 @@ class ModelManager:
         self.run_flags: RunFlags | None = None
         self.optimizer_step_count: int = 0
         self.epoch_on_registration: int = 0
-        self.epoch_counter: int = 0
+        self.current_epoch: int | None = None
+        self.global_weights_loaded: bool = False
 
     async def initialize_model_manager(
         self,
@@ -162,6 +163,11 @@ class ModelManager:
         self.layer = layer
         self.device = device
         self.logger_attributes = logger_attributes
+        # Until download_and_set_global_weights succeeds against a non-empty
+        # merge, this model holds random weights only.
+        self.global_weights_loaded = False
+        # Epoch cache is stale across (re-)registrations; refetch on next TRAINING entry.
+        self.current_epoch = None
 
         assert isinstance(self.model_config, dict), "Model config must be a dict"
         assert isinstance(self.model_metadata, dict), "Model metadata must be a dict"
@@ -405,6 +411,15 @@ class ModelManager:
         if self.run_flags.use_AdamW.isOff():
             num_layers = len(self.model_metadata["model_splits"])
             stage_dependent_beta = 0.9 + ((num_layers - (self.layer + 1)) / num_layers) * 0.09
+            # foreach=False forces the single-tensor implementation. NAdam's
+            # _multi_tensor path calls _group_tensors_by_device_and_dtype which
+            # requires every state tensor for a given param to share device+dtype
+            # (except `step`). NAdam internally creates `mu_product` as a fp32
+            # scalar regardless of param dtype, so with bf16 model params the
+            # multi-tensor path crashes on the first real optimizer.step() with
+            # "Tensors of the same index must be on the same device and the same
+            # dtype except `step` tensors...". Single-tensor path does not have
+            # this constraint and is correct on bf16 params.
             self.optimizer = torch.optim.NAdam(
                 self.model.parameters(),
                 lr=common_settings.LEARNING_RATE,
@@ -413,6 +428,7 @@ class ModelManager:
                 betas=(stage_dependent_beta, common_settings.BETAS[1]),
                 eps=common_settings.EPS,
                 decoupled_weight_decay=True,
+                foreach=False,
             )
         else:
             self.optimizer = torch.optim.AdamW(
@@ -445,7 +461,7 @@ class ModelManager:
         self.eos_token_id = self.tokenizer.eos_token_id
         logger.info(f"loaded vocab info: vocab size | {self.vocab_size} | EOS token id | {self.eos_token_id}")
 
-    async def local_optimization_step(self, learning_rate: float):
+    async def local_optimization_step(self, learning_rate: float, current_epoch: int | None = None):
         """Perform a local optimization step every N backward passes."""
 
         with logger.contextualize(gpu="local optimization step"):
@@ -475,17 +491,67 @@ class ModelManager:
                 # TODO: Remove this once we have a better way to handle local optimization step.
                 # If a miner registers at a later epoch that epoch = 1, their local optimizer can be completely bogus.
                 # This is a "warm up" period, where a miner can continue to do work, but we just *dont* up date their local weights.
-                if self.epoch_counter <= 2 and self.epoch_on_registration > 1:
+                # Warm-up window: the miner is within 2 epochs of registration AND
+                # joined past the genesis epoch. epochs_since_registration is
+                # computed from the orchestrator's authoritative epoch — we never
+                # keep a local counter that could drift across resets/skips.
+                if current_epoch is None:
+                    epochs_since_registration = None
+                else:
+                    epochs_since_registration = current_epoch - self.epoch_on_registration
+                in_warmup = (
+                    epochs_since_registration is not None
+                    and epochs_since_registration <= 2
+                    and self.epoch_on_registration > 1
+                )
+                if in_warmup:
                     # load our previous weights into memory
                     logger.info(
-                        f"Keeping previous weights for miner {self.logger_attributes['hotkey'][:8]} with epoch counter {self.epoch_counter} and epoch on registration {self.epoch_on_registration}"
+                        f"Keeping previous weights for miner {self.logger_attributes['hotkey'][:8]} "
+                        f"with epochs_since_registration={epochs_since_registration} and "
+                        f"epoch_on_registration={self.epoch_on_registration}"
                     )
                     loaded_weights = load_model_weights(
                         hotkey=self.logger_attributes["hotkey"],
                         run_id=self.logger_attributes["run_id"],
                         layer_idx=self.layer,
                     )
-                    torch.nn.utils.vector_to_parameters(loaded_weights, self.model.parameters())
+
+                    # Disk weights can be: (a) the random-init snapshot we
+                    # established at epoch start when no merge partitions were
+                    # available, (b) a NaN-poisoned snapshot from a diverging
+                    # prior epoch, or (c) genuinely valid. Validate before
+                    # applying — silently overwriting current parameters with
+                    # invalid weights would reintroduce the exact failure mode
+                    # the global_weights_loaded gate is supposed to prevent.
+                    current_params = torch.nn.utils.parameters_to_vector(self.model.parameters())
+                    if loaded_weights is None:
+                        logger.warning(
+                            f"Warm-up reload skipped for miner {self.logger_attributes['hotkey'][:8]}: "
+                            "no disk snapshot found (load_model_weights returned None). "
+                            "Keeping current parameters."
+                        )
+                    elif loaded_weights.numel() != current_params.numel():
+                        logger.error(
+                            f"Warm-up reload REJECTED for miner {self.logger_attributes['hotkey'][:8]}: "
+                            f"disk snapshot has {loaded_weights.numel()} elements vs current "
+                            f"{current_params.numel()} (likely cross-run / cross-layer file). "
+                            "Keeping current parameters."
+                        )
+                    else:
+                        try:
+                            check_for_nans_and_infs(
+                                loaded_weights,
+                                f"warm-up disk weights for miner {self.logger_attributes['hotkey'][:8]}",
+                                exception_type=NanInfException,
+                            )
+                        except NanInfException as e:
+                            logger.error(
+                                f"Warm-up reload REJECTED for miner {self.logger_attributes['hotkey'][:8]}: "
+                                f"disk snapshot contains NaN/Inf ({e}). Keeping current parameters."
+                            )
+                        else:
+                            torch.nn.utils.vector_to_parameters(loaded_weights, self.model.parameters())
 
             logger.info(f"{self.logger_attributes['hotkey'][:8]} completed local optimization step")
             log_gpu_memory_usage(note="after local optimization step")
@@ -506,7 +572,8 @@ class ModelManager:
             self.layer = None
             self.device = None
             self.logger_attributes = None
-            self.epoch_counter = 0
+            self.global_weights_loaded = False
+            self.current_epoch = None
 
             # clear all the gpu memory and all torch related objects
             _clean_gpu_memory()
