@@ -115,7 +115,8 @@ from subnet.utils.partition_utils import (
 )
 from subnet.utils.vector_utils import check_for_nans_and_infs
 from subnet.model import gpu_device
-from subnet.utils.s3_torch import download_tensor
+from subnet.utils.blob_format import download_blob_region
+from common.utils.blob_format import download_blob_trailer
 
 from miner.training import TrainingPhase
 from common.settings import P2P_MAX_SENDER_CONNECTIONS
@@ -126,6 +127,17 @@ _ACTIVE_KICK_DETECTION_PHASES = {
     LayerPhase.MERGING_PARTITIONS.value,
 }
 _KICK_REPORT_DEDUPE_SECONDS = 30.0
+
+# Reset backoff: when many miners crash in a cluster (e.g. NaN cascade), they
+# all hit reset_miner_state and re-hammer the orchestrator's /register and
+# /get_merged_partitions endpoints at the same cadence. Jittered exponential
+# backoff smooths this out and gives the orchestrator time to publish merge
+# artifacts. Numbers are intentionally conservative: a healthy miner that
+# resets once and recovers pays no penalty (count is cleared after a
+# successful training tick); only a thrashing miner backs off further.
+_RESET_BACKOFF_BASE_SECONDS = 5.0
+_RESET_BACKOFF_MAX_SECONDS = 300.0
+_RESET_BACKOFF_JITTER_FRACTION = 0.25
 
 
 class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
@@ -220,6 +232,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         # Track miner start time for uptime reporting in peer status broadcasts.
         self._start_time: float = time.time()
 
+        # Broadcast-side miner status. Peers exclude us from peer selection when
+        # this is anything other than "training" (see peer_selection.py). Default
+        # to "initializing" so that any peer that already has us cached as a
+        # "training" target from a previous process gets a corrected broadcast
+        # on the next tick rather than continuing to push.
+        self.miner_status: str = "initializing"
+
         # Input hash tracking: activation_id -> hash of input we received
         self.input_activation_hashes: dict[str, str] = {}
         self.input_hash_lock = asyncio.Lock()
@@ -230,6 +249,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self._max_concurrent_per_peer = 2  # Based on benchmark: BI degrades at concurrency >= 5
         self._last_kick_report_key: tuple[str | None, int | None, str | None] | None = None
         self._last_kick_report_at: float = 0.0
+
+        # Jittered exponential backoff between reset_miner_state calls.
+        # Cleared on every successful training_phase.run() tick so a single
+        # transient blip never compounds.
+        self._consecutive_reset_count: int = 0
 
     async def _collect_attestation_payload(
         self, action: str
@@ -407,6 +431,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             cache_capacity=miner_settings.MAX_ACTIVATION_CACHE_SIZE,
             uptime_seconds=time.time() - self._start_time,
             layer_phase=self.miner_api_client.layer_state.value,
+            miner_status=self.miner_status,
         )
 
         # Collect (nid, peer_ctx) pairs so failure logs can include relay/direct hints.
@@ -478,6 +503,36 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             f"{gather_dur * 1000:.0f}ms | errors: {err_summary} | "
             f"sample: [{'; '.join(sample_lines)}]"
         )
+
+    async def _transition_miner_status(self, status: str) -> None:
+        """Update miner status, drain inbound P2P queues if entering a blocked
+        state, and broadcast the new status to adjacent-layer peers immediately
+        so they stop targeting us within one round-trip instead of waiting for
+        the next periodic broadcast tick.
+
+        Also mirrors to the local bridge via ``register_set_status`` so the
+        electron control plane reflects the same state.
+
+        Blocking statuses (anything other than "training") trigger a
+        ``_clear_stale_p2p_state`` to drop in-flight pushes that arrived just
+        before peers learned we were stopping — those activations belong to a
+        run state we no longer hold.
+        """
+        previous = self.miner_status
+        self.miner_status = status
+        if status != "training" and previous == "training":
+            try:
+                await self._clear_stale_p2p_state()
+            except Exception as exc:
+                logger.warning(f"Failed to drain P2P state on transition to {status!r}: {exc}")
+        try:
+            await self.register_set_status(status=status)
+        except Exception as exc:
+            logger.warning(f"register_set_status({status!r}) failed: {exc}")
+        try:
+            await self._broadcast_peer_status()
+        except Exception as exc:
+            logger.debug(f"Immediate peer-status broadcast for {status!r} failed: {exc}")
 
     async def _peer_status_broadcast_loop(self) -> None:
         """Background task: broadcast peer status to adjacent-layer miners
@@ -857,14 +912,37 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 # eviction in training.py handles the happy path.
                 self.stats_tracker.activation_stats.clear()
 
-                # Make sure that the epoch counter increases every time we start training.
-                # This is to avoid the edge case where nodes fail to get to the END of merging_partitions.
-                self.model_manager.epoch_counter += 1
-                logger.info(
-                    f"🔄 Miner {self.hotkey[:8]} incremented epoch counter to: {self.model_manager.epoch_counter}"
-                )
+                # Final safety net before training: download_and_set_global_weights
+                # is the canonical gate (it raises when partitions==0 and the
+                # model still holds random weights), but if anything ever sets
+                # need_to_pull_weights=False without a real merge sync (bug,
+                # future refactor) we still want to refuse to train rather
+                # than emit random-weight activations and losses.
+                if not getattr(self.model_manager, "global_weights_loaded", False):
+                    logger.error(
+                        f"Refusing to train: miner {self.hotkey[:8]} entered TRAINING with "
+                        "model_manager.global_weights_loaded=False (model holds random weights)."
+                    )
+                    raise MinerResetException("Training aborted: model not synced to global weights this session")
+
+                # Announce we're accepting activations again BEFORE entering the
+                # training loop, so adjacent-layer peers stop excluding us in
+                # peer_selection within one broadcast round-trip.
+                if self.miner_status != "training":
+                    await self._transition_miner_status("training")
 
                 await self.training_phase.run()
+
+                # A successful training tick is the signal that the miner has
+                # recovered from any prior reset cycle — clear the backoff
+                # counter so future resets start fresh rather than inheriting
+                # the previous incident's exponential growth.
+                if self._consecutive_reset_count != 0:
+                    logger.info(
+                        f"✅ Training tick completed for miner {self.hotkey[:8]}; "
+                        f"clearing reset backoff counter (was {self._consecutive_reset_count})"
+                    )
+                    self._consecutive_reset_count = 0
                 await asyncio.sleep(1.1)
                 return
 
@@ -1003,14 +1081,14 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     logger.warning(
                         f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (initializing) and cannot perform work: {e}"
                     )
-                    await self.register_set_status(status="initializing")
+                    await self._transition_miner_status("initializing")
                     await asyncio.sleep(60)
                     continue
                 except MinerFrozenException as e:
                     logger.warning(
                         f"🔄Miner {self.hotkey[:8]} has been temporarily blocked (frozen) and cannot perform work: {e}"
                     )
-                    await self.register_set_status(status="frozen")
+                    await self._transition_miner_status("frozen")
                     await asyncio.sleep(60)
                     continue
                 except MinerBlockedException as e:
@@ -1108,9 +1186,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.model_manager.model_config = model_config
         self.model_manager.model_metadata = model_metadata
         self.model_manager.epoch_on_registration = current_epoch
-
-        # Local merge-cycle count is per assignment; re-register / new run must not inherit the old value.
-        self.model_manager.epoch_counter = 0
 
         layer_groups = ["all", f"layer-{assigned_layer}"]
         self._own_compute_node = self._own_compute_node.model_copy(update={"groups": layer_groups})
@@ -1328,11 +1403,22 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             )
             return
 
-        optimizer_state_tensor = await download_tensor(
-            path=response.optimizer_state_url,
-            dtype=torch.bfloat16,
-            device="cpu",
-            run_flags=self.run_flags,
+        # The optimizer-state object in S3 is a self-describing weights blob:
+        # [12-byte header] + [bf16 tensor bytes] + [JSON trailer]. The JSON
+        # trailer length is variable and frequently odd, so reading the whole
+        # object and `.view(bfloat16)`-ing it fails on a divisibility check.
+        # Read the trailer, find the tensor's byte region, and range-fetch just
+        # that — same pattern as `download_partition_optimizer` /
+        # `_fetch_partition_region` in `partition_utils`.
+        trailer = await download_blob_trailer(response.optimizer_state_url)
+        section = trailer["sections"]["0"]
+        offset = section["start_byte"]
+        length = section["end_byte"] - section["start_byte"]
+        optimizer_state_tensor = await download_blob_region(
+            response.optimizer_state_url,
+            offset=offset,
+            length=length,
+            dtype=trailer["dtype"],
         )
 
         if optimizer_state_tensor is None:
@@ -1390,6 +1476,19 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             if self.training_phase.backwards_since_reset == 0:
                 logger.warning(f"Backwards since reset for miner {self.hotkey[:8]} is 0, skipping")
                 return
+
+            # Hard guard: never submit pseudogradients derived from a model that
+            # has not been synced to the global merge. Without this check, a
+            # miner that restarted (NaN crash) and could not yet pull merged
+            # partitions would publish gradients computed against a random
+            # initialization, polluting the run.
+            if not getattr(self.model_manager, "global_weights_loaded", False):
+                logger.error(
+                    f"Refusing to submit weights for miner {self.hotkey[:8]}: model has not "
+                    "been synced to global state this session — pseudogradients would be "
+                    "derived from random weights."
+                )
+                raise MinerResetException("submit_weights aborted: model_manager.global_weights_loaded is False")
 
             # Pull the epoch-boundary cleanup forward.
             #
@@ -1721,6 +1820,26 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         """
         Reset the entire miner state, including the API client, health server, and all other state.
         """
+        # Jittered exponential backoff to prevent thundering-herd resets across
+        # the fleet when miners crash together (the 13:27 NaN cluster on
+        # run 4.2.2.2-tah saw multiple miners reset within seconds of each
+        # other and re-hammer the orchestrator). The first reset is free; each
+        # additional reset without an intervening successful training tick
+        # waits longer.
+        if self._consecutive_reset_count > 0:
+            backoff = min(
+                _RESET_BACKOFF_BASE_SECONDS * (2 ** (self._consecutive_reset_count - 1)),
+                _RESET_BACKOFF_MAX_SECONDS,
+            )
+            jitter = backoff * _RESET_BACKOFF_JITTER_FRACTION * (2 * random.random() - 1)
+            wait = max(0.0, backoff + jitter)
+            logger.warning(
+                f"⏳ Backing off {wait:.1f}s before reset_miner_state "
+                f"(consecutive reset #{self._consecutive_reset_count + 1})"
+            )
+            await asyncio.sleep(wait)
+        self._consecutive_reset_count += 1
+
         logger.info("🔄 Resetting miner entire state!")
         self.need_to_pull_weights = True
 
@@ -1754,24 +1873,18 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 f"(old: run={old_run_id}, layer={old_layer}) - will download layer-specifc local optimizer state"
             )
 
-        # if we continue on the same run and layer, save off what we've done so far and load weights
-        current_model_weights: torch.Tensor = None
-        current_model_optimizer_state: dict = None
+        delete_saved_model_weights_and_optimizer_state(
+            hotkey=self.hotkey,
+            current_run_id=self.state_manager.run_id,
+        )
 
-        if is_same_layer:
-            if self.model_manager.model is not None and self.model_manager.optimizer is not None:
-                current_model_weights = torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters())
-                current_model_optimizer_state = self.model_manager.optimizer.state_dict()
-
-            else:
-                current_model_weights, current_model_optimizer_state = load_model_weights_and_optimizer_state(
-                    hotkey=self.hotkey,
-                    run_id=self.state_manager.run_id,
-                    layer_idx=self.state_manager.layer,
-                )
-        else:
-            delete_saved_model_weights_and_optimizer_state(hotkey=self.hotkey)
-            logger.info(f"Deleted stale weight files from previous run/layer (old run={old_run_id}, layer={old_layer})")
+        # Find the best fallback weights to seed the new model with.
+        # None means no valid source — _setup_local_model will use random
+        # init and the training loop will block on the global_weights_loaded
+        # gate until download_and_set_global_weights succeeds.
+        current_model_weights, current_model_optimizer_state = self._recover_fallback_weights(
+            is_same_layer=is_same_layer,
+        )
 
         self.model_manager.reset()
 
@@ -1786,6 +1899,55 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             raise Exception("Error setting up local model")
 
         logger.success("✅ Successfully setup local model")
+
+    def _recover_fallback_weights(self, *, is_same_layer: bool) -> tuple[torch.Tensor | None, dict | None]:
+        """Pick the best weights to seed the model with after a reset.
+
+        Priority:
+          1. In-memory model+optimizer — only valid when we're staying on the
+             same run+layer, so the parameters are a meaningful descendant of
+             the current global state.
+          2. The latest on-disk snapshot for this run+layer (NaN-checked
+             before use; a poisoned snapshot is rejected).
+
+        Returns (None, None) when no source yields finite weights; the caller
+        falls back to random init and the training loop waits for the next
+        successful merged-partition download before unblocking.
+        """
+        if is_same_layer and self.model_manager.model is not None and self.model_manager.optimizer is not None:
+            return (
+                torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters()),
+                self.model_manager.optimizer.state_dict(),
+            )
+
+        disk_weights, disk_optimizer_state = load_model_weights_and_optimizer_state(
+            hotkey=self.hotkey,
+            run_id=self.state_manager.run_id,
+            layer_idx=self.state_manager.layer,
+            epoch=self.model_manager.epoch_on_registration,
+        )
+        if disk_weights is None:
+            return None, None
+
+        try:
+            check_for_nans_and_infs(
+                disk_weights,
+                f"disk snapshot for miner {self.hotkey[:8]} "
+                f"run={self.state_manager.run_id} layer={self.state_manager.layer}",
+                exception_type=NanInfException,
+            )
+        except NanInfException as e:
+            logger.error(
+                f"Disk snapshot for miner {self.hotkey[:8]} contains NaN/Inf ({e}); "
+                "falling back to random init and waiting for global merge."
+            )
+            return None, None
+
+        logger.success(
+            f"♻️ Restored on-disk snapshot for miner {self.hotkey[:8]} "
+            f"run={self.state_manager.run_id} layer={self.state_manager.layer}"
+        )
+        return disk_weights, disk_optimizer_state
 
     async def get_old_partition_for_partition_batch(
         self, batch_partitions: list[MergingPartition]
@@ -1817,6 +1979,21 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         Returns:
             list[Partition]: The merged partitions
         """
+        # Hard guard: never upload a merged-partition artifact when this miner
+        # hasn't synced to global state this session. merge_partitions doesn't
+        # directly use self-weights for the average, so a torn miner's math
+        # *can* be correct — but the resulting artifact becomes the next
+        # epoch's global weights for that shard, so we'd rather skip the
+        # round entirely than risk uploading anything from a session whose
+        # local state is unverified. Same rationale as the submit_weights gate.
+        if not getattr(self.model_manager, "global_weights_loaded", False):
+            logger.error(
+                f"Refusing to merge partitions for miner {self.hotkey[:8]}: model has not "
+                "been synced to global state this session — skipping the round so we don't "
+                "upload a merge artifact derived from an unverified local state."
+            )
+            raise MinerResetException("merge_partitions aborted: model_manager.global_weights_loaded is False")
+
         async with TimerLoggerMiner(
             name="merge_partitions",
             metadata={"hotkey": self.hotkey[:8], "layer": self.state_manager.layer},
@@ -1918,10 +2095,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 # Do the actual merging (apply the optimizer state to the weights)
                 weights_length = sum([p.numel() for p in old_model.parameters()])
 
-                # TODO: Epoch counter starts at 0 but we increment at the START of the epoch.
-                # For the "current global epoch" to be correct, we just need to subtract 1 from the epoch counter.
-                # However, this is dumb but we are going to re-write the miner code soon.
-                current_global_epoch = self.model_manager.epoch_on_registration + self.model_manager.epoch_counter - 1
+                current_global_epoch = self.model_manager.current_epoch
+                if current_global_epoch is None:
+                    current_global_epoch = await self.miner_api_client.get_run_epoch(
+                        run_id=self.state_manager.run_id, hotkey=self.wallet.hotkey
+                    )
 
                 merged_partitions = await merge_partition_batch(
                     partition_batch=merging_partitions,

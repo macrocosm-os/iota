@@ -415,7 +415,9 @@ def load_model_weights(hotkey: str, run_id: str, layer_idx: int) -> torch.Tensor
         return None
 
 
-def load_model_weights_and_optimizer_state(hotkey: str, run_id: str, layer_idx: int) -> tuple[torch.Tensor, dict]:
+def load_model_weights_and_optimizer_state(
+    hotkey: str, run_id: str, layer_idx: int, epoch: int
+) -> tuple[torch.Tensor, dict]:
     """Loads the model weights and optimizer state from the weights directory."""
     data_dir = get_data_dir()
 
@@ -449,8 +451,9 @@ def load_model_weights_and_optimizer_state(hotkey: str, run_id: str, layer_idx: 
         if not os.path.exists(os.path.join(data_dir, "weights")):
             logger.info("📂 Weights directory doesn't exist, creating it to save model weights and optimizer states!")
         else:
-            logger.warning(
-                f"❌ Attempted to load saved model weights and optimizer state, but it doesn't exist. If epoch is > 1, it's excepted that you have these saved. It's possible that you will diverge and lose incentive if you don't have these: {e}"
-            )
+            if epoch > 1:
+                logger.warning(
+                    f"Attempted to load saved model weights and optimizer state for epoch {epoch} but they do not exist"
+                )
 
         return None, None

@@ -84,7 +84,12 @@ class BaseNeuron:
 
             num_downloaded_partitions: int = len(merged_partitions) if merged_partitions else 0
 
-            current_epoch = self.model_manager.epoch_on_registration + self.model_manager.epoch_counter
+            # Fetch once per TRAINING entry and stash on model_manager so hot
+            # paths (per-local-opt-step warm-up gate, merge_partitions label)
+            # don't burn a round-trip per call. The cache is invalidated on
+            # ModelManager.reset() and on initialize_model_manager().
+            current_epoch = await client.get_run_epoch(run_id=self.run_id, hotkey=self.wallet.hotkey)
+            self.model_manager.current_epoch = current_epoch
             logger.debug(
                 f"Number of downloaded merged partitions for run {self.run_id}, epoch {current_epoch}: {num_downloaded_partitions}"
             )
@@ -96,20 +101,48 @@ class BaseNeuron:
                 raise RuntimeError(f"Failed to get merged partitions: {merged_partitions.error_name}") from None
 
             if num_downloaded_partitions == 0:
-                # No merge artifact in cache yet (first epoch, new run, or layer cold start).
-                logger.warning(
-                    f"No merged partitions for miner {self.hotkey[:8]} yet — keeping current model weights for run {self.run_id}, epoch {current_epoch}"
+                # No merge artifact in cache yet. There are three sub-cases:
+                #   1. Genuine genesis (current_epoch <= 1): runs start at
+                #      epoch 1 and the first merge cycle only completes on the
+                #      transition into epoch 2, so an empty merge at epoch 1 is
+                #      expected — everyone trains from the same random init and
+                #      contributing is legitimate. Mark the model as "globally
+                #      aligned".
+                #   2. We have previously loaded global weights this session:
+                #      the in-memory model is a valid descendant of the global
+                #      state and it is safe to continue with current weights.
+                #   3. We have NEVER loaded global weights AND we are past
+                #      epoch 1: the model still holds random weights and the
+                #      miner would otherwise submit garbage activations / losses
+                #      / pseudogradients. Refuse to proceed so the outer retry
+                #      / reset logic can re-attempt and back off.
+                if current_epoch <= 1:
+                    logger.info(
+                        f"Genesis epoch for miner {self.hotkey[:8]} on run {self.run_id}: "
+                        "accepting random initialization as global state."
+                    )
+                    self.model_manager.global_weights_loaded = True
+                    return None
+                if self.model_manager.global_weights_loaded:
+                    logger.warning(
+                        f"No merged partitions for miner {self.hotkey[:8]} yet — keeping previously-loaded "
+                        f"global weights for run {self.run_id}, epoch {current_epoch}"
+                    )
+                    return None
+                raise RuntimeError(
+                    f"Refusing to train: miner {self.hotkey[:8]} has never loaded global weights "
+                    f"and merged partitions are empty for run {self.run_id} at epoch {current_epoch}. "
+                    "Training with random weights would corrupt the run."
                 )
-                return None
 
             with torch.no_grad():
                 old_weights = torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters()).clone()
 
-            # Skip cosine validation on the very first download after joining —
-            # the model has random weights so every shard would be rejected.
-            is_first_download = getattr(self.model_manager, "epoch_counter", 0) == 0
-
-            # Download new weights
+            # Download new weights. Cosine validation compares incoming shards
+            # against `old_weights`; until we've synced to the global state at
+            # least once this session, `old_weights` is the random init (or a
+            # post-reset snapshot) so every shard would be rejected for low
+            # cosine similarity. Skip the check exactly when that's the case.
             new_weights = await download_merged_partitions(
                 merged_partitions=merged_partitions,
                 target_tensor=old_weights,
@@ -119,7 +152,7 @@ class BaseNeuron:
                 download_type="weights",
                 telemetry_service=getattr(self, "telemetry_service", None),
                 miner_hotkey=self.hotkey,
-                skip_cosine_validation=is_first_download,
+                skip_cosine_validation=not self.model_manager.global_weights_loaded,
             )
 
             if new_weights is None:
@@ -129,6 +162,14 @@ class BaseNeuron:
             # Set new weights and optimizer state to model
             await self.model_manager.set_model_weights_and_optimizer_state(
                 model_weights=new_weights, optimizer_state=None
+            )
+            # Only flip the flag after the parameters have actually been
+            # replaced — until this point the model still holds whatever it
+            # had on entry.
+            self.model_manager.global_weights_loaded = True
+            logger.success(
+                f"✅ Miner {self.hotkey[:8]} model parameters synced to global state "
+                f"for run {self.run_id} at epoch {current_epoch}"
             )
 
         except Exception as e:
