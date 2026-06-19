@@ -42,6 +42,8 @@ from common.models.api_models import (
     MinerKickedResponse,
     MountedAttestationPayload,
     MountedAttestationRequest,
+    RegisterQueueStateRequest,
+    RegisterQueueStateResponse,
     RegisterSetBestRunRequest,
     RegisterSetBestRunResponse,
     RegisterSetStatusRequest,
@@ -192,6 +194,11 @@ class ProtocolServer:
         resp_env = await self.request("register.best_run", req.model_dump(by_alias=True))
 
         return RegisterSetBestRunResponse(status=resp_env.data["status"])
+
+    async def register_set_queue_state(self, request: RegisterQueueStateRequest) -> RegisterQueueStateResponse:
+        resp_env = await self.request("register.queue_state", request.model_dump(by_alias=True, exclude_none=True))
+
+        return RegisterQueueStateResponse(status=resp_env.data["status"])
 
     async def training_set_state(
         self, *, state: str, detail: Optional[str] = None, run_id: Optional[str] = None, layer: Optional[int] = None
@@ -642,6 +649,15 @@ async def http_register_set_status(req: RegisterSetStatusRequest) -> Dict[str, A
 async def http_register_set_best_run(req: RegisterSetBestRunRequest) -> Dict[str, Any]:
     try:
         resp = await protocol.register_set_best_run(run_id=req.run_id)
+        return resp.model_dump()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/register/queue_state")
+async def http_register_set_queue_state(req: RegisterQueueStateRequest) -> Dict[str, Any]:
+    try:
+        resp = await protocol.register_set_queue_state(req)
         return resp.model_dump()
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

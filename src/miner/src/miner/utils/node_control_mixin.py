@@ -7,6 +7,9 @@ from typing import Any, Dict, Optional
 import aiohttp
 from loguru import logger
 from common.models.api_models import (
+    MinerRegistrationQueueStatusResponse,
+    RegisterQueueStateRequest,
+    RegisterQueueStateResponse,
     TrainingStateResponse,
     EnclaveGetKeyIdResponse,
     EnclaveSignResponse,
@@ -176,6 +179,47 @@ class NodeControlMixin:
 
         logger.warning(f"register_set_best_run exhausted retries ({retries}): {last_err}")
         return RegisterSetBestRunResponse(status=503)
+
+    async def register_set_queue_state(
+        self,
+        queue_state: MinerRegistrationQueueStatusResponse,
+        *,
+        timeout_s: float = 20.0,
+        retries: int = 3,
+    ) -> RegisterQueueStateResponse:
+        if not self._is_mounted:
+            return RegisterQueueStateResponse(status=200)
+
+        status = (
+            "registered"
+            if queue_state.response is not None or queue_state.status == "succeeded"
+            else queue_state.status
+        )
+        if status not in {"queued", "confirming", "registered", "failed", "expired"}:
+            status = "queued"
+
+        payload = RegisterQueueStateRequest(
+            status=status,
+            queue_id=queue_state.queue_id,
+            position=queue_state.position,
+            selected_run_id=queue_state.selected_run_id,
+            confirmation_required=queue_state.confirmation_required,
+            reserved_until=queue_state.reserved_until,
+            detail=queue_state.detail,
+        ).model_dump(by_alias=True, exclude_none=True)
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                await self.wait_for_host_connected(timeout_s=120.0, require_hello=True)
+                res = await self._control_post_json("/register/queue_state", payload, timeout_s=timeout_s)
+                return RegisterQueueStateResponse(**res)
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(2 * attempt)
+
+        logger.warning(f"register_set_queue_state exhausted retries ({retries}): {last_err}")
+        return RegisterQueueStateResponse(status=503)
 
     async def report_training_state(
         self,

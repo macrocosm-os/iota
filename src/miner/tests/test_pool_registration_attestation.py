@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import pytest
 
 from common.models.api_models import MountedAttestationPayload
-from common.models.run_flags import RunFlags
 from miner.pool.miner import Miner
 
 
@@ -16,8 +15,8 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
     miner._selected_payout_coldkey = "coldkey-1"
     miner._node_location = None
     miner._apply_registration_response = lambda _response: _async_noop()
-    miner.register_set_best_run = lambda **_kwargs: _async_noop()
     miner.register_set_status = lambda **_kwargs: _async_noop()
+    miner.register_set_queue_state = lambda *_args, **_kwargs: _async_noop()
 
     sent_requests = []
     mounted_payload = MountedAttestationPayload(
@@ -31,22 +30,23 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
         challenge_id="challenge-1",
     )
 
-    async def fake_fetch_run_info_request():
-        run_flags = RunFlags()
-        run_flags.attest.enabled = True
-        return [SimpleNamespace(run_id="run-123", run_flags=run_flags)]
-
     async def fake_request_attestation_challenge(action, run_id=None):
         assert action == "registration"
-        assert run_id == "run-123"
+        assert run_id is None
         return SimpleNamespace(
             attestation_challenge_blob='{"challenge_id":"challenge-1"}',
             self_checks=["self"],
             crypto="crypto",
         )
 
-    async def fake_register_miner_request(register_miner_request):
+    async def fake_register_miner_request(
+        register_miner_request,
+        confirmation_attestation_factory=None,
+        queue_state_callback=None,
+    ):
         sent_requests.append(register_miner_request)
+        assert confirmation_attestation_factory is not None
+        assert queue_state_callback is miner.register_set_queue_state
         return SimpleNamespace(
             model_cfg=SimpleNamespace(model_dump=lambda: {}),
             model_metadata=SimpleNamespace(model_dump=lambda: {}),
@@ -61,12 +61,10 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
         return mounted_payload
 
     miner.miner_api_client = SimpleNamespace(
-        fetch_run_info_request=fake_fetch_run_info_request,
         request_attestation_challenge=fake_request_attestation_challenge,
         register_miner_request=fake_register_miner_request,
         change_payout_coldkey_request=fake_change_payout_coldkey_request,
     )
-    monkeypatch.setattr("miner.pool.miner.get_miner_pool_run", lambda run_info_list: run_info_list[0])
     monkeypatch.setattr("miner.pool.miner.collect_system_data", lambda: '{"bandwidth":{}}')
     miner.collect_mounted_attestation = fake_collect_mounted_attestation
 
@@ -76,7 +74,6 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
     request = sent_requests[0]
     assert request.attestation == mounted_payload
     assert request.enclave_payload is None
-    assert request.run_id == "run-123"
     assert request.p2p_node_id == "peer-1"
 
 

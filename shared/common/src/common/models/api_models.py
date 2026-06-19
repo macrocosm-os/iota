@@ -311,7 +311,6 @@ class SubmitActivationRequest(BaseModel):
 
 
 class RegisterMinerRequest(BaseModel):
-    run_id: str
     attestation: MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None = None
     coldkey: str | None = None
     register_as_metagraph_miner: bool = True
@@ -319,6 +318,36 @@ class RegisterMinerRequest(BaseModel):
     p2p_node_id: str  # P2P node ID for direct peer communication (required)
     system_data: str | None = None  # MinerSystemData JSON (gpus, chip_info, bandwidth, etc.)
     location: NodeLocation | None = None  # Geographic location resolved from public IP at startup
+
+
+RegistrationQueueStatus = Literal[
+    "queued",
+    "confirming",
+    "confirmed",
+    "processing",
+    "succeeded",
+    "failed",
+    "expired",
+]
+
+
+class MinerRegistrationQueueStatusResponse(BaseModel):
+    queue_id: str
+    status: RegistrationQueueStatus
+    position: int | None = None
+    poll_after_seconds: float = 5.0
+    confirmation_required: bool = False
+    selected_run_id: str | None = None
+    reserved_until: str | None = None
+    payload_mismatch: bool = False
+    detail: str | None = None
+    response: MinerRegistrationResponse | None = None
+    error: dict[str, Any] | None = None
+
+
+class RegisterMinerConfirmationRequest(BaseModel):
+    attestation: MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None = None
+    enclave_payload: EnclaveGetKeyIdResponse | None = None
 
 
 class PayoutColdkeyRequest(BaseModel):
@@ -353,6 +382,7 @@ ServerCapability = Literal[
     "training.state",
     "register.status",
     "register.best_run",
+    "register.queue_state",
     "attestation.collect",
     "enclave.get_key_id",
     "enclave.sign",
@@ -370,6 +400,7 @@ NODE_PROTOCOL_CONTROL_SERVER_CAPABILITIES: Final[tuple[ServerCapability, ...]] =
     # Registration messages
     "register.status",
     "register.best_run",
+    "register.queue_state",
     # Rich host attestation messages
     "attestation.collect",
     # Secure enclave messages
@@ -399,6 +430,27 @@ class RegisterSetBestRunRequest(BaseModel):
 
 
 class RegisterSetBestRunResponse(BaseModel):
+    status: int
+
+
+RegisterQueueStateStatus = Literal["queued", "confirming", "registered", "failed", "expired"]
+
+
+class RegisterQueueStateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: RegisterQueueStateStatus
+    queue_id: str | None = Field(default=None, alias="queueId", serialization_alias="queueId")
+    position: int | None = None
+    selected_run_id: str | None = Field(default=None, alias="selectedRunId", serialization_alias="selectedRunId")
+    confirmation_required: bool = Field(
+        default=False, alias="confirmationRequired", serialization_alias="confirmationRequired"
+    )
+    reserved_until: str | None = Field(default=None, alias="reservedUntil", serialization_alias="reservedUntil")
+    detail: str | None = None
+
+
+class RegisterQueueStateResponse(BaseModel):
     status: int
 
 
