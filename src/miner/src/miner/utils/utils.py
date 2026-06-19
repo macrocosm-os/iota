@@ -4,6 +4,7 @@ import platform
 import psutil
 import subprocess
 import sys
+import time
 
 from typing import Literal
 
@@ -25,6 +26,12 @@ from loguru import logger
 from subnet.utils.vector_utils import check_for_nans_and_infs
 from subnet.miner_api_client import MinerAPIClient
 from common.models.run_flags import RUN_FLAGS, RunFlags
+from miner import settings as miner_settings
+
+
+_speedtest_cache_set = False
+_speedtest_cache_expires_at = 0.0
+_speedtest_cache_result: dict[str, float] | None = None
 
 
 def _sysctl(key: str) -> str | None:
@@ -76,6 +83,22 @@ def run_speedtest() -> dict[str, float] | None:
     except Exception as e:
         logger.debug(f"Failed to run speedtest: {e}")
         return None
+
+
+def run_speedtest_cached(ttl_seconds: float | None = None) -> dict[str, float] | None:
+    """Run speedtest at most once per TTL, caching only the bandwidth result."""
+    global _speedtest_cache_set, _speedtest_cache_expires_at, _speedtest_cache_result
+
+    now = time.monotonic()
+    if _speedtest_cache_set and now < _speedtest_cache_expires_at:
+        logger.info("Using cached speedtest result")
+        return _speedtest_cache_result
+
+    ttl = ttl_seconds if ttl_seconds is not None else miner_settings.REGISTRATION_SPEED_TEST_CACHE_TTL_SEC
+    _speedtest_cache_result = run_speedtest()
+    _speedtest_cache_expires_at = now + ttl
+    _speedtest_cache_set = True
+    return _speedtest_cache_result
 
 
 def collect_hardware_info() -> dict:
@@ -153,7 +176,7 @@ def collect_system_data() -> str | None:
                 "memory_gb": memory_gb,
             },
         }
-        bandwidth = run_speedtest()
+        bandwidth = run_speedtest_cached()
         if bandwidth:
             data["bandwidth"] = bandwidth
         return json.dumps(data)

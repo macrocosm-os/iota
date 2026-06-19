@@ -93,6 +93,7 @@ except ValueError:
 IS_MOUNTED = ELECTRON_HOST_PID is not None or os.getenv("IS_MOUNTED") == "true"
 ELECTRON_VERSION = os.getenv("ELECTRON_VERSION")
 NODE_CONTROL_TOKEN = os.getenv("NODE_CONTROL_TOKEN")
+REGISTRATION_SPEED_TEST_CACHE_TTL_SEC = float(os.getenv("REGISTRATION_SPEED_TEST_CACHE_TTL_SEC", "3600"))
 
 # Telemetry settings
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")

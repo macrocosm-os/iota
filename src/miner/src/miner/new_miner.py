@@ -53,7 +53,6 @@ from miner.utils.utils import (
     upload_weights_blob,
     wait_for_state,
 )
-from miner.utils.run_utils import identify_best_run
 from miner.utils.attestation_utils import collect_attestation_payload, AttestationUnavailableError
 from iota_sdk.p2p import (
     P2PAuthFields,
@@ -256,12 +255,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self._consecutive_reset_count: int = 0
 
     async def _collect_attestation_payload(
-        self, action: str
+        self, action: str, run_id: str | None = None, require_attestation_flag: bool = True
     ) -> MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None:
-        if self.run_flags.attest.isOff():
+        if require_attestation_flag and self.run_flags.attest.isOff():
             return None
 
-        challenge_response = await self.miner_api_client.request_attestation_challenge(action=action)
+        challenge_response = await self.miner_api_client.request_attestation_challenge(action=action, run_id=run_id)
         if challenge_response is None:
             logger.debug(f"No attestation challenge issued for action {action}")
             return None
@@ -305,6 +304,15 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         except Exception as exc:
             logger.exception(f"Error collecting attestation for action {action}: {exc}")
         return None
+
+    async def _collect_registration_attestation(
+        self, run_id: str | None = None
+    ) -> MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None:
+        return await self._collect_attestation_payload(
+            action="registration",
+            run_id=run_id,
+            require_attestation_flag=False,
+        )
 
     def _start_visualization_server_process(self, port: int | None = None):
         """Start the visualization server in a separate process."""
@@ -1295,14 +1303,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
     async def register(self) -> tuple[dict, dict]:
         """Single registration attempt. Raises on failure for caller to retry."""
-        logger.info(f"🔄 Attempting to fetch run info for miner {self.hotkey[:8]}...")
-        run_info_list = await self.miner_api_client.fetch_run_info_request()
-        if not run_info_list:
-            raise Exception("Fatal Error: Could not fetch run info")
-
-        best_run = identify_best_run(run_info_list=run_info_list)
-        logger.info(f"✅ Best run for miner {self.hotkey[:8]} is {best_run.run_id}")
-        logger.info(f"🔄 Attempting to register miner {self.hotkey[:8]} on run {best_run.run_id} with orchestrator...")
+        logger.info(f"🔄 Attempting to join registration waitlist for miner {self.hotkey[:8]}...")
 
         # P2P node ID is required for registration
         if not self.p2p_node_id:
@@ -1326,15 +1327,18 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         else:
             logger.warning(f"Failed to collect system data for miner {self.hotkey[:8]}")
 
+        registration_attestation = await self._collect_registration_attestation()
         register_request = RegisterMinerRequest(
-            run_id=best_run.run_id,
+            attestation=registration_attestation,
             register_as_metagraph_miner=True,
             p2p_node_id=self.p2p_node_id,
             system_data=system_data,
             location=self._node_location,
         )
         response: MinerRegistrationResponse = await self.miner_api_client.register_miner_request(
-            register_miner_request=register_request
+            register_miner_request=register_request,
+            confirmation_attestation_factory=self._collect_registration_attestation,
+            queue_state_callback=self.register_set_queue_state,
         )
         logger.info(f"Registered with P2P node ID: {self.p2p_node_id[:16]}...")
 

@@ -1,4 +1,6 @@
-from typing import Any, Literal
+import asyncio
+import random
+from typing import Any, Awaitable, Callable, Literal
 from common.models.api_models import (
     GetActivationRequest,
     HeartbeatResponse,
@@ -10,7 +12,9 @@ from common.models.api_models import (
     FileUploadRequest,
     LossReportRequest,
     MinerRegistrationResponse,
+    MinerRegistrationQueueStatusResponse,
     OptimizerStateUpdate,
+    RegisterMinerConfirmationRequest,
     RegisterMinerRequest,
     FileUploadResponse,
     SubmitActivationRequest,
@@ -21,6 +25,8 @@ from common.models.api_models import (
     RequestAttestationChallengeResponse,
     SubmitMergedPartitionsRequest,
     MinerAttestationPayload,
+    MountedAttestationPayload,
+    EnclaveSignResponse,
 )
 from common.models.error_models import (
     LayerStateError,
@@ -48,6 +54,28 @@ from subnet.common_api_client import CommonAPIClient
 from substrateinterface.keypair import Keypair
 
 
+RegistrationAttestationFactory = Callable[
+    [str | None], Awaitable[MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None]
+]
+RegistrationQueueStateCallback = Callable[[MinerRegistrationQueueStatusResponse], Awaitable[None]]
+
+REGISTRATION_QUEUE_POLL_JITTER_FRACTION = 0.2
+
+
+def registration_queue_poll_sleep_seconds(
+    poll_after_seconds: float,
+    jitter_fraction: float = REGISTRATION_QUEUE_POLL_JITTER_FRACTION,
+) -> float:
+    poll_after_seconds = max(0.0, poll_after_seconds)
+    jitter_fraction = max(0.0, jitter_fraction)
+    if poll_after_seconds == 0 or jitter_fraction == 0:
+        return poll_after_seconds
+
+    min_sleep = poll_after_seconds * (1 - jitter_fraction)
+    max_sleep = poll_after_seconds * (1 + jitter_fraction)
+    return random.uniform(min_sleep, max_sleep)
+
+
 class MinerAPIClient(CommonAPIClient):
     def __init__(self, hotkey: Keypair | None = None, is_mounted: bool = False, electron_version: str | None = None):
         self.hotkey = hotkey
@@ -67,7 +95,10 @@ class MinerAPIClient(CommonAPIClient):
         return [RunInfo.model_validate(run_info) for run_info in parsed_response]
 
     async def register_miner_request(
-        self, register_miner_request: RegisterMinerRequest
+        self,
+        register_miner_request: RegisterMinerRequest,
+        confirmation_attestation_factory: RegistrationAttestationFactory | None = None,
+        queue_state_callback: RegistrationQueueStateCallback | None = None,
     ) -> MinerRegistrationResponse | dict:
         try:
             response = await CommonAPIClient.orchestrator_request(
@@ -79,10 +110,80 @@ class MinerAPIClient(CommonAPIClient):
                 electron_version=self.electron_version,
             )
             parsed_response = self.parse_response(response)
+            if isinstance(parsed_response, dict) and parsed_response.get("queue_id"):
+                queue_response = MinerRegistrationQueueStatusResponse.model_validate(parsed_response)
+                return await self._wait_for_registration_queue(
+                    queue_response,
+                    confirmation_attestation_factory=confirmation_attestation_factory,
+                    queue_state_callback=queue_state_callback,
+                )
             return MinerRegistrationResponse.model_validate(parsed_response)
         except Exception as e:
             logger.error(f"Error registering miner: {e}")
             raise
+
+    async def _wait_for_registration_queue(
+        self,
+        queue_response: MinerRegistrationQueueStatusResponse,
+        *,
+        confirmation_attestation_factory: RegistrationAttestationFactory | None = None,
+        queue_state_callback: RegistrationQueueStateCallback | None = None,
+    ) -> MinerRegistrationResponse:
+        while True:
+            if queue_state_callback is not None:
+                await queue_state_callback(queue_response)
+
+            if queue_response.response is not None:
+                return queue_response.response
+
+            if queue_response.status in ("failed", "expired"):
+                raise RuntimeError(queue_response.error or queue_response.detail or "Registration queue failed")
+
+            if queue_response.confirmation_required:
+                attestation = None
+                if confirmation_attestation_factory is not None:
+                    attestation = await confirmation_attestation_factory(queue_response.selected_run_id)
+                queue_response = await self._confirm_registration_queue(queue_response.queue_id, attestation)
+                continue
+
+            await asyncio.sleep(registration_queue_poll_sleep_seconds(queue_response.poll_after_seconds))
+            status_response = await self._registration_queue_status_request(queue_response.queue_id)
+            if isinstance(status_response, MinerRegistrationResponse):
+                return status_response
+            queue_response = status_response
+
+    async def _registration_queue_status_request(
+        self, queue_id: str
+    ) -> MinerRegistrationResponse | MinerRegistrationQueueStatusResponse:
+        response = await CommonAPIClient.orchestrator_request(
+            method="GET",
+            path=f"/miner/register/status/{queue_id}",
+            hotkey=self.hotkey,
+            body={},
+            is_mounted=self.is_mounted,
+            electron_version=self.electron_version,
+        )
+        parsed_response = self.parse_response(response)
+        if isinstance(parsed_response, dict) and parsed_response.get("queue_id"):
+            return MinerRegistrationQueueStatusResponse.model_validate(parsed_response)
+        return MinerRegistrationResponse.model_validate(parsed_response)
+
+    async def _confirm_registration_queue(
+        self,
+        queue_id: str,
+        attestation: MinerAttestationPayload | MountedAttestationPayload | EnclaveSignResponse | None,
+    ) -> MinerRegistrationQueueStatusResponse:
+        body = RegisterMinerConfirmationRequest(attestation=attestation).model_dump()
+        response = await CommonAPIClient.orchestrator_request(
+            method="POST",
+            path=f"/miner/register/confirm/{queue_id}",
+            hotkey=self.hotkey,
+            body=body,
+            is_mounted=self.is_mounted,
+            electron_version=self.electron_version,
+        )
+        parsed_response = self.parse_response(response)
+        return MinerRegistrationQueueStatusResponse.model_validate(parsed_response)
 
     async def change_payout_coldkey_request(self, payout_coldkey: str) -> dict:
         try:
