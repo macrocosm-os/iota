@@ -33,7 +33,7 @@ class EpistulaHeaders(BaseModel):
     request_id: str = Header(default_factory=lambda: str(uuid.uuid4()), alias=HEADER_REQUEST_ID)
     spec_version: str = Header(default=int(0), alias="X-Spec-Version")
 
-    def verify_signature_v2(self, body: bytes, now: float, timeout: int):
+    def verify_signature_v2(self, body: bytes, now: float, timeout: int) -> None:
         """
         Verify the signature of the request.
 
@@ -44,8 +44,8 @@ class EpistulaHeaders(BaseModel):
 
         The Epistula-Timestamp header is epoch milliseconds (see generate_header).
 
-        Returns:
-            None if the signature is valid, otherwise an error message
+        Raises:
+            HTTPException: If the signature or request metadata is invalid.
         """
         try:
             if not isinstance(self.request_signature, str):
@@ -79,7 +79,7 @@ class EpistulaHeaders(BaseModel):
 
         except Exception as e:
             logger.exception(f"signature_verification_failed: {self.model_dump_json()}")
-            return str(e)
+            raise HTTPException(status_code=400, detail=EpistulaError(error=str(e)).model_dump())
 
 
 def generate_header(
