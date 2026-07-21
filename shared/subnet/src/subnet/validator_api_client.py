@@ -6,7 +6,7 @@ from common.settings import ORCHESTRATOR_HOST, ORCHESTRATOR_PORT, ORCHESTRATOR_S
 from common.utils.epistula import create_message_body, generate_header
 from common.utils.exceptions import APIException, RateLimitException
 from loguru import logger
-from substrateinterface.keypair import Keypair
+from bittensor_wallet import Keypair
 
 from subnet.common_api_client import CommonAPIClient
 

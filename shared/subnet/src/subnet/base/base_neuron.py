@@ -17,7 +17,7 @@ from subnet.utils.partition_utils import download_merged_partitions
 class BaseNeuron:
     def __init__(self):
         super().__init__()
-        self.wallet: bt.wallet | None = None
+        self.wallet: bt.Wallet | None = None
         self.layer: Optional[int] = None
         self.status: str = MinerStatus.IDLE.value
         self.registration_time: str = datetime.now().isoformat()
@@ -28,7 +28,7 @@ class BaseNeuron:
         self.model_manager = ModelManager()
         self.num_partitions: int | None = None
 
-    def init_neuron(self, wallet_name: str = None, wallet_hotkey: str = None, wallet: bt.wallet | None = None):
+    def init_neuron(self, wallet_name: str = None, wallet_hotkey: str = None, wallet: bt.Wallet | None = None):
         self.wallet = wallet or get_wallet(
             wallet_name=wallet_name,
             wallet_hotkey=wallet_hotkey,

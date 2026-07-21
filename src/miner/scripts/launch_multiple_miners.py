@@ -184,9 +184,9 @@ def run_single_miner_process(wallet_name: str, wallet_hotkey: str, miner_id: int
         return common_settings.NETWORK == "local" or host in {"127.0.0.1", "localhost"}
 
     # Provision local wallets/hotkeys if missing when pointing at a local subtensor (helps local dev).
-    wallet: bt.wallet | None = None
+    wallet: bt.Wallet | None = None
     if common_settings.BITTENSOR and _is_local_subtensor():
-        wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
+        wallet = bt.Wallet(name=wallet_name, hotkey=wallet_hotkey)
         if not wallet.coldkey_file.exists_on_device():
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 wallet.create_new_coldkey(use_password=False, overwrite=True)

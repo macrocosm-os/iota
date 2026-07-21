@@ -60,7 +60,7 @@ class Validator(BaseNeuron, HealthServerMixin):
 
         if common_settings.BITTENSOR:
             self.subtensor = get_subtensor()
-            self.metagraph = bt.metagraph(
+            self.metagraph = bt.Metagraph(
                 netuid=int(common_settings.NETUID), lite=False, network=common_settings.NETWORK
             )
 

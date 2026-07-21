@@ -51,7 +51,7 @@ from common.utils.s3_utils import upload_parts
 from common.utils.shared_states import LayerPhase
 from loguru import logger
 from subnet.common_api_client import CommonAPIClient
-from substrateinterface.keypair import Keypair
+from bittensor_wallet import Keypair
 
 
 RegistrationAttestationFactory = Callable[

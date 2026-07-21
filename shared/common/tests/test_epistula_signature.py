@@ -2,7 +2,7 @@ import time
 
 import pytest
 from fastapi import HTTPException
-from substrateinterface import Keypair
+from bittensor_wallet import Keypair
 
 from common.utils.epistula import EpistulaHeaders, create_message_body, generate_header
 
@@ -36,4 +36,4 @@ def test_epistula_malformed_signature_raises_http_exception():
         headers.verify_signature_v2(body=create_message_body(body), now=time.time(), timeout=60)
 
     assert exc_info.value.status_code == 400
-    assert "Signature" in exc_info.value.detail["error"]
+    assert "signature" in exc_info.value.detail["error"].lower()

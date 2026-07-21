@@ -23,7 +23,7 @@ from miner.telemetry.resource_metrics import (
 from miner.telemetry.snapshot import snapshot_registry
 
 if TYPE_CHECKING:
-    from substrateinterface.keypair import Keypair
+    from bittensor_wallet import Keypair
 
 
 class TelemetryBufferService:

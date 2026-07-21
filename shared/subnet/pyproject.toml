@@ -7,15 +7,15 @@ readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
   "common",
-  "bittensor==9.9.0",
-  "bittensor-cli==9.13.1",
+  "bittensor==10.3.2",
+  "bittensor-cli==9.21.2",
   "tenacity>=9.1.2",
   "psutil>=7.1.1",
   "torch>=2.6.0,<2.11.0",
   "transformers==4.38.2",
   "httpx>=0.28.1",
   "platformdirs>=4.5.0",
-  "async-substrate-interface<2.0.0",
+  "async-substrate-interface>=2.0.4,<3.0.0",
 ]
 
 [build-system]
