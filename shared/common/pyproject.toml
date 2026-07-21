@@ -21,7 +21,7 @@ dependencies = [
   "pytest-asyncio>=1.0.0",
   "pytest-mock>=3.14.1",
   "cryptography>=46.0.3",
-  "substrate-interface >=1.7, <1.8",
+  "bittensor-wallet>=4.0.1",
 ]
 
 [build-system]

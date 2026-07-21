@@ -8,7 +8,7 @@ from loguru import logger
 from bittensor import Wallet, Subtensor
 
 
-async def weight_setting_step(wallet: Wallet, subtensor: Subtensor, metagraph: bt.metagraph):
+async def weight_setting_step(wallet: Wallet, subtensor: Subtensor, metagraph: bt.Metagraph):
     global_weights = await ValidatorAPIClient.get_global_miner_scores(hotkey=wallet.hotkey)
 
     if not global_weights or "error_name" in global_weights:
@@ -39,7 +39,7 @@ async def weight_setting_step(wallet: Wallet, subtensor: Subtensor, metagraph: b
     await set_weights(wallet=wallet, subtensor=subtensor, weights=global_weights_dict, metagraph=metagraph)
 
 
-async def set_weights(wallet: Wallet, subtensor: Subtensor, weights: dict[int, float], metagraph: bt.metagraph):
+async def set_weights(wallet: Wallet, subtensor: Subtensor, weights: dict[int, float], metagraph: bt.Metagraph):
     """
     Sets the validator weights to the metagraph hotkeys based on the global weights.
     """
@@ -127,7 +127,7 @@ async def set_weights(wallet: Wallet, subtensor: Subtensor, weights: dict[int, f
         logger.exception(f"Error submitting weights to Bittensor: {e}")
 
 
-def copy_weights_from_chain(metagraph: bt.metagraph) -> dict[int, float]:
+def copy_weights_from_chain(metagraph: bt.Metagraph) -> dict[int, float]:
     """Copy weights from the chain to the validator.
 
     Returns:

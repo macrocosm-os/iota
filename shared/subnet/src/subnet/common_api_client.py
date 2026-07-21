@@ -2,7 +2,7 @@ from abc import abstractmethod
 import asyncio
 from aiohttp import ClientSession, ClientTimeout
 from loguru import logger
-from substrateinterface.keypair import Keypair
+from bittensor_wallet import Keypair
 
 from common import settings as common_settings
 from common.models.api_models import RunEpochResponse

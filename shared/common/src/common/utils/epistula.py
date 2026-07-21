@@ -6,7 +6,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, Header
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, model_validator
-from substrateinterface import Keypair
+from bittensor_wallet import Keypair
 import uuid
 from common import settings as common_settings
 
