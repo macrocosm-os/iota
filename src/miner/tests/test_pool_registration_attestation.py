@@ -73,6 +73,8 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
     assert sent_requests, "register request should be sent"
     request = sent_requests[0]
     assert request.attestation == mounted_payload
+    assert request.coldkey == "coldkey-1"
+    assert request.register_as_metagraph_miner is False
     assert request.enclave_payload is None
     assert request.p2p_node_id == "peer-1"
 
