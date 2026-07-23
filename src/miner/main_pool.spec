@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_data_files
 
 load_dotenv()
 
@@ -13,13 +13,14 @@ ENTITLEMENTS_PATH = Path(os.getcwd()).parents[1] / "scripts" / "entitlements.pli
 
 SIGNING_IDENTITY = os.getenv("MACOS_SIGNING_IDENTITY")
 IROH_BINARIES = collect_dynamic_libs("iroh", destdir="iroh")
+SCALECODEC_DATAS, SCALECODEC_BINARIES, SCALECODEC_HIDDEN_IMPORTS = collect_all("scalecodec")
 
 a = Analysis(
     ["main_pool.py"],
     pathex=[],
-    binaries=[(str(ATTEST_SO_PATH), "common"), *IROH_BINARIES],
-    datas=collect_data_files("certifi"),
-    hiddenimports=["platformdirs.macos", "iroh.iroh_ffi"],
+    binaries=[(str(ATTEST_SO_PATH), "common"), *IROH_BINARIES, *SCALECODEC_BINARIES],
+    datas=[*collect_data_files("certifi"), *SCALECODEC_DATAS],
+    hiddenimports=["platformdirs.macos", "iroh.iroh_ffi", *SCALECODEC_HIDDEN_IMPORTS],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=["hooks/hook-ssl-certifi.py"],
