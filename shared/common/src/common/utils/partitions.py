@@ -17,6 +17,12 @@ def get_pairs_for_miner(
     Returns:
         dict[int, tuple[str, str]]: A dictionary of partition numbers to pairs of miner hotkeys.
     """
+    # No miners to pair (e.g. no weights submitted this epoch). Returning early
+    # avoids the pairing loop below spinning forever on an empty pool.
+    if len(miner_hotkeys) == 0:
+        logger.warning(f"No miner hotkeys found for target hotkey {target_hotkey}; returning empty list")
+        return []
+
     if len(miner_hotkeys) == 1:
         return {i: (miner_hotkeys[0], None) for i in range(n_partitions)}
 
