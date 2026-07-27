@@ -77,3 +77,15 @@ def test_create_run_metadata_fills_missing_kick_policy():
     stored = create_run_metadata(RunMetadata())
     assert stored.kick_policy == KickPolicy.NO_KICK_POLICY
     assert stored.kick_policy_params == {}
+
+
+def test_is_public_defaults_to_false():
+    assert RunMetadata().is_public is False
+
+
+def test_create_run_metadata_preserves_is_public():
+    stored = create_run_metadata(RunMetadata(is_public=False))
+    assert stored.is_public is False
+
+    stored = create_run_metadata(RunMetadata(is_public=True))
+    assert stored.is_public is True

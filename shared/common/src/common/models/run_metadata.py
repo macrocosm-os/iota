@@ -36,6 +36,7 @@ class RunMetadata(BaseModel):
 
     kick_policy: KickPolicy = Field(default=KickPolicy.NO_KICK_POLICY)
     kick_policy_params: dict[str, Any] = Field(default_factory=dict)
+    is_public: bool = Field(default=False)
 
     def is_kick_active(self) -> bool:
         return self.kick_policy != KickPolicy.NO_KICK_POLICY
@@ -55,5 +56,6 @@ def create_run_metadata(run_metadata: RunMetadata | None = None) -> RunMetadata:
         return RunMetadata(
             kick_policy=run_metadata.kick_policy,
             kick_policy_params=run_metadata.kick_policy_params,
+            is_public=run_metadata.is_public,
         )
     return RunMetadata(kick_policy=KickPolicy.NO_KICK_POLICY, kick_policy_params={})
