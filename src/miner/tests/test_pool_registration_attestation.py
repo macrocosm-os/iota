@@ -52,9 +52,6 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
             model_metadata=SimpleNamespace(model_dump=lambda: {}),
         )
 
-    async def fake_change_payout_coldkey_request(_payout_coldkey):
-        return {}
-
     async def fake_collect_mounted_attestation(*, challenge_base64, challenge_id):
         assert challenge_id == "challenge-1"
         assert challenge_base64
@@ -63,7 +60,6 @@ async def test_pool_registration_sends_mounted_attestation(monkeypatch):
     miner.miner_api_client = SimpleNamespace(
         request_attestation_challenge=fake_request_attestation_challenge,
         register_miner_request=fake_register_miner_request,
-        change_payout_coldkey_request=fake_change_payout_coldkey_request,
     )
     monkeypatch.setattr("miner.pool.miner.collect_system_data", lambda: '{"bandwidth":{}}')
     miner.collect_mounted_attestation = fake_collect_mounted_attestation

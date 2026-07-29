@@ -8,6 +8,7 @@ from common import settings
 from common.models.ml_models import ModelConfig, ModelMetadata
 from common.models.run_flags import RunFlags
 from common.utils.partitions import MinerPartition
+from common.models.run_metadata import RunTier
 
 
 class NodeLocation(BaseModel):
@@ -248,6 +249,8 @@ class SubnetScores(BaseModel):
 
     miner_scores: list[MinerScore]
     runs: list[RunIncentiveAllocation]
+    active_runs: list[RunIncentiveAllocation] = Field(default_factory=list)
+    provider_pool_metadata: dict = Field(default_factory=dict)
 
     # Overall burn factor calculated for the subnet
     # Calculated by: 1 - sum(all miner weights)
@@ -366,6 +369,7 @@ class RunInfo(BaseModel):
     run_flags: RunFlags
     max_miners: int
     whitelist_force_allow: bool = False
+    tier: RunTier = RunTier.IRON
 
 
 ############################################################
