@@ -4,7 +4,9 @@ from pydantic import ValidationError
 from common.models.run_metadata import (
     BottomByScoreParams,
     KickPolicy,
+    MinerTier,
     RunMetadata,
+    RunTier,
     ScoreThresholdParams,
     create_run_metadata,
 )
@@ -89,3 +91,32 @@ def test_create_run_metadata_preserves_is_public():
 
     stored = create_run_metadata(RunMetadata(is_public=True))
     assert stored.is_public is True
+
+
+def test_create_run_metadata_preserves_tier():
+    stored = create_run_metadata(RunMetadata(tier=RunTier.GOLD))
+
+    assert stored.tier is RunTier.GOLD
+
+
+def test_miner_tiers_include_run_tiers():
+    for run_tier in RunTier:
+        assert MinerTier[run_tier.name].value == run_tier.value
+
+    assert MinerTier.BANNED.value == -1
+
+
+@pytest.mark.parametrize("tier", list(RunTier))
+def test_run_metadata_accepts_supported_tiers(tier):
+    metadata = RunMetadata(tier=tier)
+
+    assert metadata.tier is tier
+
+
+def test_run_metadata_rejects_banned_tier():
+    with pytest.raises(ValidationError):
+        RunMetadata(tier=MinerTier.BANNED)
+
+
+def test_run_tier_defaults_to_iron():
+    assert RunMetadata().tier is RunTier.IRON

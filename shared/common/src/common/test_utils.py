@@ -2,6 +2,7 @@
 
 from common.models.api_models import RunInfo
 from common.models.run_flags import RunFlags
+from common.models.run_metadata import RunTier
 
 
 # Test constants
@@ -41,6 +42,7 @@ def create_test_run_info(
     incentive_perc: float = 0.33,
     max_miners: int = 256,
     whitelist_force_allow: bool = False,
+    tier: RunTier = RunTier.IRON,
 ) -> RunInfo:
     return RunInfo(
         run_id=run_id,
@@ -54,4 +56,5 @@ def create_test_run_info(
         run_flags=RunFlags(),
         max_miners=max_miners,
         whitelist_force_allow=whitelist_force_allow,
+        tier=tier,
     )

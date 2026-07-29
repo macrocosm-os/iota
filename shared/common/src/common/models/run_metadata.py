@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -31,12 +31,32 @@ KICK_POLICY_PARAM_MODELS: dict[KickPolicy, type[BaseModel] | None] = {
 }
 
 
+class RunTier(IntEnum):
+    """Known run tier options."""
+
+    IRON = 0
+    BRONZE = 1
+    SILVER = 2
+    GOLD = 3
+
+
+class MinerTier(IntEnum):
+    """Known miner tier options, including the miner-only banned state."""
+
+    BANNED = -1
+    IRON = RunTier.IRON.value
+    BRONZE = RunTier.BRONZE.value
+    SILVER = RunTier.SILVER.value
+    GOLD = RunTier.GOLD.value
+
+
 class RunMetadata(BaseModel):
     """Per-run operational metadata."""
 
     kick_policy: KickPolicy = Field(default=KickPolicy.NO_KICK_POLICY)
     kick_policy_params: dict[str, Any] = Field(default_factory=dict)
     is_public: bool = Field(default=False)
+    tier: RunTier = Field(default=RunTier.IRON)
 
     def is_kick_active(self) -> bool:
         return self.kick_policy != KickPolicy.NO_KICK_POLICY
@@ -53,9 +73,5 @@ class RunMetadata(BaseModel):
 def create_run_metadata(run_metadata: RunMetadata | None = None) -> RunMetadata:
     """Build run_metadata for create/update; defaults to kick disabled."""
     if run_metadata is not None:
-        return RunMetadata(
-            kick_policy=run_metadata.kick_policy,
-            kick_policy_params=run_metadata.kick_policy_params,
-            is_public=run_metadata.is_public,
-        )
+        return run_metadata.model_copy(deep=True)
     return RunMetadata(kick_policy=KickPolicy.NO_KICK_POLICY, kick_policy_params={})
