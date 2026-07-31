@@ -91,6 +91,15 @@ NESTEROV_MOMENTUM = 0.9
 NESTEROV_MOMENTUM_WARMUP_START = 0.5
 NESTEROV_MOMENTUM_WARMUP_EPOCHS = 20
 
+# Optimizer state sharing: how many completed epochs to search backwards for the
+# most recently uploaded optimizer state. Floored at the upload interval so the
+# window always covers at least one scheduled optimizer upload.
+OPTIMIZER_UPLOAD_EPOCH_INTERVAL = int(os.getenv("OPTIMIZER_UPLOAD_EPOCH_INTERVAL", "1"))
+OPTIMIZER_LOOKBACK_EPOCHS = max(
+    int(os.getenv("OPTIMIZER_LOOKBACK_EPOCHS", "4")),
+    OPTIMIZER_UPLOAD_EPOCH_INTERVAL,
+)
+
 # Activation settings - not for miner's to change
 MAX_ACTIVATION_CACHE_SIZE = 16
 N_BACKWARDS_FOR_CACHE_INCREASE_STOP = int(os.getenv("N_BACKWARDS_FOR_CACHE_INCREASE_STOP", 3))
@@ -134,3 +143,6 @@ def activation_cache_timeout_sec(num_layers: int, layer_idx: int, interval_sec: 
     layer_idx is 0-indexed.
     """
     return interval_sec * (num_layers - layer_idx)
+
+
+BUFFER_WINDOW_BATCH_FRACTION = 0.05
