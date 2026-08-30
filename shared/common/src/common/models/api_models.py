@@ -107,6 +107,8 @@ class MinerRegistrationResponse(BaseModel):
     run_id: str
     run_flags: RunFlags
     num_partitions: int
+    # Orchestrator-assigned MinerStatus value; None from older orchestrators.
+    status: str | None = None
 
 
 class HeartbeatResponse(BaseModel):
@@ -114,6 +116,17 @@ class HeartbeatResponse(BaseModel):
     layer: int
     epoch: int
     phase: str
+    # Orchestrator-assigned MinerStatus value; None from older orchestrators.
+    status: str | None = None
+
+
+class RunConfigResponse(BaseModel):
+    """Live run configuration, polled periodically by miners so run-flag and
+    hyperparameter changes (e.g. activation cache size) apply without a restart."""
+
+    run_id: str
+    run_flags: RunFlags
+    model_metadata: ModelMetadata | None = None
 
 
 class RunEpochResponse(BaseModel):
@@ -180,6 +193,8 @@ class ValidatorTask(BaseModel):
     task_type: str  # validation_scoring, validation_detection
     function_name: str
     inputs: dict
+    # The task's run mini batch size, so the validator reshapes activations to the run's value.
+    mini_batch_size: int | None = None
 
 
 class TestTaskModel(BaseModel):
@@ -242,6 +257,22 @@ class RunIncentiveAllocation(BaseModel):
 
     # How much of the allocated incentive is burned for this run
     burn_factor: float
+
+    # Fraction of the payout window (billing period) during which this run was ACTIVE.
+    # The run's effective incentive is incentive_weight * active_weight_fraction, so a
+    # run that was only alive for part of the window contributes proportionally less.
+    # Defaults to 1.0 (full window) for the validator path, which has no billing window.
+    active_weight_fraction: float = 1.0
+
+    @property
+    def effective_incentive_weight(self) -> float:
+        """Incentive scaled by the fraction of the payout window the run was active.
+
+        A run alive for only part of the window (e.g. archived or created mid-window
+        during a run-family rotation) contributes proportionally less. On the validator
+        path active_weight_fraction defaults to 1.0, so this is just incentive_weight.
+        """
+        return self.incentive_weight * self.active_weight_fraction
 
 
 class SubnetScores(BaseModel):

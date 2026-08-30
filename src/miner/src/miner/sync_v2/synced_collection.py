@@ -14,7 +14,9 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
+import random
 from typing import Any, Literal
 
 import httpx
@@ -231,14 +233,15 @@ async def set_many(
     *,
     lock: Lock | None = None,
     current_versions: dict[str, int] | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Batch-set tracked variables in a single request.
 
-    Returns a list of variable names whose bridge entry was not found
-    (VariableNotFound error). Callers can use this to re-register and retry.
+    Returns ``(not_found, mismatched)`` variable names: bridge entries that
+    were missing (VariableNotFound — re-register and retry) and CAS writes
+    rejected for a stale version (refresh the version and retry).
     """
     if not values:
-        return []
+        return [], []
     updates: list[dict[str, Any]] = []
     for name, value in values.items():
         if name not in variables:
@@ -260,14 +263,18 @@ async def set_many(
     resp.raise_for_status()
 
     not_found: list[str] = []
+    mismatched: list[str] = []
     run_prefix = f"{run_id}/"
     for result in resp.json().get("results", []):
         if result.get("status") == "error":
             logger.warning(f"set_many {result['var_id']!r}: {result.get('error')}")
-            if "VariableNotFound" in (result.get("error") or ""):
-                full_id = result["var_id"]
-                rel = full_id.removeprefix(run_prefix) if full_id.startswith(run_prefix) else full_id
+            error = result.get("error") or ""
+            full_id = result["var_id"]
+            rel = full_id.removeprefix(run_prefix) if full_id.startswith(run_prefix) else full_id
+            if "VariableNotFound" in error:
                 not_found.append(rel)
+            elif "CASVersionMismatch" in error:
+                mismatched.append(rel)
             continue
         full_id = result["var_id"]
         rel = full_id.removeprefix(run_prefix) if full_id.startswith(run_prefix) else full_id
@@ -276,19 +283,88 @@ async def set_many(
             if rel in values:
                 variables[rel]._cached_value = values[rel]
             variables[rel]._needs_push = False
-    return not_found
+    return not_found, mismatched
+
+
+async def _refresh_versions(
+    client: httpx.AsyncClient,
+    run_id: str,
+    variables: dict[str, SyncedVariableV2],
+    names: list[str],
+) -> list[str]:
+    """Refresh local CAS versions for *names* with a keyed /get.
+
+    Fetches by var_id (not by wildcard listing, which can under-report — the
+    listing missing a key while CAS sets still see it is exactly how stale
+    versions get stuck). Updates only the version, keeping the local dirty
+    value intact for the retry. Returns names the bridge reported missing.
+    """
+    tracked = [n for n in names if n in variables]
+    if not tracked:
+        return []
+    resp = await _bridge_request(client, "POST", "/get", json={"var_ids": [variables[n].var_id for n in tracked]})
+    resp.raise_for_status()
+    run_prefix = f"{run_id}/"
+    data = resp.json()
+    for entry in data.get("variables", []):
+        full_id = entry["var_id"]
+        rel = full_id.removeprefix(run_prefix) if full_id.startswith(run_prefix) else full_id
+        if rel in variables:
+            variables[rel].version = entry.get("version", variables[rel].version)
+    missing: list[str] = []
+    for err in data.get("errors", []):
+        full_id = err["var_id"]
+        rel = full_id.removeprefix(run_prefix) if full_id.startswith(run_prefix) else full_id
+        missing.append(rel)
+    return missing
+
+
+async def _reregister_all(
+    client: httpx.AsyncClient,
+    variables: dict[str, SyncedVariableV2],
+) -> None:
+    """Re-register the caller's *entire* entry (all tracked leaves).
+
+    Unlike re-registering only the missing leaves, this rebuilds an entry that
+    was wiped in bulk (e.g. a Redis-cluster node reschedule dropping hash slots),
+    which drops leaves this process isn't currently pushing as dirty. Registration
+    is idempotent, so re-registering already-present leaves is harmless.
+    """
+    vars_list = list(variables.values())
+    if not vars_list:
+        return
+    payload = [
+        {
+            "var_id": var.var_id,
+            "default_value": var._cached_value,
+            "var_type": var.var_type,
+            "write_rule": var.write_rule,
+        }
+        for var in vars_list
+    ]
+    resp = await _bridge_request(client, "POST", "/register", json={"variables": payload})
+    resp.raise_for_status()
+    for i, result in enumerate(resp.json().get("results", [])):
+        if result.get("status") != "error":
+            var = vars_list[i]
+            var.version = result.get("version", 1)
+            var._bridge_registered = True
 
 
 async def push_dirty(
     client: httpx.AsyncClient,
     run_id: str,
     variables: dict[str, SyncedVariableV2],
+    *,
+    max_retries: int = 3,
 ) -> None:
     """Push all dirty (LWW/CAS) variables in one batch.
 
     Skips ``write_rule="LOCK"`` variables — callers must acquire a lock
     and call :meth:`set_value` explicitly.  If any variables are missing
-    from the bridge (VariableNotFound), re-registers them and retries once.
+    from the bridge (VariableNotFound), the entry's registry state was lost;
+    re-register the *whole* entry and retry with bounded backoff until the
+    leaves persist. A persistent failure escalates rather than being swallowed.
     """
     dirty: dict[str, Any] = {}
     for name, var in variables.items():
@@ -303,38 +379,57 @@ async def push_dirty(
     if not dirty:
         return
 
-    not_found = await set_many(client, run_id, variables, dirty)
+    not_found, mismatched = await set_many(client, run_id, variables, dirty)
+
+    if mismatched:
+        # Stale local CAS versions — e.g. background pulls missed these keys
+        # (bridge listing under-reported) so versions were never refreshed.
+        # Refresh by keyed /get and retry; a key missing on refresh joins the
+        # re-register path below.
+        missing = await _refresh_versions(client, run_id, variables, mismatched)
+        not_found.extend(missing)
+        retry_mismatched = {n: dirty[n] for n in mismatched if n in dirty and n not in missing}
+        if retry_mismatched:
+            nf, still_mismatched = await set_many(client, run_id, variables, retry_mismatched)
+            not_found.extend(nf)
+            if still_mismatched:
+                # Lost another race; leaves stay dirty and the next push cycle
+                # retries with the versions refreshed above.
+                logger.warning(f"push_dirty: {len(still_mismatched)} CAS retries still mismatched (run={run_id})")
+
     if not not_found:
         return
 
-    # Re-register vars the bridge doesn't know about, then retry once.
-    nf_vars = [(name, variables[name]) for name in not_found if name in variables]
-    if not nf_vars:
-        return
-    payload = [
-        {
-            "var_id": var.var_id,
-            "default_value": var._cached_value,
-            "var_type": var.var_type,
-            "write_rule": var.write_rule,
-        }
-        for _, var in nf_vars
-    ]
-    try:
-        resp = await _bridge_request(client, "POST", "/register", json={"variables": payload})
-        resp.raise_for_status()
-        for i, result in enumerate(resp.json().get("results", [])):
-            if result.get("status") != "error":
-                _, var = nf_vars[i]
-                var.version = result.get("version", 1)
-                var._bridge_registered = True
-    except Exception as exc:
-        logger.warning(f"push_dirty re-registration failed: {exc}")
-        return
+    # Missing leaves => the bridge lost (part of) this entry's registry state.
+    # Rebuild the full entry, not just the dirty misses, and retry until the
+    # leaves stick or we hit the cap (the next push cycle retries regardless).
+    delay = 0.5
+    for attempt in range(1, max_retries + 1):
+        try:
+            await _reregister_all(client, variables)
+        except Exception as exc:
+            if attempt >= max_retries:
+                logger.error(
+                    f"push_dirty: re-register failed after {attempt} attempts "
+                    f"(run={run_id}, {len(not_found)} missing leaves): {exc}"
+                )
+                return
+            await asyncio.sleep(delay + random.uniform(0, delay))
+            delay *= 2
+            continue
 
-    retry = {name: dirty[name] for name in not_found if name in dirty}
-    if retry:
-        await set_many(client, run_id, variables, retry)
+        retry = {name: dirty[name] for name in not_found if name in dirty}
+        not_found = (await set_many(client, run_id, variables, retry))[0] if retry else []
+        if not not_found:
+            return
+        if attempt < max_retries:
+            await asyncio.sleep(delay + random.uniform(0, delay))
+            delay *= 2
+
+    logger.error(
+        f"push_dirty: {len(not_found)} leaves still missing after {max_retries} "
+        f"re-register attempts (run={run_id}); bridge registry state may be lost"
+    )
 
 
 # ── Deletion ──────────────────────────────────────────────────────────────

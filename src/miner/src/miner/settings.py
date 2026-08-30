@@ -54,8 +54,7 @@ PACK_SAMPLES = os.getenv("PACK_SAMPLES", "True") == "True"  # not for miner's to
 N_PARTITION_BATCHES = int(os.getenv("N_PARTITION_BATCHES", "20"))  # not for miner's to change
 PREVIOUS_WEIGHTS = os.getenv("MODEL_DIR", "./weights")
 
-# Activation settings - miners can reduce if they are OOM'ing but can't surpass common settings
-MAX_ACTIVATION_CACHE_SIZE = int(os.getenv("MAX_ACTIVATION_CACHE_SIZE", common_settings.MAX_ACTIVATION_CACHE_SIZE))
+# Activation settings
 P2P_ACTIVATION_CACHE_TTL = int(os.getenv("P2P_ACTIVATION_CACHE_TTL", 3000))  # seconds
 MAX_FORWARD_ACTIVATIONS_IN_QUEUE = int(
     os.getenv("MAX_FORWARD_ACTIVATIONS_IN_QUEUE", common_settings.MAX_FORWARD_ACTIVATIONS_IN_QUEUE)
@@ -72,6 +71,10 @@ ACTIVATION_SEND_CONCURRENCY = int(os.getenv("ACTIVATION_SEND_CONCURRENCY", "8"))
 
 PEER_STATUS_BROADCAST_INTERVAL_SECONDS = float(os.getenv("PEER_STATUS_BROADCAST_INTERVAL_SECONDS", "5.0"))
 
+# How often the miner re-pulls the run's flags + hyperparameters from the
+# orchestrator so operator changes (e.g. cache size) apply without a restart.
+RUN_CONFIG_REFRESH_INTERVAL_SECONDS = float(os.getenv("RUN_CONFIG_REFRESH_INTERVAL_SECONDS", "300"))
+
 VISUALIZATION_API_URL = os.getenv("VISUALIZATION_API_URL", "http://localhost:8009")
 VISUALIZATION_AUTO_OPEN = os.getenv("VISUALIZATION_AUTO_OPEN", "true").lower() in ("1", "true", "yes", "on")
 
@@ -82,6 +85,8 @@ MIN_LOCAL_OPTIMIZER_STEPS = int(os.getenv("MIN_LOCAL_OPTIMIZER_STEPS", "5"))
 LOCAL_BATCH_SIZE = int(
     os.getenv("LOCAL_BATCH_SIZE", "8")
 )  # Splits the minibatch further into even smaller local batches to avoid running out of memory
+# Probing the largest local batch that fits (and shrinking on OOM) is gated by the
+# `auto_local_batch_size` run flag; see TrainingPhase.calibrate_local_batch_size.
 PSEUDO_GRADIENTS_BATCH_SIZE = int(os.getenv("PSEUDO_GRADIENTS_BATCH_SIZE", "100"))
 
 # Determines whether the miner is mounted within a host electron app

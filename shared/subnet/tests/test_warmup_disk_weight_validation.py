@@ -151,6 +151,32 @@ async def test_warmup_reload_applies_valid_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_warmup_reload_preserves_param_device_and_dtype(monkeypatch):
+    """load_model_weights returns a CPU tensor in whatever dtype was saved.
+    vector_to_parameters re-points param.data at views of that vector, so
+    applying it raw migrates the params off their device/dtype while the
+    optimizer state (materialized by the step that ran just before the
+    reload) stays behind — the next optimizer.step() then dies with
+    "Tensors of the same index must be on the same device and the same
+    dtype". Simulate with a bf16 snapshot against fp32 params (the dtype
+    half of the same grouping check, testable without CUDA)."""
+    mgr = _make_manager_for_warmup()
+    snapshot = torch.full_like(_current_params(mgr), -3.5).to(torch.bfloat16)
+    monkeypatch.setattr(model_mixin_module, "load_model_weights", lambda **_: snapshot)
+
+    await mgr.local_optimization_step(learning_rate=1e-3, current_epoch=_IN_WARMUP_EPOCH)
+
+    for p in mgr.model.parameters():
+        assert p.dtype == torch.float32, "warm-up reload must not change parameter dtype"
+
+    # The next optimization step must group params with the pre-existing
+    # optimizer state without error.
+    for p in mgr.model.parameters():
+        p.grad = torch.zeros_like(p)
+    mgr.optimizer.step()
+
+
+@pytest.mark.asyncio
 async def test_warmup_branch_skipped_outside_window(monkeypatch):
     """When epochs_since_registration > 2 (or epoch_on_registration <= 1), the
     warm-up branch must not run — so load_model_weights is never called."""

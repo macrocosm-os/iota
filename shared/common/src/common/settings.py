@@ -56,8 +56,9 @@ REQUEST_RETRY_COUNT = int(os.getenv("REQUEST_RETRY_COUNT", "3"))
 # Bridge settings
 CLIENT_REQUEST_TIMEOUT = int(os.getenv("CLIENT_REQUEST_TIMEOUT", "40"))  # TODO: Make this 20s
 
-MIN_PART_SIZE = 10 * 1024 * 1024  # 10MB
+MIN_PART_SIZE = 10 * 1024 * 1024  # TODO: Change this to 16 -> 64 for Orion runs
 MAX_PART_SIZE = 100 * 1024 * 1024  # 100MB
+S3_UPLOAD_MAX_CONCURRENCY = int(os.getenv("S3_UPLOAD_MAX_CONCURRENCY", "16"))  # concurrent part PUTs per blob
 
 # Self-describing blob wire format (see shared/common/src/common/utils/blob_format.py)
 BLOB_VERSION = 1
@@ -105,11 +106,47 @@ MAX_ACTIVATION_CACHE_SIZE = 16
 N_BACKWARDS_FOR_CACHE_INCREASE_STOP = int(os.getenv("N_BACKWARDS_FOR_CACHE_INCREASE_STOP", 3))
 MAX_FORWARD_ACTIVATIONS_IN_QUEUE = 2
 MIN_FORWARD_ACTIVATIONS_IN_QUEUE = 1
-MINI_BATCH_SIZE = 4
+MINI_BATCH_SIZE = 4  # default; per-run value is applied via set_mini_batch_size() from run metadata
 MINI_BATCH_ACCUMULATION_COUNT = 4
 SEQUENCE_LENGTH = 800
 
+
+def set_mini_batch_size(value: int | None) -> None:
+    """Apply a run's mini batch size process-wide (mirrors the RUN_FLAGS per-run pattern).
+
+    Consumers read ``common_settings.MINI_BATCH_SIZE`` by attribute, so mutating it here makes
+    them all see the per-run value. Callers must invoke this once per active run, at the point
+    they learn the run's metadata (miner registration, validator task execution). No-op if
+    ``value`` is falsy or unchanged.
+    """
+    global MINI_BATCH_SIZE
+    if value and value != MINI_BATCH_SIZE:
+        MINI_BATCH_SIZE = value
+
+
+def set_mini_batch_accumulation_count(value: int | None) -> None:
+    """Apply a run's mini batch accumulation count process-wide. No-op if value is falsy or unchanged."""
+    global MINI_BATCH_ACCUMULATION_COUNT
+    if value and value != MINI_BATCH_ACCUMULATION_COUNT:
+        MINI_BATCH_ACCUMULATION_COUNT = value
+
+
+def set_max_activation_cache_size(value: int | None) -> None:
+    """Apply a run's max activation cache size process-wide. No-op if value is falsy or unchanged."""
+    global MAX_ACTIVATION_CACHE_SIZE
+    if value and value != MAX_ACTIVATION_CACHE_SIZE:
+        MAX_ACTIVATION_CACHE_SIZE = value
+
+
+def set_sequence_length(value: int | None) -> None:
+    """Apply a run's sequence length process-wide. No-op if value is falsy or unchanged."""
+    global SEQUENCE_LENGTH
+    if value and value != SEQUENCE_LENGTH:
+        SEQUENCE_LENGTH = value
+
+
 ACTIVATION_TIMEOUT_SEC = int(os.getenv("ACTIVATION_TIMEOUT", "100") if not MOCK else 600)
+ACTIVATION_CACHE_TIMEOUT_SEC = int(os.getenv("ACTIVATION_CACHE_TIMEOUT", "300"))
 
 # P2P connection pool
 P2P_MAX_SENDER_CONNECTIONS = int(os.getenv("P2P_MAX_SENDER_CONNECTIONS", "128"))
@@ -137,7 +174,9 @@ MIN_PARTITION_DOWNLOAD_SUCCESS_PCT = 90  # TODO: Make this dynamic based on the 
 MIN_COSINE_SIMILARITY_DOWNLOAD = float(os.getenv("MIN_COSINE_SIMILARITY_DOWNLOAD", "0.9"))
 
 
-def activation_cache_timeout_sec(num_layers: int, layer_idx: int, interval_sec: int = 300) -> int:
+def activation_cache_timeout_sec(
+    num_layers: int, layer_idx: int, interval_sec: int = ACTIVATION_CACHE_TIMEOUT_SEC
+) -> int:
     """
     Seconds to retain forward activations in the miner cache; longer for earlier layers.
     layer_idx is 0-indexed.
@@ -145,4 +184,5 @@ def activation_cache_timeout_sec(num_layers: int, layer_idx: int, interval_sec: 
     return interval_sec * (num_layers - layer_idx)
 
 
+# Buffer window settings
 BUFFER_WINDOW_BATCH_FRACTION = 0.05

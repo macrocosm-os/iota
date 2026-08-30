@@ -463,13 +463,6 @@ class ActivationPublisher:
                 return
 
         max_tries = miner_settings.ACTIVATION_SEND_MAX_TRIES
-        item.tries += 1
-        if item.tries > max_tries:
-            logger.warning(
-                f"Dropping {item.msg.direction} activation {item.msg.activation_id} "
-                f"after {item.tries - 1} tries (max={max_tries})"
-            )
-            return
 
         # Resolve target
         target_ctx = ""
@@ -552,6 +545,10 @@ class ActivationPublisher:
                 f"direct={len(chosen.iroh_direct_addresses or [])}"
             )
 
+        # Counts send attempts only — deferrals above re-enqueue without
+        # consuming a try; the entry deadline check bounds their lifetime.
+        item.tries += 1
+
         # Send. Per-attempt timings get hydrated by the sender; errors and the final
         # attempt count accumulate on the OutboundItem across publisher-level retries.
         attempt_timings = P2POperationTimings()
@@ -591,7 +588,12 @@ class ActivationPublisher:
                 f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
             )
         except ActivationPushNackError as nack_exc:
-            item.p2p_errors.append(f"NACK[{nack_exc.status.name}]: {nack_exc}")
+            # The Rust-backed exception carries the P2PResponseStatus enum in
+            # args[0]; it has no `.status` attribute. Fall back to the class
+            # name if the args shape is ever different.
+            nack_status = nack_exc.args[0] if nack_exc.args else None
+            nack_status_name = getattr(nack_status, "name", "UNKNOWN")
+            item.p2p_errors.append(f"NACK[{nack_status_name}]: {nack_exc}")
             # Receiver explicitly rejected the push (e.g. queue full)
             if item.tries < max_tries:
                 if item.msg.direction == "forward":
@@ -599,7 +601,7 @@ class ActivationPublisher:
                 backoff = self._retry_backoff_seconds(item.tries)
                 logger.warning(
                     f"Push NACK for {item.msg.direction} {item.msg.activation_id} "
-                    f"({nack_exc.status.name}), re-enqueuing in {backoff:.2f}s (tries={item.tries}/{max_tries}) "
+                    f"({nack_status_name}), re-enqueuing in {backoff:.2f}s (tries={item.tries}/{max_tries}) "
                     f"| {target_ctx} | req={attempt_timings.req_id[:8] if attempt_timings.req_id else '-'} | {_format_phases(attempt_timings)}"
                 )
                 await asyncio.sleep(backoff)

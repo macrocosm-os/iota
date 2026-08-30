@@ -3,16 +3,16 @@ from __future__ import annotations
 import torch
 from loguru import logger
 import asyncio
+import statistics
 import time
 
 from common.models.run_flags import RunFlags
 from common import settings as common_settings
 from common.utils.exceptions import NanInfException
-from common.utils.lr_scheduler import make_lr_scheduler
 from subnet.utils.vector_utils import check_for_nans_and_infs
 from subnet.miner_api_client import MinerAPIClient
 from subnet.model.model_mixin import ModelManager
-from subnet.model.utils import compute_loss, log_gpu_memory_usage
+from subnet.model.utils import compute_loss, log_gpu_memory_usage, _clean_gpu_memory
 from subnet.model import gpu_device
 
 
@@ -24,9 +24,7 @@ from miner.training.activation_cache import ActivationData, ActivationCache
 from miner.training.activation_queue import ActivationQueue
 from miner.training.activation_publisher import ActivationPublisher
 from miner.training.peer_selection import select_by_capacity
-from miner.sync_v2.counter import SyncedCounter
 from miner.sync_v2.elastic_device_mesh import ElasticDeviceMesh
-from miner.sync_v2.utils import sync_run_sync_prefix
 from miner.telemetry.metric_registry import (
     ACTIVATIONS_PROCESSED_TOTAL,
     BACKWARD_PASS_DURATION_SECONDS,
@@ -36,6 +34,10 @@ from miner.telemetry.metric_registry import (
 
 if False:  # for typing purposes only
     from miner.new_miner import Miner
+
+# Local batch size calibration: untimed warmup passes then timed passes per candidate.
+_PROBE_WARMUP_ITERS = 3
+_PROBE_TIMED_ITERS = 10
 
 
 class TrainingPhase:
@@ -63,6 +65,7 @@ class TrainingPhase:
             cache_timeout_sec=common_settings.activation_cache_timeout_sec(
                 num_layers=self._model_manager.model_metadata["n_splits"],
                 layer_idx=self._state_manager.layer,
+                interval_sec=common_settings.ACTIVATION_CACHE_TIMEOUT_SEC,
             ),
         )
         self._queue: ActivationQueue = ActivationQueue(
@@ -82,6 +85,10 @@ class TrainingPhase:
             peer_selector=select_by_capacity,
         )
         self._stats_tracker: StatsTracker | None = None
+        # Per-GPU local micro-batch size. Capped at MINI_BATCH_SIZE (larger is a no-op: the
+        # backward slice loop never exceeds the mini-batch). Calibrated on startup and shrunk
+        # on OOM during training; see calibrate_local_batch_size / _reduce_local_batch_size.
+        self._local_batch_size = min(miner_settings.LOCAL_BATCH_SIZE, common_settings.MINI_BATCH_SIZE)
         self.backwards_since_reset = 0
         self.backwards_since_last_optim = 0
         self.local_optimization_steps = 0
@@ -90,38 +97,7 @@ class TrainingPhase:
         if self._run_flags.auto_max_cache.isOn():
             self._cache._warmup_active = True
         self.miner = miner
-        self._loss_on_cpu: bool = False
         self.node_registry = node_registry
-        # Counter is created lazily after registration so Redis keys include ``run_id``.
-        self._backward_counter: SyncedCounter | None = None
-        self._counter_started: bool = False
-        self._lr_scheduler = make_lr_scheduler()
-
-    async def rebind_backward_counter_for_run(self) -> None:
-        """Drop the distributed counter so the next opt step binds a run-scoped Redis key."""
-        if self._backward_counter is not None:
-            await self._backward_counter.stop()
-            self._backward_counter = None
-        self._counter_started = False
-
-    async def _ensure_backward_counter(self) -> SyncedCounter:
-        """Build or replace the backward counter for the current run and layer."""
-        ns = sync_run_sync_prefix(self._state_manager.run_id)
-        name = f"global_backward_count_{self._state_manager.layer}"
-        if (
-            self._backward_counter is not None
-            and getattr(self._backward_counter, "_namespace", None) == ns
-            and getattr(self._backward_counter, "_name", None) == name
-        ):
-            return self._backward_counter
-        if self._backward_counter is not None:
-            await self._backward_counter.stop()
-        self._backward_counter = SyncedCounter(
-            name=name,
-            namespace=ns,
-            manager=self.miner._bridge_manager,
-        )
-        return self._backward_counter
 
     def _record_forward_timing(self, activation_data: ActivationData, start_time: float, end_time: float) -> None:
         if self._stats_tracker is None:
@@ -159,7 +135,6 @@ class TrainingPhase:
                 await self._queue.check_if_training_is_complete()
 
                 if self._cache.is_full() and self._queue.next_activation_is_forward():
-                    logger.debug(f"Activation cache is full ({len(self._cache)}), waiting for backward activations")
                     await asyncio.sleep(1)
                     continue
 
@@ -260,9 +235,14 @@ class TrainingPhase:
                     return await self.backward(activation_data=activation_data)
 
                 logger.debug(f"Forwarding activation of size {activation_data.input_activations.shape}")
-                output_activations_gpu, _ = await self._model_manager._forward_no_intermittent_activations(
-                    input_activations=input_activations_gpu, processing_batch_size=miner_settings.LOCAL_BATCH_SIZE
-                )
+                while True:
+                    try:
+                        output_activations_gpu, _ = await self._model_manager._forward_no_intermittent_activations(
+                            input_activations=input_activations_gpu, processing_batch_size=self._local_batch_size
+                        )
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        self._reduce_local_batch_size()
 
                 # Cleanup GPU memory
                 output_activations_cpu = output_activations_gpu.detach().cpu()
@@ -309,131 +289,24 @@ class TrainingPhase:
                     self._stats_tracker.record_backward()
                 start_time = time.time()
                 last_layer = self._state_manager.layer == self._model_manager.model_metadata["n_splits"] - 1
-                all_input_activations_grads = []
-                losses = []
 
                 logger.info(
-                    f"🔄 BACKWARD pass | layer={self._state_manager.layer} activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
+                    f"🔄 BACKWARD pass | layer={self._state_manager.layer} local_batch={self._local_batch_size} "
+                    f"activation={activation_data.activation_id} hotkey={self._hotkey[:8]}"
                 )
 
-                # Sub-phase timing accumulators (accumulated across local batch iterations)
-                gpu_setup_total = 0.0
-                bwd_fwd_total = 0.0
-                bwd_loss_total = 0.0
-                bwd_pass_total = 0.0
-                grad_extract_total = 0.0
+                # Run the local-batch slice loop, shrinking the local batch and retrying on OOM.
+                while True:
+                    try:
+                        slices = await self._run_backward_slices(activation_data, last_layer)
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        self._reduce_local_batch_size()
 
-                for i in range(0, len(activation_data.input_activations), miner_settings.LOCAL_BATCH_SIZE):
-                    log_gpu_memory_usage(
-                        note=f"after training forward pass cleaning on last layer miner with cache size of {len(self._cache)}"
-                    )
-                    gpu_setup_start = time.time()
-                    async with TimerLoggerMiner(name="moving to gpu", hotkey=self._hotkey[:8]):
-                        log_gpu_memory_usage(note="starting training backward pass")
-
-                        # Check if activation is in cache
-                        if activation_data.activation_id not in self._cache:
-                            logger.warning(
-                                f"⚠️ Activation {activation_data.activation_id} not found in cache, skipping backward pass"
-                            )
-                            return
-
-                        # Move to GPU and enable gradients only for floating point tensors
-                        self._model_manager.model = self._model_manager.model.to(self._device)
-                        cached_input_activation = self._cache[activation_data.activation_id].input_activations.to(
-                            self._device
-                        )
-                        backwards_grads_from_previous_miner = activation_data.input_activations.to(self._device)
-
-                        # Take slices
-                        sliced_cached_input_activation = (
-                            cached_input_activation[i : i + miner_settings.LOCAL_BATCH_SIZE].clone().contiguous()
-                        )
-
-                        if last_layer:
-                            sliced_backwards_grads_from_previous_miner = None
-                            sliced_targets = activation_data.sample_activations[
-                                i : i + miner_settings.LOCAL_BATCH_SIZE
-                            ].contiguous()
-                        else:
-                            sliced_backwards_grads_from_previous_miner = (
-                                backwards_grads_from_previous_miner[i : i + miner_settings.LOCAL_BATCH_SIZE]
-                                .clone()
-                                .contiguous()
-                            )
-
-                        if self._state_manager.layer > 0:
-                            sliced_cached_input_activation.requires_grad_(True)
-                    gpu_setup_total += time.time() - gpu_setup_start
-
-                    bwd_fwd_start = time.time()
-                    output_activations_gpu, state = await self._model_manager._forward(
-                        layer=self._state_manager.layer,
-                        input_activations=sliced_cached_input_activation,
-                    )
-                    bwd_fwd_total += time.time() - bwd_fwd_start
-
-                    log_gpu_memory_usage(note="after preparing activations on training backward pass")
-
-                    # Compute loss; if targets download or loss computation fails, skip backward gracefully
-                    if last_layer:
-                        try:
-                            bwd_loss_start = time.time()
-                            logger.debug(
-                                f"Computing loss for last layer miner with shape {output_activations_gpu.shape} and targets shape {sliced_targets.shape} on local batch {i} of {len(activation_data.input_activations)/miner_settings.LOCAL_BATCH_SIZE}"
-                            )
-                            # logger.debug(f"Targets (shape: {sliced_targets.shape}): {sliced_targets}")
-                            loss = await self.compute_last_layer_loss(
-                                activation_data=activation_data, logits=output_activations_gpu, targets=sliced_targets
-                            )
-                            # Ex: batch = 8, local_batch = 2, so we divide by 4
-                            output_activations_gpu = loss / (
-                                len(activation_data.input_activations) / miner_settings.LOCAL_BATCH_SIZE
-                            )
-                            # output_activations_gpu = loss
-                            losses.append(loss.item())
-                            bwd_loss_total += time.time() - bwd_loss_start
-                        except Exception as e:
-                            logger.exception(
-                                f"Skipping backward for activation {activation_data.activation_id} due to loss/target fetch error: {e}"
-                            )
-                            return
-
-                    bwd_pass_start = time.time()
-                    async with TimerLoggerMiner(name="backward pass", hotkey=self._hotkey[:8]):
-                        await self._model_manager._backward(
-                            layer=self._state_manager.layer,
-                            output_activations=output_activations_gpu,
-                            activation_grads=sliced_backwards_grads_from_previous_miner,
-                            state=state,
-                        )
-                    bwd_pass_total += time.time() - bwd_pass_start
-                    log_gpu_memory_usage(note="after backward pass")
-
-                    # Handle different cases for input activation gradients
-                    grad_extract_start = time.time()
-                    if self._mock:
-                        input_activation_grads = sliced_cached_input_activation.detach().to(torch.bfloat16).cpu()
-
-                    elif self._state_manager.layer == 0:
-                        # Get the embedding layer weight grads instead of the input activations grads
-                        # This is because input activation grads of the first layer do not exist.
-                        emb_weight = self._model_manager.model.tok_emb.weight
-                        embedding_dim = (
-                            self._model_manager.model_config["bottleneck_dim"]
-                            or self._model_manager.model_config["emb_dim"]
-                        )
-                        n_grad_elems = common_settings.SEQUENCE_LENGTH * embedding_dim * common_settings.MINI_BATCH_SIZE
-                        # Same values as flatten().cpu()[:n] before, but slice + bf16 on GPU then D2H only for the prefix.
-                        input_activation_grads = (
-                            emb_weight.grad.detach().reshape(-1)[:n_grad_elems].to(torch.bfloat16).cpu()
-                        )
-                    else:
-                        input_activation_grads = sliced_cached_input_activation.grad.detach().cpu()
-                    grad_extract_total += time.time() - grad_extract_start
-
-                    log_gpu_memory_usage(note="after moving input activation grads to GPU")
-                    all_input_activations_grads.append(input_activation_grads)
+                # Activation vanished from cache mid-flight, or loss/target fetch failed: skip.
+                if slices is None:
+                    return
+                all_input_activations_grads, losses, timing = slices
                 end_time = time.time()
                 if self._stats_tracker is not None:
                     stats = self._stats_tracker.ensure_activation_stats(
@@ -448,11 +321,11 @@ class TrainingPhase:
                     stats.timing.backward.backward_queue_len = len(self._queue._backward_queue)
 
                     # Sub-phase durations (accumulated across local batch iterations)
-                    stats.timing.backward_gpu_setup.duration = gpu_setup_total
-                    stats.timing.backward_forward.duration = bwd_fwd_total
-                    stats.timing.backward_loss.duration = bwd_loss_total
-                    stats.timing.backward_pass.duration = bwd_pass_total
-                    stats.timing.backward_grad_extract.duration = grad_extract_total
+                    stats.timing.backward_gpu_setup.duration = timing["gpu_setup"]
+                    stats.timing.backward_forward.duration = timing["bwd_fwd"]
+                    stats.timing.backward_loss.duration = timing["bwd_loss"]
+                    stats.timing.backward_pass.duration = timing["bwd_pass"]
+                    stats.timing.backward_grad_extract.duration = timing["grad_extract"]
                 layer_idx = str(self._state_manager.layer)
                 BACKWARD_PASS_DURATION_SECONDS.labels(layer_idx=layer_idx).observe(end_time - start_time)
                 ACTIVATIONS_PROCESSED_TOTAL.labels(direction="backward", layer_idx=layer_idx).inc()
@@ -473,13 +346,28 @@ class TrainingPhase:
                         )
                         if self._stats_tracker is not None:
                             self._stats_tracker.record_loss(mean_loss)
+
+                    # The cached forward activation holds the PREVIOUS layer's P2P node IDs —
+                    # the target this backward gradient must be pushed to. It can be evicted
+                    # mid-flight by cleanup() if it ages past the cache timeout during this
+                    # (multi-second) backward pass.
+                    if activation_data.activation_id in self._cache:
+                        source_p2p_node_ids = self._cache[activation_data.activation_id].source_p2p_node_ids
+                    else:
+                        logger.warning(
+                            f"Activation {activation_data.activation_id} evicted from cache before backward "
+                            f"publish; skipping P2P push, previous layer will pull via orchestrator "
+                            f"| hotkey={self._hotkey[:8]}"
+                        )
+                        source_p2p_node_ids = None
+
                     self._publisher.publish_activation(
                         tensor=torch.cat(all_input_activations_grads, dim=0),
                         activation_id=activation_data.activation_id,
                         direction="backward",
                         upload_url=activation_data.upload_url,
                         activation_path=activation_data.activation_upload_path,
-                        source_p2p_node_ids=self._cache[activation_data.activation_id].source_p2p_node_ids or None,
+                        source_p2p_node_ids=source_p2p_node_ids or None,
                     )
 
                 async with TimerLoggerMiner(name="cleaning up cache", hotkey=self._hotkey[:8]):
@@ -503,9 +391,7 @@ class TrainingPhase:
                             self._cache._frozen_max_size = frozen_size
                             self._auto_max_cache_frozen = True
 
-                    # Cleanup GPU memory
-                    del output_activations_gpu, cached_input_activation, backwards_grads_from_previous_miner
-
+                    # GPU tensors from the slice loop are freed when _run_backward_slices returns.
                     with logger.contextualize(cache_size=len(self._cache)):
                         log_gpu_memory_usage(note="after training backward pass cleaning")
 
@@ -519,18 +405,8 @@ class TrainingPhase:
                             logger.info(
                                 f"🔄 Local optimization step after {mini_batch_accumulation_count} backward passes | hotkey={self._hotkey[:8]}"
                             )
-                            if not self._counter_started:
-                                counter = await self._ensure_backward_counter()
-                                await counter.start()
-                                self._counter_started = True
-
-                            global_step = await self._backward_counter.increment()
-                            logger.debug(f"Global step for miner {self._hotkey[:8]}: {global_step}")
-                            learning_rate = self._lr_scheduler.step(global_step)
-                            logger.debug(f"LR at global step {global_step}: {learning_rate}")
-
                             await self._model_manager.local_optimization_step(
-                                learning_rate=learning_rate,
+                                learning_rate=common_settings.LEARNING_RATE,
                                 current_epoch=self._model_manager.current_epoch,
                             )
                             await self.optimization_reset()
@@ -554,6 +430,285 @@ class TrainingPhase:
                     else:
                         self._stats_tracker.set_local_epoch(max(0, cached_epoch - epoch_on_registration))
 
+    async def _run_backward_slices(self, activation_data: ActivationData, last_layer: bool):
+        """Run fwd+loss+bwd over the mini-batch in ``self._local_batch_size`` slices.
+
+        Returns ``(all_input_activations_grads, losses, timing)`` on success, or ``None`` if
+        the backward should be skipped (activation evicted from cache, or loss/target error).
+        Raises ``torch.cuda.OutOfMemoryError`` so ``backward`` can shrink the batch and retry.
+        """
+        all_input_activations_grads = []
+        losses = []
+
+        # Sub-phase timing accumulators (accumulated across local batch iterations)
+        gpu_setup_total = 0.0
+        bwd_fwd_total = 0.0
+        bwd_loss_total = 0.0
+        bwd_pass_total = 0.0
+        grad_extract_total = 0.0
+
+        for i in range(0, len(activation_data.input_activations), self._local_batch_size):
+            log_gpu_memory_usage(
+                note=f"after training forward pass cleaning on last layer miner with cache size of {len(self._cache)}"
+            )
+            gpu_setup_start = time.time()
+            async with TimerLoggerMiner(name="moving to gpu", hotkey=self._hotkey[:8]):
+                log_gpu_memory_usage(note="starting training backward pass")
+
+                # Check if activation is in cache
+                if activation_data.activation_id not in self._cache:
+                    logger.warning(
+                        f"⚠️ Activation {activation_data.activation_id} not found in cache, skipping backward pass"
+                    )
+                    return None
+
+                # Move to GPU and enable gradients only for floating point tensors
+                self._model_manager.model = self._model_manager.model.to(self._device)
+                cached_input_activation = self._cache[activation_data.activation_id].input_activations.to(self._device)
+                backwards_grads_from_previous_miner = activation_data.input_activations.to(self._device)
+
+                # Take slices
+                sliced_cached_input_activation = (
+                    cached_input_activation[i : i + self._local_batch_size].clone().contiguous()
+                )
+
+                if last_layer:
+                    sliced_backwards_grads_from_previous_miner = None
+                    sliced_targets = activation_data.sample_activations[i : i + self._local_batch_size].contiguous()
+                else:
+                    sliced_backwards_grads_from_previous_miner = (
+                        backwards_grads_from_previous_miner[i : i + self._local_batch_size].clone().contiguous()
+                    )
+
+                if self._state_manager.layer > 0:
+                    sliced_cached_input_activation.requires_grad_(True)
+            gpu_setup_total += time.time() - gpu_setup_start
+
+            bwd_fwd_start = time.time()
+            output_activations_gpu, state = await self._model_manager._forward(
+                layer=self._state_manager.layer,
+                input_activations=sliced_cached_input_activation,
+            )
+            bwd_fwd_total += time.time() - bwd_fwd_start
+
+            log_gpu_memory_usage(note="after preparing activations on training backward pass")
+
+            # Compute loss; if targets download or loss computation fails, skip backward gracefully
+            if last_layer:
+                try:
+                    bwd_loss_start = time.time()
+                    logger.debug(
+                        f"Computing loss for last layer miner with shape {output_activations_gpu.shape} and targets shape {sliced_targets.shape} on local batch {i} of {len(activation_data.input_activations)/self._local_batch_size}"
+                    )
+                    # logger.debug(f"Targets (shape: {sliced_targets.shape}): {sliced_targets}")
+                    loss = await self.compute_last_layer_loss(
+                        activation_data=activation_data, logits=output_activations_gpu, targets=sliced_targets
+                    )
+                    # Ex: batch = 8, local_batch = 2, so we divide by 4
+                    output_activations_gpu = loss / (len(activation_data.input_activations) / self._local_batch_size)
+                    # output_activations_gpu = loss
+                    losses.append(loss.item())
+                    bwd_loss_total += time.time() - bwd_loss_start
+                except Exception as e:
+                    logger.exception(
+                        f"Skipping backward for activation {activation_data.activation_id} due to loss/target fetch error: {e}"
+                    )
+                    return None
+
+            bwd_pass_start = time.time()
+            async with TimerLoggerMiner(name="backward pass", hotkey=self._hotkey[:8]):
+                await self._model_manager._backward(
+                    layer=self._state_manager.layer,
+                    output_activations=output_activations_gpu,
+                    activation_grads=sliced_backwards_grads_from_previous_miner,
+                    state=state,
+                )
+            bwd_pass_total += time.time() - bwd_pass_start
+            log_gpu_memory_usage(note="after backward pass")
+
+            # Handle different cases for input activation gradients
+            grad_extract_start = time.time()
+            if self._mock:
+                input_activation_grads = sliced_cached_input_activation.detach().to(torch.bfloat16).cpu()
+
+            elif self._state_manager.layer == 0:
+                # Get the embedding layer weight grads instead of the input activations grads
+                # This is because input activation grads of the first layer do not exist.
+                emb_weight = self._model_manager.model.tok_emb.weight
+                embedding_dim = (
+                    self._model_manager.model_config["bottleneck_dim"] or self._model_manager.model_config["emb_dim"]
+                )
+                n_grad_elems = common_settings.SEQUENCE_LENGTH * embedding_dim * common_settings.MINI_BATCH_SIZE
+                # Same values as flatten().cpu()[:n] before, but slice + bf16 on GPU then D2H only for the prefix.
+                input_activation_grads = emb_weight.grad.detach().reshape(-1)[:n_grad_elems].to(torch.bfloat16).cpu()
+            else:
+                input_activation_grads = sliced_cached_input_activation.grad.detach().cpu()
+            grad_extract_total += time.time() - grad_extract_start
+
+            log_gpu_memory_usage(note="after moving input activation grads to GPU")
+            all_input_activations_grads.append(input_activation_grads)
+
+        timing = {
+            "gpu_setup": gpu_setup_total,
+            "bwd_fwd": bwd_fwd_total,
+            "bwd_loss": bwd_loss_total,
+            "bwd_pass": bwd_pass_total,
+            "grad_extract": grad_extract_total,
+        }
+        return all_input_activations_grads, losses, timing
+
+    def _reduce_local_batch_size(self) -> None:
+        """Halve the local batch size after an OOM and free GPU memory, so the caller can retry.
+
+        Raises the original error path (via ``raise``) when already at 1 — this GPU cannot fit
+        even a single-sample slice for this layer, which is unrecoverable here.
+        """
+        _clean_gpu_memory()
+        old = self._local_batch_size
+        if old <= 1:
+            logger.error(
+                f"💥 CUDA OOM at local_batch_size=1 | layer={self._state_manager.layer} "
+                f"hotkey={self._hotkey[:8]} — cannot shrink further"
+            )
+            raise
+        self._local_batch_size = max(1, old // 2)
+        logger.warning(
+            f"⚠️ CUDA OOM — reducing local_batch_size {old} → {self._local_batch_size} | "
+            f"layer={self._state_manager.layer} hotkey={self._hotkey[:8]}"
+        )
+
+    async def calibrate_local_batch_size(self) -> None:
+        """Pick the highest-throughput local batch size (≤ MINI_BATCH_SIZE) for this GPU, on startup.
+
+        Sweeps candidate batch sizes upward from 1. For each that fits, times ``_PROBE_TIMED_ITERS``
+        forward+backward passes (after a short warmup) and records batches/second (mean ± stdev).
+        Stops climbing at the first OOM (larger won't fit). Chooses the batch size with the highest
+        *throughput* (samples/second = batch_size × batches/second), not merely the largest that fits,
+        then prints a per-batch-size summary.
+
+        A placeholder tensor the size of the optimizer state (2× params for Adam-family) is held
+        resident during the probe so a batch that fits here also fits once the real loop allocates
+        optimizer state. Non-destructive: forward+backward only populates ``.grad`` (cleared after);
+        it never steps the optimizer, so the seed weights/momentum this runs against are untouched.
+        """
+        if self._run_flags.auto_local_batch_size.isOff() or self._mock or not torch.cuda.is_available():
+            logger.info(
+                f"Skipping local batch size calibration (auto={self._run_flags.auto_local_batch_size.isOn()}, "
+                f"mock={self._mock}) — using local_batch_size={self._local_batch_size}"
+            )
+            return
+
+        model = self._model_manager.model
+        cfg = self._model_manager.model_config
+        layer = self._state_manager.layer
+        last_layer = layer == self._model_manager.model_metadata["n_splits"] - 1
+        hidden_dim = cfg["bottleneck_dim"] or cfg["emb_dim"]
+        seq = common_settings.SEQUENCE_LENGTH
+
+        model.to(self._device)
+        # Reserve VRAM equal to the optimizer state (exp_avg + exp_avg_sq ≈ 2× params for Adam),
+        # so a batch that fits here also fits once the real loop allocates optimizer state.
+        opt_reserve_bytes = 2 * sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+        placeholder = None
+        try:
+            placeholder = torch.empty(opt_reserve_bytes, dtype=torch.uint8, device=self._device)
+        except torch.cuda.OutOfMemoryError:
+            _clean_gpu_memory()
+            logger.warning("Not enough VRAM to reserve optimizer-state headroom during calibration; probing without it")
+
+        async def _probe_iteration(bs: int) -> None:
+            if layer == 0:
+                fake_input = torch.randint(0, cfg["vocab_size"], (bs, seq), device=self._device)
+            else:
+                fake_input = torch.randn(bs, seq, hidden_dim, dtype=cfg["dtype"], device=self._device)
+                fake_input.requires_grad_(True)
+            out, state = await self._model_manager._forward(layer=layer, input_activations=fake_input)
+            if last_layer:
+                # Same chunked path as real training — the old whole-tensor CE with a full
+                # fp32 upcast OOMed the probe at high token counts before real training could.
+                fake_targets = torch.randint(0, cfg["vocab_size"], (bs, seq), device=self._device)
+                loss = compute_loss(
+                    mock=False,
+                    logits=out,
+                    targets=fake_targets,
+                    vocab_size=cfg["vocab_size"],
+                    pad_token_id=-1,
+                    pack=True,
+                    device=self._device,
+                )
+                await self._model_manager._backward(
+                    layer=layer, output_activations=loss, activation_grads=None, state=state
+                )
+            else:
+                fake_grads = torch.randn_like(out)
+                await self._model_manager._backward(
+                    layer=layer, output_activations=out, activation_grads=fake_grads, state=state
+                )
+
+        # Candidate batch sizes: powers of two from 1 up to MINI_BATCH_SIZE (cap included).
+        # Larger than MINI_BATCH_SIZE is a no-op: the real slice loop never exceeds the mini-batch.
+        max_bs = common_settings.MINI_BATCH_SIZE
+        candidates = []
+        b = 1
+        while b < max_bs:
+            candidates.append(b)
+            b *= 2
+        candidates.append(max_bs)
+        candidates = sorted(set(candidates))
+
+        # bs -> (mean_batches_per_sec, stdev_batches_per_sec, samples_per_sec)
+        results: dict[int, tuple[float, float, float]] = {}
+        for bs in candidates:
+            try:
+                for _ in range(_PROBE_WARMUP_ITERS):
+                    await _probe_iteration(bs)
+                torch.cuda.synchronize()
+
+                batches_per_sec = []
+                for _ in range(_PROBE_TIMED_ITERS):
+                    start = time.time()
+                    await _probe_iteration(bs)
+                    torch.cuda.synchronize()
+                    batches_per_sec.append(1.0 / max(time.time() - start, 1e-9))
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(f"OOM at local_batch_size={bs} for layer {layer}; stopping upward search")
+                _clean_gpu_memory()
+                break
+
+            mean_bps = statistics.mean(batches_per_sec)
+            stdev_bps = statistics.stdev(batches_per_sec) if len(batches_per_sec) > 1 else 0.0
+            results[bs] = (mean_bps, stdev_bps, mean_bps * bs)
+            logger.info(
+                f"local_batch_size={bs}: {mean_bps:.2f} ± {stdev_bps:.2f} batches/s "
+                f"({mean_bps * bs:.1f} samples/s) | layer={layer} hotkey={self._hotkey[:8]}"
+            )
+            model.zero_grad(set_to_none=True)
+            _clean_gpu_memory()
+
+        # Restore clean state: drop probe grads and the reserved placeholder.
+        if placeholder is not None:
+            del placeholder
+        model.zero_grad(set_to_none=True)
+        _clean_gpu_memory()
+
+        if not results:
+            logger.error(
+                f"💥 Could not fit local_batch_size=1 for layer {layer} on this GPU | hotkey={self._hotkey[:8]}; "
+                f"keeping {self._local_batch_size}, training will likely OOM"
+            )
+            return
+
+        # Choose highest throughput (samples/s), not the largest that fits.
+        chosen = max(results, key=lambda bs: results[bs][2])
+
+        logger.info(f"📊 Local batch size throughput summary (layer {layer}, hotkey {self._hotkey[:8]}):")
+        for bs in sorted(results):
+            mean_bps, stdev_bps, sps = results[bs]
+            marker = "  ← chosen (max throughput)" if bs == chosen else ""
+            logger.info(f"   bs={bs:>3}: {mean_bps:7.2f} ± {stdev_bps:6.2f} batches/s | {sps:9.1f} samples/s{marker}")
+
+        self._local_batch_size = chosen
+
     async def compute_last_layer_loss(
         self, activation_data: ActivationData, logits: torch.Tensor, targets: torch.Tensor
     ) -> torch.Tensor:
@@ -569,20 +724,20 @@ class TrainingPhase:
             },
             hotkey=self._hotkey[:8],
         ):
-            # NOTE: targets are on the CPU at this point
-            # the problem is that loss calculation is very heavy on the GPU memory
-            # on A4000 a 1B, when on GPU, it took 0.03s to compute the loss - on the CPU performance it took 0.5s
-            if self._loss_on_cpu:
-                device = "cpu"  # If I failed on the gpu once, just calculate on the cpu from now on
-            else:
-                device = self._device
+            # NOTE: targets are on the CPU at this point.
+            # Loss is computed in token chunks (see subnet.model.utils._chunked_cross_entropy),
+            # so GPU OOM here should be rare even at long sequence lengths. The CPU fallback is
+            # per-call only: the old permanent loss-on-CPU latch turned one transient OOM into
+            # ~170s CPU losses for the rest of the run (the root cause of the >7.2K-token
+            # throughput cliff, 2026-07-16).
             try:
-                loss: torch.Tensor = self._compute_loss_on_device(logits, targets, device)
+                loss: torch.Tensor = self._compute_loss_on_device(logits, targets, self._device)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    logger.exception(f"Out of memory error while computing loss on GPU: {e}")
+                    logger.exception(
+                        f"Out of memory error while computing loss on GPU (falling back to CPU for this activation only): {e}"
+                    )
                     gpu_device.empty_cache()
-                    self._loss_on_cpu = True
                     loss = self._compute_loss_on_device(logits, targets, "cpu")
                 else:
                     raise e
@@ -642,15 +797,6 @@ class TrainingPhase:
                 await fetcher
             except (asyncio.CancelledError, Exception):
                 pass
-
-        # Stop the distributed counter so its background poller/Redis connection exits.
-        if self._backward_counter is not None:
-            try:
-                await self._backward_counter.stop()
-            except Exception as e:
-                logger.error(f"Failed to stop backward counter: {e}")
-            self._backward_counter = None
-        self._counter_started = False
 
         # Drop cached activations to release GPU memory before the new instance loads weights.
         try:

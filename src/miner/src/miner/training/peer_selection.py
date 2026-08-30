@@ -11,6 +11,8 @@ import math
 
 import random
 
+from loguru import logger
+
 from common.models.compute_node import ComputeNode
 
 
@@ -39,30 +41,67 @@ def select_by_capacity(eligible: list[ComputeNode]) -> ComputeNode | None:
     Peers are scored by remaining cache headroom plus an inverse of forward
     queue depth.  Peers without metrics, in a non-training layer phase, with
     a non-training miner status, or with zero remaining capacity are excluded.
-    Falls back to uniform random over accepting peers if no peer has measured
-    capacity, and returns ``None`` if no peer is accepting work.
+    Returns ``None`` when peers have reported metrics but none has capacity
+    (backpressure — don't send into full caches).  Falls back to uniform
+    random over accepting peers only when no peer has reported metrics yet
+    (first-contact window before broadcasts arrive).
     """
     scored: list[tuple[ComputeNode, float]] = []
+    # Tally why peers are excluded so the routing decision's inputs are visible.
+    skips = {"no_status": 0, "phase": 0, "status": 0, "no_capacity": 0}
+    considered: list[str] = []  # per-peer cache/queue inputs + outcome for routing visibility
     for node in eligible:
         m = node.runtime_metrics
+        tag = (
+            f"{node.node_id[:8]} cache={m.cache_size}/{m.cache_capacity} "
+            f"fwd_q={m.forward_queue_size} lsr={m.last_status_received} st={m.miner_status}"
+        )
         if m.last_status_received == 0:
             # No metrics received — skip
+            skips["no_status"] += 1
+            considered.append(tag + " -> skip:no_status")
             continue
         if m.layer_phase != "training":
+            skips["phase"] += 1
+            considered.append(tag + f" -> skip:phase({m.layer_phase})")
             continue
         if m.miner_status != "training":
+            skips["status"] += 1
+            considered.append(tag + " -> skip:status")
             continue
         free_cache = m.cache_capacity - m.cache_size
         if free_cache <= 0:
             # No capacity — skip
+            skips["no_capacity"] += 1
+            considered.append(tag + " -> skip:no_capacity")
             continue
         queue_score = 1.0 / (1 + m.forward_queue_size)
-        scored.append((node, math.log(free_cache) + queue_score))
+        # log1p: plain log(1)=0 zeroes the weight at one free slot, and when
+        # ALL peers sit there random.choices raises on an all-zero total.
+        weight = math.log1p(free_cache) * queue_score
+        scored.append((node, weight))
+        considered.append(tag + f" -> scored(w={weight:.3f})")
 
+    peers = " | ".join(considered)
     if scored:
         nodes, weights = zip(*scored)
-        return random.choices(nodes, weights=weights, k=1)[0]
+        chosen = random.choices(nodes, weights=weights, k=1)[0]
+        logger.debug(
+            f"route=capacity eligible={len(eligible)} scored={len(scored)} skips={skips} "
+            f"chose={chosen.node_id[:8]} | peers: {peers}"
+        )
+        return chosen
+
+    if any(n.runtime_metrics.last_status_received for n in eligible):
+        # Peers are reporting but none has capacity — apply backpressure.
+        logger.debug(f"route=backpressure eligible={len(eligible)} skips={skips} -> None (defer) | peers: {peers}")
+        return None
 
     # Nothing measured — fall back to uniform random over peers we believe
     # are accepting work (covers the first-contact window before broadcasts arrive).
-    return select_random(eligible)
+    chosen = select_random(eligible)
+    logger.debug(
+        f"route=random-fallback eligible={len(eligible)} skips={skips} "
+        f"chose={chosen.node_id[:8] if chosen else None} | peers: {peers}"
+    )
+    return chosen

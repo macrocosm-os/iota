@@ -1,8 +1,15 @@
+from unittest.mock import AsyncMock
+
 import pytest
 
-from common.models.api_models import MinerRegistrationQueueStatusResponse, MinerRegistrationResponse
+from common.models.api_models import (
+    MinerRegistrationQueueStatusResponse,
+    MinerRegistrationResponse,
+    RegisterMinerRequest,
+)
 from common.models.run_flags import RunFlags
 from subnet import miner_api_client as miner_api_client_module
+from subnet.common_api_client import CommonAPIClient
 from subnet.miner_api_client import MinerAPIClient, registration_queue_poll_sleep_seconds
 
 
@@ -59,3 +66,21 @@ async def test_wait_for_registration_queue_uses_jittered_poll_sleep(monkeypatch)
     assert response.run_id == "run-1"
     assert sleeps == [4.25]
     assert status_requests == ["queue-1"]
+
+
+@pytest.mark.asyncio
+async def test_register_request_does_not_replay_single_use_attestation(monkeypatch):
+    request = AsyncMock(
+        return_value={
+            "run_id": "run-1",
+            "run_flags": {},
+            "num_partitions": 2,
+        }
+    )
+    monkeypatch.setattr(CommonAPIClient, "orchestrator_request", request)
+
+    response = await MinerAPIClient().register_miner_request(RegisterMinerRequest(p2p_node_id="node-1"))
+
+    assert response.run_id == "run-1"
+    assert request.await_args.kwargs["path"] == "/miner/register"
+    assert request.await_args.kwargs["max_attempts"] == 1

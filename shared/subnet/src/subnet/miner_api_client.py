@@ -5,6 +5,7 @@ from common.models.api_models import (
     GetActivationRequest,
     HeartbeatResponse,
     LayerOptimizerStateResponse,
+    RunConfigResponse,
     RunInfo,
     ActivationResponse,
     CompleteFileUploadResponse,
@@ -80,6 +81,9 @@ class MinerAPIClient(CommonAPIClient):
     def __init__(self, hotkey: Keypair | None = None, is_mounted: bool = False, electron_version: str | None = None):
         self.hotkey = hotkey
         self.layer_state = LayerPhase.TRAINING
+        # Orchestrator-assigned miner status, refreshed on every heartbeat.
+        # None until the first heartbeat (or against an older orchestrator).
+        self.db_miner_status: str | None = None
         self.is_mounted = is_mounted
         self.electron_version = electron_version
 
@@ -108,6 +112,11 @@ class MinerAPIClient(CommonAPIClient):
                 body=register_miner_request.model_dump(),
                 is_mounted=self.is_mounted,
                 electron_version=self.electron_version,
+                # Registration attestations contain a single-use challenge. A
+                # transport retry would replay the same challenge while the
+                # first request may still be completing server-side. Let the
+                # outer registration loop obtain a fresh challenge instead.
+                max_attempts=1,
             )
             parsed_response = self.parse_response(response)
             if isinstance(parsed_response, dict) and parsed_response.get("queue_id"):
@@ -245,7 +254,22 @@ class MinerAPIClient(CommonAPIClient):
             electron_version=self.electron_version,
         )
         parsed_response = self.parse_response(response)
-        return HeartbeatResponse.model_validate(parsed_response)
+        heartbeat_response = HeartbeatResponse.model_validate(parsed_response)
+        self.db_miner_status = heartbeat_response.status
+        return heartbeat_response
+
+    async def get_run_config(self) -> RunConfigResponse:
+        """Fetch the current run's flags + model metadata (polled periodically by the miner)."""
+        response = await CommonAPIClient.orchestrator_request(
+            method="GET",
+            path="/miner/get_run_config",
+            hotkey=self.hotkey,
+            body={},
+            is_mounted=self.is_mounted,
+            electron_version=self.electron_version,
+        )
+        parsed_response = self.parse_response(response)
+        return RunConfigResponse.model_validate(parsed_response)
 
     async def get_activations(self, get_activation_request: GetActivationRequest) -> list[ActivationResponse] | dict:
         try:

@@ -31,6 +31,10 @@ class RunFlags(BaseModel):
     peer_eviction: RunFlag = RunFlag()
     auto_max_cache: RunFlag = RunFlag()
     sync_patches: RunFlag = RunFlag(enabled=True)
+    auto_local_batch_size: RunFlag = RunFlag(enabled=True)
+    # Trusted single-run fleet: disables signature verification, metagraph checks,
+    # attestation, and rate limiting on the orchestrator. Never enable for permissionless.
+    trusted_fleet: RunFlag = RunFlag()
 
 
 RUN_FLAGS = RunFlags()

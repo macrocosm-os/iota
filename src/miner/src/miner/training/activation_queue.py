@@ -73,6 +73,11 @@ class ActivationQueue:
         self._activation_fetcher_task: asyncio.Task | None = None
         self._model_manager: ModelManager | None = None
         self._max_forwards_in_queue: int = miner_settings.MAX_FORWARD_ACTIVATIONS_IN_QUEUE
+        # Bounded concurrent materialization of pushed activations (see
+        # _fetch_activations_push_based); 4 covers download-latency overlap
+        # without unbounded memory from a push burst.
+        self._materialize_sem: asyncio.Semaphore = asyncio.Semaphore(4)
+        self._materialize_tasks: set[asyncio.Task] = set()
         self._min_forwards_in_queue: int = miner_settings.MIN_FORWARD_ACTIVATIONS_IN_QUEUE
 
         self._all_layers_training_cached: bool = False
@@ -232,6 +237,11 @@ class ActivationQueue:
             if time.time() - last_state_check >= 30.0:
                 try:
                     await self._miner_api_client.heartbeat(expected_phase=LayerPhase.TRAINING)
+                    # Re-evaluate the bench gate mid-phase: the announce at
+                    # phase entry never re-runs, so without this a bench/un-bench
+                    # learned via heartbeat wouldn't reach peer routing.
+                    if self._miner is not None:
+                        await self._miner._announce_training_status()
                 except RateLimitException:
                     pass
                 except (LayerStateException, MinerNotRegisteredException):
@@ -414,57 +424,72 @@ class ActivationQueue:
                     start_time = time.time()
                     input_hash = None
 
-                    # Download the input activations
-                    if activation_response.direction == "forward" and self._state_manager.layer == 0:
-                        # Layer 0 always downloads samples from S3 (no P2P for initial data)
-                        input_activations = await asyncio.wait_for(
-                            download_sample(
-                                download_url=activation_response.presigned_download_url,
-                                tokenizer=self._model_manager.tokenizer,
-                                device="cpu",
-                                mock=self._mock,
-                                run_flags=self._run_flags,
-                            ),
-                            timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
+                    # Last-layer forwards need BOTH the P2P input activations and the S3
+                    # target sample — independent sources, fetched concurrently so the
+                    # critical last-layer turnaround doesn't pay two serial round trips.
+                    is_last_layer_forward = (
+                        activation_response.direction == "forward"
+                        and self._state_manager.layer == self._model_manager.model_metadata["n_splits"] - 1
+                    )
+                    sample_activations = None
+                    sample_download_start = None
+                    sample_download_end = None
+                    target_task: asyncio.Task | None = None
+                    if is_last_layer_forward:
+                        logger.debug("Last layer miner, downloading sample activations")
+                        sample_download_start = time.time()
+                        target_task = asyncio.create_task(
+                            asyncio.wait_for(
+                                download_sample(
+                                    download_url=activation_response.target_download_url,
+                                    tokenizer=self._model_manager.tokenizer,
+                                    device="cpu",
+                                    mock=self._mock,
+                                    run_flags=self._run_flags,
+                                ),
+                                timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
+                            )
                         )
-                    else:
-                        # P2P download for all inter-miner activations
-                        if not activation_response.source_node_id:
-                            raise RuntimeError(
-                                f"No source_node_id for activation {activation_response.activation_id} - "
-                                f"P2P routing required but orchestrator did not provide producer node ID"
+
+                    try:
+                        # Download the input activations
+                        if activation_response.direction == "forward" and self._state_manager.layer == 0:
+                            # Layer 0 always downloads samples from S3 (no P2P for initial data)
+                            input_activations = await asyncio.wait_for(
+                                download_sample(
+                                    download_url=activation_response.presigned_download_url,
+                                    tokenizer=self._model_manager.tokenizer,
+                                    device="cpu",
+                                    mock=self._mock,
+                                    run_flags=self._run_flags,
+                                ),
+                                timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
                             )
-                        if not self._miner:
-                            raise RuntimeError(
-                                f"P2P not initialized for activation {activation_response.activation_id} - "
-                                f"miner reference not set in activation queue"
-                            )
-                        input_activations, input_hash = await self._download_activation_p2p(activation_response)
+                        else:
+                            # P2P download for all inter-miner activations
+                            if not activation_response.source_node_id:
+                                raise RuntimeError(
+                                    f"No source_node_id for activation {activation_response.activation_id} - "
+                                    f"P2P routing required but orchestrator did not provide producer node ID"
+                                )
+                            if not self._miner:
+                                raise RuntimeError(
+                                    f"P2P not initialized for activation {activation_response.activation_id} - "
+                                    f"miner reference not set in activation queue"
+                                )
+                            input_activations, input_hash = await self._download_activation_p2p(activation_response)
+                    except BaseException:
+                        # Input download failed — don't orphan the concurrent target fetch.
+                        if target_task is not None:
+                            target_task.cancel()
+                        raise
 
                     # Store input hash for later submission (if we got one from P2P)
                     if input_hash and self._miner:
                         await self._miner.store_input_hash(activation_response.activation_id, input_hash)
 
-                    # Download the sample for last layer miners as well
-                    sample_activations = None
-                    sample_download_start = None
-                    sample_download_end = None
-                    if (
-                        activation_response.direction == "forward"
-                        and self._state_manager.layer == self._model_manager.model_metadata["n_splits"] - 1
-                    ):
-                        logger.debug("Last layer miner, downloading sample activations")
-                        sample_download_start = time.time()
-                        sample_activations = await asyncio.wait_for(
-                            download_sample(
-                                download_url=activation_response.target_download_url,
-                                tokenizer=self._model_manager.tokenizer,
-                                device="cpu",
-                                mock=self._mock,
-                                run_flags=self._run_flags,
-                            ),
-                            timeout=common_settings.S3_DOWNLOAD_TIMEOUT,
-                        )
+                    if target_task is not None:
+                        sample_activations = await target_task
                         sample_download_end = time.time()
                     total_bytes = tensor_num_bytes(input_activations) + tensor_num_bytes(sample_activations)
                     if self._stats_tracker is not None:
@@ -820,6 +845,30 @@ class ActivationQueue:
             logger.error(f"Activation push RECV | materialize failed | id={aid}: {exc}")
             return None
 
+    async def _materialize_and_enqueue(self, msg) -> None:
+        """Materialize one pushed activation and enqueue it (bounded concurrency)."""
+        async with self._materialize_sem:
+            entry = await self._push_message_to_activation_data(msg)
+        if entry is None:
+            return
+        async with self._queue_lock:
+            if self._stats_tracker is not None:
+                self._stats_tracker.ensure_activation_stats(
+                    msg.activation_id,
+                    direction=msg.direction,
+                    time_received=time.time(),
+                )
+                stats = self._stats_tracker.ensure_activation_stats(msg.activation_id, direction=msg.direction)
+                stats.timing.queue.start = time.time()
+            if msg.direction == "backward":
+                self._backward_queue.append(entry)
+            else:
+                self._forward_queue.append(entry)
+        logger.info(
+            f"Activation push RECV | in-process queue | id={msg.activation_id} dir={msg.direction} "
+            f"(layer>0 training queue)"
+        )
+
     async def _fetch_activations_push_based(self) -> None:
         """For layer > 0: receive all activations via P2P push instead of polling the orchestrator.
 
@@ -832,6 +881,9 @@ class ActivationQueue:
             if time.time() - last_state_check >= 30.0:
                 try:
                     await self._miner_api_client.heartbeat(expected_phase=LayerPhase.TRAINING)
+                    # Re-evaluate the bench gate mid-phase (see layer-0 fetcher).
+                    if self._miner is not None:
+                        await self._miner._announce_training_status()
                 except RateLimitException:
                     pass
                 except (LayerStateException, MinerNotRegisteredException):
@@ -864,27 +916,16 @@ class ActivationQueue:
                 f"dir={msg.direction} src_layer={msg.source_layer} tgt_layer={msg.target_layer}"
             )
 
-            entry = await self._push_message_to_activation_data(msg)
-            if entry is None:
-                continue
-
-            async with self._queue_lock:
-                if self._stats_tracker is not None:
-                    self._stats_tracker.ensure_activation_stats(
-                        msg.activation_id,
-                        direction=msg.direction,
-                        time_received=time.time(),
-                    )
-                    stats = self._stats_tracker.ensure_activation_stats(msg.activation_id, direction=msg.direction)
-                    stats.timing.queue.start = time.time()
-                if msg.direction == "backward":
-                    self._backward_queue.append(entry)
-                else:
-                    self._forward_queue.append(entry)
-            logger.info(
-                f"Activation push RECV | in-process queue | id={msg.activation_id} dir={msg.direction} "
-                f"(layer>0 training queue)"
-            )
+            # Materialize concurrently (bounded): on the last-layer miner,
+            # materialization includes a ~0.6-1.5s S3 target-sample download —
+            # doing it inline here serialized every subsequently pushed
+            # activation behind it, making the loss layer the pipeline's rate
+            # limiter. Individual activations are independent, so completion
+            # order in the local queue is a fairness detail, not semantics.
+            # _push_message_to_activation_data never raises (returns None).
+            task = asyncio.create_task(self._materialize_and_enqueue(msg))
+            self._materialize_tasks.add(task)
+            task.add_done_callback(self._materialize_tasks.discard)
 
     def _cancel_tasks(self, tasks: list[asyncio.Task], completed_tasks: Optional[set[asyncio.Task]] = None):
         if completed_tasks is None:

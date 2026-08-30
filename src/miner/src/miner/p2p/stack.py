@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import OrderedDict
+from typing import Callable
 
 from loguru import logger
 
@@ -105,6 +106,11 @@ class P2PStack:
         # `asyncio.Queue` because the consumer (`new_miner._handle_inbound_pushes`)
         # is an async task. Bounded if the caller asked, else unbounded.
         self._push_queue: asyncio.Queue[ActivationPushMessage] = asyncio.Queue(maxsize=push_queue_max_size)
+
+        # Set by the miner after construction (lambda: miner.miner_status).
+        # When it reports a non-training status, inbound FORWARD pushes are
+        # NACKed so senders re-route to a working replica; None disables the gate.
+        self.miner_status_getter: Callable[[], str] | None = None
 
     # ── properties ────────────────────────────────────────────────────
 
@@ -293,6 +299,25 @@ class P2PStack:
             had: if ACK delivery failed, the sender retried to a different peer
             and both peers ended up enqueuing the same activation.
             """
+
+            # Bench gate: refuse new forwards while not training so senders
+            # re-route immediately (NACK -> peer re-select). Backwards stay
+            # accepted — they target our earlier forwards and apply once the
+            # bench lifts.
+            if (
+                msg.direction == "forward"
+                and self.miner_status_getter is not None
+                and self.miner_status_getter() != "training"
+            ):
+                logger.info(
+                    f"P2P /activation/push NACK (status={self.miner_status_getter()}): "
+                    f"{msg.activation_id} (peer={peer_id[:16]}...)"
+                )
+
+                async def _noop_after_nack() -> None:
+                    return None
+
+                return encode_push_ack(P2PResponseStatus.ERROR), _noop_after_nack
 
             async def _enqueue_after_ack() -> None:
                 try:
