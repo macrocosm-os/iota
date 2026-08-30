@@ -18,24 +18,11 @@ if TYPE_CHECKING:
 
 _REL_PREFIX = "node_registry"
 _KEEPALIVE_INTERVAL = 5.0
-_FRESH_PULL_WINDOW_SECONDS = 5.0
-_STALE_KEEPALIVE_SECONDS = 300.0
 
 
 def _bridge_key_segment(node_id: str) -> str:
     """Make *node_id* safe as a single path segment under ``node_registry/``."""
     return "".join((c if c.isalnum() or c in "-_" else "_") for c in str(node_id))
-
-
-def _keepalive_age(entry: dict[str, Any], *, now: float) -> float:
-    """Seconds since *entry*'s ``last_keepalive``; treat missing/invalid as infinitely stale."""
-    raw = entry.get("last_keepalive")
-    if raw is None:
-        return float("inf")
-    try:
-        return now - float(raw)
-    except (TypeError, ValueError):
-        return float("inf")
 
 
 class ElasticDeviceMesh:
@@ -45,10 +32,9 @@ class ElasticDeviceMesh:
     writes only its own ``{run_id}/node_registry/{slug(node_id)}/…`` leaves (CAS);
     the dict pulls all entries automatically via :class:`VariableManager`.
 
-    On each pull, any peer whose ``last_keepalive`` is older than
-    :data:`_STALE_KEEPALIVE_SECONDS` may be evicted by any miner (including this
-    one), provided the registry snapshot was fetched within the last
-    :data:`_FRESH_PULL_WINDOW_SECONDS`.
+    Stale peers are removed centrally by the bridge's registry cleanup loop;
+    miners never delete peer entries. (A distributed deleter dogpiled reinserting
+    nodes and instantly evicted partially-written entries — see _registry_cleanup_loop.)
 
     Call :meth:`start_background_sync` to attach to a :class:`VariableManager`.
     """
@@ -72,7 +58,6 @@ class ElasticDeviceMesh:
         self._manager: VariableManager | None = None
         self._local_overrides: dict[str, Any] = {}  # peer-local state not pushed to bridge
         self._keepalive_task: asyncio.Task | None = None
-        self._last_pulled_at: float = 0.0
         # P2P integration — set by the miner after the P2P stack starts
         self._registered_peer_addrs: dict[str, tuple[str | None, tuple[str, ...]]] = {}
         self._groups = groups
@@ -91,39 +76,11 @@ class ElasticDeviceMesh:
 
     async def _on_dict_pull(self, _d: SyncedDictionary) -> None:
         self._local_overrides.clear()
-        self._last_pulled_at = time.time()
-        await self._evict_stale_entries()
+        # Refill peer cache/queue overrides so capacity routing isn't blind until the next broadcast.
+        self.sync_peer_status_into_registry()
         self._on_miner_update()
         if self._on_update is not None:
             self._on_update(self)
-
-    async def _evict_stale_entries(self) -> None:
-        """Remove peer entries whose keepalive is stale, using a fresh pull snapshot."""
-        if self._last_pulled_at <= 0:
-            return
-        if time.time() - self._last_pulled_at >= _FRESH_PULL_WINDOW_SECONDS:
-            return
-
-        d = self._require_started()
-        now = time.time()
-        for slug, entry in list(d.to_dict().items()):
-            if slug == self._own_slug or not isinstance(entry, dict):
-                continue
-            node_id = entry.get("node_id")
-            if node_id is not None and str(node_id) == self._own_node_id:
-                continue
-            if _keepalive_age(entry, now=now) <= _STALE_KEEPALIVE_SECONDS:
-                continue
-            try:
-                await d.delete_slug(slug)
-                if node_id is not None:
-                    self._local_overrides.pop(str(node_id), None)
-                logger.info(
-                    f"[ElasticDeviceMesh] Evicted stale node {node_id!r} "
-                    f"(slug={slug!r}, keepalive age {_keepalive_age(entry, now=now):.0f}s)"
-                )
-            except Exception as exc:
-                logger.warning(f"[ElasticDeviceMesh] Failed to evict stale node {node_id!r}: {exc}")
 
     def _require_started(self) -> SyncedDictionary:
         if self._dict is None:
@@ -238,8 +195,6 @@ class ElasticDeviceMesh:
     async def pull(self) -> None:
         d = self._require_started()
         await d.pull()
-        self._last_pulled_at = time.time()
-        await self._evict_stale_entries()
 
     # ── P2P integration ────────────────────────────────────────────────────────
 
@@ -321,6 +276,26 @@ class ElasticDeviceMesh:
             status_dict["last_status_received"] = received_at
             entry["runtime_metrics"] = status_dict
             self[node_id] = entry
+
+    async def set_own_status(self, status: str) -> None:
+        """Write our miner_status into our own registry entry and push it.
+
+        Peers ingest live status via UNI broadcasts; this covers peers (and
+        late joiners) that only see us through a registry pull.
+        """
+        entry = self.get(self._own_node_id)
+        if entry is None:
+            return
+        entry = dict(entry)
+        rm = dict(entry.get("runtime_metrics") or {})
+        rm["miner_status"] = status
+        entry["runtime_metrics"] = rm
+        self[self._own_node_id] = entry
+        if self._own_node is not None:
+            self._own_node = self._own_node.model_copy(
+                update={"runtime_metrics": self._own_node.runtime_metrics.model_copy(update={"miner_status": status})}
+            )
+        await self.push()
 
     def _stamp_own_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
         """Ensure all miner-owned fields are present on the own registry entry.

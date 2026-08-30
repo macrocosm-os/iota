@@ -63,7 +63,7 @@ class TimerLogger:
             "time": self.enter_time,
             "metadata": self.metadata,
         }
-        logger.debug(f"Timer Logger: {json.dumps(start_event)}")
+        logger.trace(f"Timer Logger: {json.dumps(start_event)}")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -77,5 +77,5 @@ class TimerLogger:
             "duration": self.exit_time - self.enter_time,
         }
 
-        logger.debug(f"Timer Logger: {json.dumps(end_event)}")
+        logger.trace(f"Timer Logger: {json.dumps(end_event)}")
         return False

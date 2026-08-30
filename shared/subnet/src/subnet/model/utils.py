@@ -24,6 +24,53 @@ def load_model_from_hf(model_name: str, pretrained: bool, device: Union[str, tor
     return model.to(device)
 
 
+# Tokens per cross-entropy chunk. At vocab 128,256 an fp32 chunk of 1024 tokens
+# is ~0.5 GB transient — safe on 24 GB cards next to a 16B shard + optimizer.
+_CE_CHUNK_TOKENS = 1024
+
+
+def _chunk_ce_sum(chunk_logits: torch.Tensor, chunk_labels: torch.Tensor) -> torch.Tensor:
+    """Sum-reduced CE for one chunk; fp32 upcast happens per-chunk (transient)."""
+    return torch.nn.functional.cross_entropy(chunk_logits.float(), chunk_labels, reduction="sum", ignore_index=-100)
+
+
+def _chunked_cross_entropy(logits: torch.Tensor, shift_labels: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Mean cross-entropy over non-ignored labels, computed in token chunks.
+
+    - Slices are VIEWS of the original (batch, seq, vocab) logits — no full copy.
+    - Each chunk runs under torch.utils.checkpoint so backward recomputes the
+      chunk's softmax transiently instead of retaining every chunk's saved
+      tensors simultaneously.
+    - Matches torch.nn.CrossEntropyLoss() default semantics exactly:
+      mean over labels != -100 (fp32 accumulation).
+    """
+    batch_size = logits.shape[0]
+    loss_sum = logits.new_zeros((), dtype=torch.float32)
+    valid = 0
+    for b in range(batch_size):
+        row_logits = logits[b, :-1, :]  # view: (seq-1, vocab)
+        row_labels = shift_labels[b]  # (seq-1,)
+        n = row_labels.shape[0]
+        for start in range(0, n, _CE_CHUNK_TOKENS):
+            end = min(start + _CE_CHUNK_TOKENS, n)
+            chunk_labels = row_labels[start:end]
+            n_valid = int((chunk_labels != -100).sum().item())
+            if n_valid == 0:
+                continue
+            if logits.requires_grad:
+                chunk_sum = torch.utils.checkpoint.checkpoint(
+                    _chunk_ce_sum, row_logits[start:end], chunk_labels, use_reentrant=False
+                )
+            else:
+                chunk_sum = _chunk_ce_sum(row_logits[start:end], chunk_labels)
+            loss_sum = loss_sum + chunk_sum
+            valid += n_valid
+    if valid == 0:
+        # All labels ignored — mirror CrossEntropyLoss (nan) is unhelpful; return 0 with grad path.
+        return loss_sum
+    return loss_sum / valid
+
+
 def compute_loss(
     mock: bool,
     logits: torch.Tensor,
@@ -57,8 +104,7 @@ def compute_loss(
     logits_gpu = logits.to(device)
     targets_gpu = targets.to(device)
 
-    # Shift the logits and labels to compute the loss.
-    shift_logits = logits_gpu[..., :-1, :].contiguous()
+    # Labels are tiny (int64 token ids) — shifting/masking them eagerly is fine.
     shift_labels = targets_gpu[..., 1:].contiguous()
 
     log_gpu_memory_usage(note="after allocating loss memory")
@@ -76,11 +122,17 @@ def compute_loss(
         # CrossEntropyLoss ignores -100 labels by default.
         shift_labels[pad_mask] = -100
 
-    # Flatten the tokens
-    loss_fct = torch.nn.CrossEntropyLoss()
-    shift_logits = shift_logits.view(-1, vocab_size)
-    shift_labels = shift_labels.view(-1)
-    loss = loss_fct(shift_logits, shift_labels)
+    # Chunked cross-entropy. The old whole-tensor path materialized a full
+    # contiguous copy of the shifted logits (~2.1 GB at 8K tokens x 128K vocab,
+    # bf16) plus full-size log-softmax intermediates — which OOMed 24 GB cards
+    # once tokens-per-microbatch crossed ~7.2K, tripping the permanent
+    # loss-on-CPU fallback (~173 s per loss) and collapsing pipeline throughput
+    # 3x. Instead, compute CE per token-chunk from row views of the ORIGINAL
+    # logits tensor (no full copy), under gradient checkpointing so backward
+    # recomputes each chunk's softmax transiently instead of keeping all chunks'
+    # saved tensors alive at once. Peak extra memory ≈ one fp32 chunk
+    # (~0.5 GB at 1024 tokens x 128K vocab) regardless of sequence length.
+    loss = _chunked_cross_entropy(logits_gpu, shift_labels, vocab_size)
 
     logger.info(f"Loss computation took {time.time() - start_time:.2f}s on {device}")
 

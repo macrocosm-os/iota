@@ -29,6 +29,7 @@ class CommonAPIClient:
         is_mounted: bool = False,
         electron_version: str | None = None,
         params: dict | None = None,
+        max_attempts: int | None = None,
     ) -> dict:
         logger.opt(colors=True).debug(
             f"<magenta>Making orchestrator request | method: {method} | path: {path}</magenta>"
@@ -42,13 +43,17 @@ class CommonAPIClient:
 
         if hotkey:
             headers = generate_header(hotkey, body_bytes)
-            # Don't add request ID to headers - let orchestrator generate it
+            # generate_header includes the request ID used to correlate retries.
 
         headers["X-Is-Mounted"] = "true" if is_mounted else "false"
         if electron_version is not None:
             headers["X-Host-Version"] = electron_version
 
-        for i in range(common_settings.REQUEST_RETRY_COUNT):
+        request_attempts = common_settings.REQUEST_RETRY_COUNT if max_attempts is None else max_attempts
+        if request_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+
+        for i in range(request_attempts):
             try:
                 if i:
                     logger.warning(f"Retrying request to endpoint {path} (attempt {i + 1})")
@@ -93,7 +98,12 @@ class CommonAPIClient:
                 await asyncio.sleep(1)
 
         # The only time you get here is because you've exhausted all retries.
-        error_msg = f"Failed request after {common_settings.REQUEST_RETRY_COUNT} attempts: {response.status if response else 'No response'}, {response_text if response_text else 'No response text'}"
+        attempt_label = "attempt" if request_attempts == 1 else "attempts"
+        response_status = response.status if response else "No response"
+        error_msg = (
+            f"Failed request after {request_attempts} {attempt_label}: "
+            f"{response_status}, {response_text if response_text else 'No response text'}"
+        )
         if request_id:
             with logger.contextualize(request_id=request_id):
                 logger.error(error_msg)

@@ -243,6 +243,127 @@ LLAMA32_CONFIG_15B = {
     "activation_timeout": 120,
 }
 
+LLAMA32_CONFIG_16B = {
+    "model_name": "Llama-3.2-16B",
+    "total_global_params": 16_193_524_224,  # No bottlenecks. Add (2 * embed_dim * bottleneck_dim) for each bottleneck.
+    "vocab_size": 128_256,  # Vocabulary size
+    "context_length": 1024,  # Maximum context length to use (reduced to save memory)
+    "orig_context_length": 1024,  # Context length that was used to train the model
+    "emb_dim": 5120,  # Embedding dimension
+    "bottleneck_dim": 50,  # Bottleneck dimension, if None
+    "quantize_activations": False,
+    "quantize_activations_grads": False,
+    "quantize_weights": False,
+    "n_heads": 40,  # Number of attention heads
+    "n_layers": 44,  # Number of layers
+    "hidden_dim": 17480,  # Size of the intermediate dimension in FeedForward
+    "n_kv_groups": 8,  # Key-Value groups for grouped-query attention
+    "rope_base": 10_000.0,  # The base in RoPE's "theta"
+    "dtype": "torch.bfloat16",  # Lower-precision dtype to reduce memory usage
+    "rope_freq": {  # RoPE frequency scaling
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 1024,
+    },
+    "model_splits": [  # 16 stages
+        [-1, 1],
+        [1, 4],
+        [4, 7],
+        [7, 10],
+        [10, 13],
+        [13, 16],
+        [16, 19],
+        [19, 22],
+        [22, 25],
+        [25, 28],
+        [28, 31],
+        [31, 34],
+        [34, 37],
+        [37, 40],
+        [40, 43],
+        [43, -1],
+    ],
+    "miners_per_layer": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3],  # TODO: Check this end distribution
+    "s3_download_timeout": 600,
+    "s3_upload_timeout": 600,
+    "activation_timeout": 120,
+}
+
+LLAMA32_CONFIG_16B_SHORT = {
+    "model_name": "Llama-3.2-16B",
+    "total_global_params": 3_964_687_360,  # No bottlenecks. Add (2 * embed_dim * bottleneck_dim) for each bottleneck.
+    "vocab_size": 128_256,  # Vocabulary size
+    "context_length": 1024,  # Maximum context length to use (reduced to save memory)
+    "orig_context_length": 1024,  # Context length that was used to train the model
+    "emb_dim": 5120,  # Embedding dimension
+    "bottleneck_dim": 50,  # Bottleneck dimension, if None
+    "quantize_activations": False,
+    "quantize_activations_grads": False,
+    "quantize_weights": False,
+    "n_heads": 40,  # Number of attention heads
+    "n_layers": 8,  # Number of layers
+    "hidden_dim": 17480,  # Size of the intermediate dimension in FeedForward
+    "n_kv_groups": 8,  # Key-Value groups for grouped-query attention
+    "rope_base": 10_000.0,  # The base in RoPE's "theta"
+    "dtype": "torch.bfloat16",  # Lower-precision dtype to reduce memory usage
+    "rope_freq": {  # RoPE frequency scaling
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 1024,
+    },
+    "model_splits": [  # 16 stages
+        [-1, 1],
+        [1, 4],
+        [4, 7],
+        [7, -1],
+    ],
+    "miners_per_layer": [1, 1, 1, 1],  # TODO: Check this end distribution
+    "s3_download_timeout": 600,
+    "s3_upload_timeout": 600,
+    "activation_timeout": 120,
+}
+
+LLAMA32_CONFIG_16B_MID = {
+    "model_name": "Llama-3.2-16B",
+    "total_global_params": 7_941_698_560,  # 20 layers, no bottlenecks. Add (2 * embed_dim * bottleneck_dim) for each bottleneck.
+    "vocab_size": 128_256,  # Vocabulary size
+    "context_length": 1024,  # Maximum context length to use (reduced to save memory)
+    "orig_context_length": 1024,  # Context length that was used to train the model
+    "emb_dim": 5120,  # Embedding dimension
+    "bottleneck_dim": 50,  # Bottleneck dimension, if None
+    "quantize_activations": False,
+    "quantize_activations_grads": False,
+    "quantize_weights": False,
+    "n_heads": 40,  # Number of attention heads
+    "n_layers": 20,  # Number of layers
+    "hidden_dim": 17480,  # Size of the intermediate dimension in FeedForward
+    "n_kv_groups": 8,  # Key-Value groups for grouped-query attention
+    "rope_base": 10_000.0,  # The base in RoPE's "theta"
+    "dtype": "torch.bfloat16",  # Lower-precision dtype to reduce memory usage
+    "rope_freq": {  # RoPE frequency scaling
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 1024,
+    },
+    "model_splits": [  # 8 stages
+        [-1, 1],
+        [1, 4],
+        [4, 7],
+        [7, 10],
+        [10, 13],
+        [13, 16],
+        [16, 19],
+        [19, -1],
+    ],
+    "miners_per_layer": [1, 1, 1, 1, 1, 1, 1, 1],
+    "s3_download_timeout": 600,
+    "s3_upload_timeout": 600,
+    "activation_timeout": 120,
+}
+
 LLAMA32_CONFIG_21B = {
     "model_name": "Llama-3.2-21B",
     "total_global_params": 21_446_661_120,  # No bottlenecks. Add (2 * embed_dim * bottleneck_dim) for each bottleneck.
@@ -389,5 +510,3 @@ LLAMA32_CONFIG_SIMULATED_100B = {
     "s3_upload_timeout": 600,
     "activation_timeout": 120,
 }
-
-#

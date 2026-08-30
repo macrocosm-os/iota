@@ -173,6 +173,224 @@ async def test_push_dirty():
     assert variables["x"]._needs_push is False
 
 
+async def test_push_dirty_cas_mismatch_refreshes_version_and_retries():
+    # Local CAS version is stale (pulls missed this key). push_dirty must
+    # refresh the version with a keyed /get and retry, keeping the local value.
+    client = _make_client()
+    client.post = AsyncMock(
+        side_effect=_side_effect(
+            _resp({"results": [{"var_id": "run-abc/x", "status": "created", "version": 1}]}),
+            _resp({"results": [{"var_id": "run-abc/x", "status": "error", "error": "CASVersionMismatch"}]}),
+            _resp({"variables": [{"var_id": "run-abc/x", "value": 7, "version": 41}]}),
+            _resp({"results": [{"var_id": "run-abc/x", "status": "updated", "version": 42}]}),
+        )
+    )
+    variables: dict[str, SyncedVariableV2] = {}
+    await register_many(
+        client,
+        "run-abc",
+        [{"name": "x", "default_value": 0, "var_type": "int"}],
+        rule="CAS",
+        variables=variables,
+    )
+    variables["x"].set(99)
+    await push_dirty(client, "run-abc", variables)
+
+    retry_body = client.post.call_args.kwargs["json"]
+    assert retry_body["updates"][0]["current_version"] == 41
+    assert get_cached("x", variables) == 99  # local dirty value pushed, not the bridge's 7
+    assert variables["x"].version == 42
+    assert variables["x"]._needs_push is False
+
+
+async def test_push_dirty_cas_mismatch_key_gone_joins_reregister():
+    # Mismatch, but the keyed /get says the variable vanished — must fall
+    # through to the re-register path instead of retrying the CAS write.
+    client = _make_client()
+    client.post = AsyncMock(
+        side_effect=_side_effect(
+            _resp({"results": [{"var_id": "run-abc/x", "status": "created", "version": 1}]}),
+            _resp({"results": [{"var_id": "run-abc/x", "status": "error", "error": "CASVersionMismatch"}]}),
+            _resp({"variables": [], "errors": [{"var_id": "run-abc/x", "error": "VariableNotFound"}]}),
+            _resp({"results": [{"var_id": "run-abc/x", "status": "created", "version": 1}]}),
+            _resp({"results": [{"var_id": "run-abc/x", "status": "updated", "version": 2}]}),
+        )
+    )
+    variables: dict[str, SyncedVariableV2] = {}
+    await register_many(
+        client,
+        "run-abc",
+        [{"name": "x", "default_value": 0, "var_type": "int"}],
+        rule="CAS",
+        variables=variables,
+    )
+    variables["x"].set(99)
+    await push_dirty(client, "run-abc", variables)
+    assert get_cached("x", variables) == 99
+    assert variables["x"]._needs_push is False
+
+
+async def test_push_dirty_bulk_loss_reregisters_full_entry():
+    # Only `a` is dirty, but the bridge lost the whole entry — re-register must
+    # cover both leaves (a and b), not just the dirty miss, then converge.
+    client = _make_client()
+    client.post = AsyncMock(
+        side_effect=_side_effect(
+            _resp(
+                {
+                    "results": [
+                        {"var_id": "run-abc/a", "status": "created", "version": 1},
+                        {"var_id": "run-abc/b", "status": "created", "version": 1},
+                    ]
+                }
+            ),
+            _resp({"results": [{"var_id": "run-abc/a", "status": "error", "error": "VariableNotFound"}]}),
+            _resp(
+                {
+                    "results": [
+                        {"var_id": "run-abc/a", "status": "created", "version": 1},
+                        {"var_id": "run-abc/b", "status": "created", "version": 1},
+                    ]
+                }
+            ),
+            _resp({"results": [{"var_id": "run-abc/a", "status": "updated", "version": 2}]}),
+        )
+    )
+    variables: dict[str, SyncedVariableV2] = {}
+    await register_many(
+        client,
+        "run-abc",
+        [
+            {"name": "a", "default_value": 0, "var_type": "int"},
+            {"name": "b", "default_value": 0, "var_type": "int"},
+        ],
+        variables=variables,
+    )
+    variables["a"].set(99)
+    await push_dirty(client, "run-abc", variables)
+
+    # The re-register call (3rd POST) must carry the FULL entry, both leaves.
+    register_calls = [c for c in client.post.call_args_list if "variables" in c.kwargs["json"]]
+    reregister = register_calls[-1].kwargs["json"]["variables"]
+    var_ids = {v["var_id"] for v in reregister}
+    assert var_ids == {"run-abc/a", "run-abc/b"}
+    assert get_cached("a", variables) == 99
+    assert variables["a"]._needs_push is False
+
+
+async def test_push_dirty_persistent_failure_escalates(monkeypatch):
+    import miner.sync_v2.synced_collection as sc
+
+    monkeypatch.setattr(sc.asyncio, "sleep", AsyncMock())
+    err = MagicMock()
+    monkeypatch.setattr(sc.logger, "error", err)
+
+    client = _make_client()
+    client.post = AsyncMock(
+        side_effect=_side_effect(
+            _resp({"results": [{"var_id": "run-abc/a", "status": "created", "version": 1}]}),
+        )
+    )
+    variables: dict[str, SyncedVariableV2] = {}
+    await register_many(client, "run-abc", [{"name": "a", "default_value": 0, "var_type": "int"}], variables=variables)
+    variables["a"].set(7)
+
+    async def post_fn(path, **kwargs):
+        if path == "/set":
+            return _resp({"results": [{"var_id": "run-abc/a", "status": "error", "error": "VariableNotFound"}]})
+        if path == "/register":
+            return _resp({"detail": "bad"}, status=400)  # re-register keeps failing
+        raise AssertionError(f"unexpected path {path}")
+
+    client.post = AsyncMock(side_effect=post_fn)
+
+    # Must not raise, must stop at the cap, must escalate (not swallow silently).
+    await push_dirty(client, "run-abc", variables, max_retries=2)
+    assert err.called
+
+
+async def test_push_dirty_recovers_on_later_retry(monkeypatch):
+    # Re-register succeeds but the leaves don't persist on the first retry
+    # (slots still healing); the loop must keep retrying and converge on a
+    # later attempt — the "keep retrying until it sticks" case.
+    import miner.sync_v2.synced_collection as sc
+
+    monkeypatch.setattr(sc.asyncio, "sleep", AsyncMock())
+
+    client = _make_client()
+    client.post = AsyncMock(
+        side_effect=_side_effect(
+            _resp(
+                {
+                    "results": [
+                        {"var_id": "run-abc/a", "status": "created", "version": 1},
+                        {"var_id": "run-abc/b", "status": "created", "version": 1},
+                    ]
+                }
+            ),
+        )
+    )
+    variables: dict[str, SyncedVariableV2] = {}
+    await register_many(
+        client,
+        "run-abc",
+        [
+            {"name": "a", "default_value": 0, "var_type": "int"},
+            {"name": "b", "default_value": 0, "var_type": "int"},
+        ],
+        variables=variables,
+    )
+    variables["a"].set(11)
+    variables["b"].set(22)
+
+    set_calls = {"n": 0}
+
+    async def post_fn(path, **kwargs):
+        if path == "/register":  # re-register always succeeds
+            return _resp(
+                {
+                    "results": [
+                        {"var_id": "run-abc/a", "status": "created", "version": 1},
+                        {"var_id": "run-abc/b", "status": "created", "version": 1},
+                    ]
+                }
+            )
+        if path == "/set":
+            set_calls["n"] += 1
+            # calls 1 (initial) and 2 (first retry) still miss; call 3 sticks.
+            if set_calls["n"] < 3:
+                return _resp(
+                    {
+                        "results": [
+                            {"var_id": "run-abc/a", "status": "error", "error": "VariableNotFound"},
+                            {"var_id": "run-abc/b", "status": "error", "error": "VariableNotFound"},
+                        ]
+                    }
+                )
+            return _resp(
+                {
+                    "results": [
+                        {"var_id": "run-abc/a", "status": "updated", "version": 2},
+                        {"var_id": "run-abc/b", "status": "updated", "version": 2},
+                    ]
+                }
+            )
+        raise AssertionError(f"unexpected path {path}")
+
+    client.post = AsyncMock(side_effect=post_fn)
+
+    await push_dirty(client, "run-abc", variables, max_retries=3)
+
+    # Converged after a second re-register + retry.
+    assert get_cached("a", variables) == 11
+    assert get_cached("b", variables) == 22
+    assert variables["a"]._needs_push is False
+    assert variables["b"]._needs_push is False
+    register_calls = [c for c in client.post.call_args_list if "variables" in c.kwargs["json"]]
+    assert len(register_calls) == 2  # first retry missed, so it re-registered twice
+    assert set_calls["n"] == 3
+
+
 async def test_set_value_single():
     client = _make_client()
     client.post = AsyncMock(

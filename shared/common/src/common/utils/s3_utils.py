@@ -51,76 +51,81 @@ async def upload_parts(urls: list[str], data: Any, upload_id: str | None, max_re
     # Skip SSL verification for localhost/minio (self-signed certs in local dev)
     connector = aiohttp.TCPConnector(ssl=False) if urls and should_skip_ssl(urls[0]) else None
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        parts = []
-
         part_size = int(math.ceil(len(data) / len(urls)))
         assert part_size > 0, "Part size is 0"
 
         chunk_indices = range(0, len(data), part_size)
 
-        logger.info(f"uploading {len(chunk_indices)} chunks with part size {part_size}")
+        logger.info(
+            f"uploading {len(chunk_indices)} chunks with part size {part_size} "
+            f"(concurrency {common_settings.S3_UPLOAD_MAX_CONCURRENCY})"
+        )
+        semaphore = asyncio.Semaphore(common_settings.S3_UPLOAD_MAX_CONCURRENCY)
 
-        for i, (url, chunk_index) in enumerate(zip(urls, chunk_indices)):
-            part_number = i + 1
-
+        async def upload_one(part_number: int, url: str, chunk_index: int) -> dict:
             # Retry logic for each part
-            for attempt in range(max_retries + 1):  # +1 to include initial attempt
-                try:
-                    start_time = asyncio.get_event_loop().time()
-                    async with session.put(url, data=data[chunk_index : chunk_index + part_size]) as response:
-                        upload_time = asyncio.get_event_loop().time() - start_time
+            async with semaphore:
+                for attempt in range(max_retries + 1):  # +1 to include initial attempt
+                    try:
+                        start_time = asyncio.get_event_loop().time()
+                        async with session.put(url, data=data[chunk_index : chunk_index + part_size]) as response:
+                            upload_time = asyncio.get_event_loop().time() - start_time
 
-                        if not response.ok:
-                            # Get detailed error information from S3
-                            error_body = await response.text()
-                            error_headers = dict(response.headers)
+                            if not response.ok:
+                                # Get detailed error information from S3
+                                error_body = await response.text()
+                                error_headers = dict(response.headers)
 
-                            logger.error(f"HTTP Status: {response.status} {response.reason}")
-                            logger.error(f"Response Headers: {error_headers}")
-                            logger.error(f"Response Body: {error_body}")
-                            logger.error(f"Request URL: {url}")
-                            logger.error(f"Upload ID: {upload_id}")
+                                logger.error(f"HTTP Status: {response.status} {response.reason}")
+                                logger.error(f"Response Headers: {error_headers}")
+                                logger.error(f"Response Body: {error_body}")
+                                logger.error(f"Request URL: {url}")
+                                logger.error(f"Upload ID: {upload_id}")
 
-                        response.raise_for_status()
+                            response.raise_for_status()
 
-                        # Extract ETag from response headers (remove quotes if present)
-                        etag = response.headers.get("ETag", "").strip('"')
+                            # Extract ETag from response headers (remove quotes if present)
+                            etag = response.headers.get("ETag", "").strip('"')
 
-                        # Log upload performance
-                        upload_speed_mbps = (len(data) / (1024 * 1024)) / max(upload_time, 0.001)
-                        logger.debug(
-                            f"🏎️ Part {part_number} upload completed in {upload_time:.2f}s ({upload_speed_mbps:.2f} MB/s) 🏎️"
-                        )
+                            # Log upload performance
+                            upload_speed_mbps = (part_size / (1024 * 1024)) / max(upload_time, 0.001)
+                            logger.debug(
+                                f"🏎️ Part {part_number} upload completed in {upload_time:.2f}s ({upload_speed_mbps:.2f} MB/s) 🏎️"
+                            )
 
-                        parts.append(
-                            {
+                            return {
                                 "PartNumber": part_number,
                                 "ETag": etag,
                             }
-                        )
-                        # Success - break out of retry loop
-                        break
 
-                except (
-                    aiohttp.ClientError,
-                    aiohttp.ServerTimeoutError,
-                    aiohttp.ClientResponseError,
-                    asyncio.TimeoutError,
-                    TimeoutError,  # Python built-in TimeoutError
-                    ConnectionError,
-                    Exception,  # Catch RequestTimeout and other S3-specific errors
-                ) as e:
-                    if attempt < max_retries:
-                        # Calculate exponential backoff delay (1s, 2s, 4s, ...)
-                        delay = 2**attempt
-                        logger.warning(
-                            f"Upload failed for part {part_number} (attempt {attempt + 1}/{max_retries + 1}): {e}. "
-                            f"Retrying in {delay}s..."
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(f"Upload failed for part {part_number} after {max_retries + 1} attempts: {e}")
-                        raise
+                    except (
+                        aiohttp.ClientError,
+                        aiohttp.ServerTimeoutError,
+                        aiohttp.ClientResponseError,
+                        asyncio.TimeoutError,
+                        TimeoutError,  # Python built-in TimeoutError
+                        ConnectionError,
+                        Exception,  # Catch RequestTimeout and other S3-specific errors
+                    ) as e:
+                        if attempt < max_retries:
+                            # Calculate exponential backoff delay (1s, 2s, 4s, ...)
+                            delay = 2**attempt
+                            logger.warning(
+                                f"Upload failed for part {part_number} (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                                f"Retrying in {delay}s..."
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.error(f"Upload failed for part {part_number} after {max_retries + 1} attempts: {e}")
+                            raise
+
+        # Parts upload concurrently (bounded by the semaphore); gather preserves
+        # input order so `parts` stays sorted by PartNumber for the S3 complete call.
+        parts = list(
+            await asyncio.gather(
+                *[upload_one(i + 1, url, chunk_index) for i, (url, chunk_index) in enumerate(zip(urls, chunk_indices))]
+            )
+        )
     return parts
 
 
@@ -192,21 +197,38 @@ async def upload_part(urls: list[str], data: bytes | memoryview, upload_id: str,
                     raise
 
 
+# Per-event-loop download session cache: a fresh ClientSession per call means a new
+# TCP+TLS handshake to R2 for every sample download (~100-300ms of a ~700ms download).
+# Keyed by (loop, skip_ssl) so keep-alive connections are reused within a process.
+_download_sessions: dict = {}
+
+
+def _get_download_session(skip_ssl: bool) -> "aiohttp.ClientSession":
+    loop = asyncio.get_running_loop()
+    key = (id(loop), skip_ssl)
+    session = _download_sessions.get(key)
+    if session is None or session.closed:
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=common_settings.S3_DOWNLOAD_TIMEOUT),
+            connector=aiohttp.TCPConnector(ssl=False) if skip_ssl else None,
+        )
+        _download_sessions[key] = session
+    return session
+
+
 async def download_file(presigned_url: str, max_retries: int = 3, run_flags: RunFlags = RUN_FLAGS):
     """Download a file from S3 storage with retry logic."""
-    timeout = aiohttp.ClientTimeout(total=common_settings.S3_DOWNLOAD_TIMEOUT)
     # Skip SSL verification for localhost/minio (self-signed certs in local dev)
-    connector = aiohttp.TCPConnector(ssl=False) if should_skip_ssl(presigned_url) else None
+    session = _get_download_session(should_skip_ssl(presigned_url))
 
     for attempt in range(max_retries + 1):
         try:
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                async with session.get(presigned_url) as response:
-                    response.raise_for_status()
-                    if run_flags.compress_s3_files.isOn():
-                        return gzip.decompress(await response.read())
-                    else:
-                        return await response.read()
+            async with session.get(presigned_url) as response:
+                response.raise_for_status()
+                if run_flags.compress_s3_files.isOn():
+                    return gzip.decompress(await response.read())
+                else:
+                    return await response.read()
         except aiohttp.ClientResponseError as e:
             if e.status >= 500 or e.status == 429:
                 if attempt < max_retries:
@@ -224,6 +246,24 @@ async def download_file(presigned_url: str, max_retries: int = 3, run_flags: Run
             else:
                 logger.error(f"HTTP error downloading file: {e}")
                 raise
+        except (
+            aiohttp.ClientPayloadError,  # truncated body (ContentLengthError) — frequent on slow R2 links
+            aiohttp.ClientConnectionError,
+            aiohttp.ServerTimeoutError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
+        ) as e:
+            if attempt < max_retries:
+                delay = 2**attempt
+                logger.warning(
+                    f"Transient download error ({type(e).__name__}: {e}), retrying in {delay}s... "
+                    f"(attempt {attempt + 1}/{max_retries + 1})"
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error(f"Download failed after {max_retries + 1} attempts: {type(e).__name__}: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error downloading file from presigned URL: {e}")
             raise

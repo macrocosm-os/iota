@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 
 from common.models.compute_node import ComputeNode
-from miner.sync_v2.elastic_device_mesh import _STALE_KEEPALIVE_SECONDS, ElasticDeviceMesh
+from common.models.peer_status import PeerStatusBroadcast
+from miner.sync_v2.elastic_device_mesh import ElasticDeviceMesh
 from miner.sync_v2.utils import sync_run_sync_prefix
 from miner.sync_v2.variable_manager import VariableManager
 
@@ -56,7 +57,7 @@ class _FakeBridgeStore:
             if entry["write_rule"] == "CAS":
                 expected = update.get("current_version")
                 if expected != entry["version"]:
-                    results.append({"var_id": vid, "status": "error", "error": "version mismatch"})
+                    results.append({"var_id": vid, "status": "error", "error": "CASVersionMismatch"})
                     continue
             entry["value"] = update["value"]
             entry["version"] += 1
@@ -294,24 +295,26 @@ async def test_second_update_succeeds_when_version_matches():
         await reg.stop()
 
 
-async def test_cas_version_mismatch_does_not_update_bridge():
+async def test_cas_version_mismatch_refreshes_version_and_converges():
     reg, _, store = await _started_registry()
     try:
         await reg.register(ComputeNode(node_id=OWN_NODE, groups=["layer-1"]))
         groups_vid = _leaf_var_id(OWN_NODE, "groups")
 
-        # Another writer updated the bridge while our local cache is still stale.
-        concurrent_value = ["layer-99"]
+        # Another writer bumped the bridge while our local version is stale
+        # (e.g. background pulls missed this key). The push must refresh the
+        # version by keyed /get and retry — own leaves have a single
+        # authoritative writer, so the miner's value wins.
         store.vars[groups_vid]["version"] += 1
-        store.vars[groups_vid]["value"] = concurrent_value
+        store.vars[groups_vid]["value"] = ["layer-99"]
         version_on_bridge = store.vars[groups_vid]["version"]
 
         d = reg._require_started()
         d[OWN_NODE]["groups"].set(["layer-5"])
         await reg.push()
 
-        assert store.vars[groups_vid]["value"] == concurrent_value
-        assert store.vars[groups_vid]["version"] == version_on_bridge
+        assert store.vars[groups_vid]["value"] == ["layer-5"]
+        assert store.vars[groups_vid]["version"] == version_on_bridge + 1
     finally:
         await reg.stop()
 
@@ -325,6 +328,27 @@ async def test_initialize_publishes_keepalive_to_bridge():
         assert ka_vid in store.vars
         assert store.vars[ka_vid]["value"] > 0
         assert store.vars[ka_vid]["version"] >= 2
+    finally:
+        await reg.stop()
+
+
+async def test_set_own_status_updates_registry_entry():
+    reg, _, store = await _started_registry()
+    try:
+        await reg.initialize(
+            ComputeNode(
+                node_id=OWN_NODE,
+                runtime_metrics=PeerStatusBroadcast(source_hotkey=OWN_NODE, miner_status="initializing"),
+            )
+        )
+        assert reg[OWN_NODE]["runtime_metrics"]["miner_status"] == "initializing"
+
+        await reg.set_own_status("training")
+
+        assert reg[OWN_NODE]["runtime_metrics"]["miner_status"] == "training"
+        assert reg._own_node.runtime_metrics.miner_status == "training"
+        status_vid = _leaf_var_id(OWN_NODE, "runtime_metrics") + "/miner_status"
+        assert store.vars[status_vid]["value"] == "training"
     finally:
         await reg.stop()
 
@@ -345,57 +369,41 @@ async def test_pull_merges_peer_registry_entry():
         await reg.stop()
 
 
-async def test_pull_evicts_peer_with_stale_keepalive():
+async def test_pull_never_deletes_peers():
+    # Miners no longer evict peers — the bridge's central _registry_cleanup_loop
+    # is the sole deleter. Pull must never issue a /delete, even for a peer whose
+    # keepalive is ancient; the stale peer stays until central cleanup removes it.
     reg, mgr, store = await _started_registry()
     peer_slug = "stale_peer"
     try:
-        _seed_peer(store, peer_slug, last_keepalive=time.time() - _STALE_KEEPALIVE_SECONDS - 60)
+        _seed_peer(store, peer_slug, last_keepalive=time.time() - 100_000)
 
         await reg.pull()
 
-        node_ids = {n.node_id for n in reg.all_nodes()}
-        assert peer_slug not in node_ids
-        assert not any(vid.startswith(f"{RUN_KEY}/node_registry/{peer_slug}/") for vid in store.vars)
         delete_calls = [c for c in _post_calls(mgr) if c.args and c.args[0] == "/delete"]
-        assert delete_calls, "stale peer leaves should be deleted from the bridge"
-    finally:
-        await reg.stop()
-
-
-async def test_pull_keeps_peer_with_recent_keepalive():
-    reg, mgr, store = await _started_registry()
-    peer_slug = "live_peer"
-    try:
-        _seed_peer(store, peer_slug, last_keepalive=time.time() - 10)
-
-        await reg.pull()
-
+        assert not delete_calls, "miners must not delete peer entries; central cleanup owns that"
         assert peer_slug in {n.node_id for n in reg.all_nodes()}
-        delete_calls = [c for c in _post_calls(mgr) if c.args and c.args[0] == "/delete"]
-        assert not delete_calls
     finally:
         await reg.stop()
 
 
-async def test_repulls_full_entry_after_eviction_by_peer():
-    """A live miner whose slug was evicted re-publishes its full record, not just last_keepalive."""
+async def test_repulls_full_entry_after_deletion():
+    """A live miner whose entry was deleted (by the central cleanup) re-publishes its
+    full record. With full-reregister, any dirty-leaf push that hits VariableNotFound
+    rebuilds the whole entry — not just the dirty leaf."""
     reg, _, store = await _started_registry()
     try:
         node = ComputeNode(node_id=OWN_NODE, p2p_node_ids=["abc123"], groups=["all", "layer-2"])
         await reg.initialize(node)
 
-        # A peer evicts this miner: every leaf under its slug is deleted on the bridge.
+        # Central cleanup deleted this miner: every leaf under its slug is gone.
         for vid in [v for v in store.vars if v.startswith(f"{RUN_KEY}/node_registry/{OWN_NODE}/")]:
             del store.vars[vid]
 
-        # The keepalive tick recreates only the dirty last_keepalive leaf.
+        # A keepalive tick pushes the dirty last_keepalive; the resulting
+        # VariableNotFound triggers a full re-register of the entry.
         d = reg._require_started()
         d[OWN_NODE]["last_keepalive"].set(time.time())
-        await d.push_dirty()
-        assert set(store.vars) == {_leaf_var_id(OWN_NODE, "last_keepalive")}
-
-        # The next background pull sees the stripped entry and re-publishes the full record.
-        await d._after_pull(await d.wildcard_fetch("node_registry/*"))
         await d.push_dirty()
 
         assert store.vars[_leaf_var_id(OWN_NODE, "p2p_node_ids")]["value"] == ["abc123"]
@@ -428,20 +436,6 @@ async def test_backfills_leaves_lost_to_partial_delete():
         assert store.vars[_leaf_var_id(OWN_NODE, "p2p_node_ids")]["value"] == ["abc123"]
         # Restored keepalive must be stamped fresh, not taken from the stored snapshot.
         assert store.vars[_leaf_var_id(OWN_NODE, "last_keepalive")]["value"] >= before_repair
-    finally:
-        await reg.stop()
-
-
-async def test_pull_does_not_evict_own_entry_when_stale():
-    reg, _, store = await _started_registry()
-    try:
-        ka_vid = _leaf_var_id(OWN_NODE, "last_keepalive")
-        store.vars[ka_vid]["value"] = time.time() - _STALE_KEEPALIVE_SECONDS - 60
-
-        await reg.pull()
-
-        assert OWN_NODE in {n.node_id for n in reg.all_nodes()}
-        assert ka_vid in store.vars
     finally:
         await reg.stop()
 
@@ -511,19 +505,18 @@ def test_own_is_leader_false_when_not_oldest():
     assert reg.is_leader("all") is False
 
 
-async def test_get_leader_after_eviction():
-    """After the oldest peer is evicted (stale keepalive), own node becomes leader."""
+async def test_get_leader_ignores_after_central_cleanup_removes_peer():
+    """Once the central cleanup removes an older peer from the registry, own node
+    becomes leader on the next pull. Miners don't delete; we simulate the bridge
+    having already pruned the stale peer."""
     reg, _, store = await _started_registry(own_node_id="node-newer")
     try:
-        # Seed older peer with a stale keepalive so it gets evicted on pull
-        _seed_peer(store, "node-older", groups=["all"], last_keepalive=time.time() - _STALE_KEEPALIVE_SECONDS - 60)
-        store.vars[_leaf_var_id("node-older", "joined_at")] = {"value": 50.0, "version": 1, "write_rule": "CAS"}
-        # Own node joined later
         store.vars[_leaf_var_id("node-newer", "joined_at")] = {"value": 200.0, "version": 1, "write_rule": "CAS"}
         store.vars[_leaf_var_id("node-newer", "groups")] = {"value": ["all"], "version": 1, "write_rule": "CAS"}
 
         await reg.pull()
 
+        # No older peer present (central cleanup already pruned it) → own is leader.
         assert "node-older" not in {n.node_id for n in reg.all_nodes()}
         assert reg.is_leader("all") is True
     finally:

@@ -2,7 +2,6 @@ import aiohttp
 import httpx
 import pprint
 import asyncio
-import copy
 import gc
 import json
 import ctypes
@@ -183,7 +182,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         # Initialize own identity and node registry before referencing them elsewhere
         self._own_node_id: str = self.wallet.hotkey.ss58_address
-        self._own_compute_node = ComputeNode(node_id=self._own_node_id)
+        # Seed the registry entry as "initializing" (not the PeerStatusBroadcast
+        # default "training") so senders never pick a still-benched joiner as a
+        # push target before our first status broadcast lands.
+        self._own_compute_node = ComputeNode(
+            node_id=self._own_node_id,
+            runtime_metrics=PeerStatusBroadcast(source_hotkey=self._own_node_id, miner_status="initializing"),
+        )
         self.elastic_device_mesh: ElasticDeviceMesh | None = None
         self._bridge_manager = VariableManager(url=common_settings.BRIDGE_V2_URL)
 
@@ -351,23 +356,77 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         threading.Thread(target=_open, name="VisualizationTabOpener", daemon=True).start()
 
     def _update_run_flags(self, new_flags: RunFlags) -> None:
-        """Update this miner's run flags in-place."""
+        """Update this miner's run flags in-place (holders of self.run_flags see changes)."""
         for field_name in new_flags.model_fields:
             new_flag = getattr(new_flags, field_name)
             current_flag = getattr(self.run_flags, field_name, None)
             if current_flag is not None:
+                if current_flag.enabled != new_flag.enabled:
+                    logger.info(
+                        f"Run flag '{field_name}' changed for miner {self.hotkey[:8]}: "
+                        f"{current_flag.enabled} -> {new_flag.enabled}"
+                    )
                 current_flag.enabled = new_flag.enabled
                 current_flag.version = new_flag.version
             else:
                 setattr(self.run_flags, field_name, new_flag)
 
+    def _apply_run_hyperparams(self, model_metadata: dict) -> None:
+        """Apply run-level training hyperparameters process-wide so all consumers
+        see the run's values rather than module-level defaults. The set_* helpers
+        no-op on falsy/unchanged values, so this is safe to re-apply on every
+        run-config refresh; changes are logged."""
+        before = (
+            common_settings.MINI_BATCH_SIZE,
+            common_settings.MINI_BATCH_ACCUMULATION_COUNT,
+            common_settings.MAX_ACTIVATION_CACHE_SIZE,
+            common_settings.SEQUENCE_LENGTH,
+        )
+        common_settings.set_mini_batch_size((model_metadata.get("dataset") or {}).get("mini_batch_size"))
+        common_settings.set_mini_batch_accumulation_count(model_metadata.get("mini_batch_accumulation_count"))
+        common_settings.set_max_activation_cache_size(
+            (model_metadata.get("activation") or {}).get("max_activation_cache_size")
+        )
+        common_settings.set_sequence_length((model_metadata.get("dataset") or {}).get("sequence_length"))
+        after = (
+            common_settings.MINI_BATCH_SIZE,
+            common_settings.MINI_BATCH_ACCUMULATION_COUNT,
+            common_settings.MAX_ACTIVATION_CACHE_SIZE,
+            common_settings.SEQUENCE_LENGTH,
+        )
+        if after != before:
+            logger.info(
+                f"Run hyperparameters updated for miner {self.hotkey[:8]}: "
+                f"mini_batch_size={after[0]}, mini_batch_accumulation_count={after[1]}, "
+                f"max_activation_cache_size={after[2]}, sequence_length={after[3]}"
+            )
+
+    async def _run_config_refresh_loop(self) -> None:
+        """Background task: poll the orchestrator for the current run's flags and
+        hyperparameters so operator-side changes (e.g. activation cache size)
+        take effect on the fly, without restarting the run."""
+        interval = miner_settings.RUN_CONFIG_REFRESH_INTERVAL_SECONDS
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                run_config = await self.miner_api_client.get_run_config()
+                self._update_run_flags(run_config.run_flags)
+                if run_config.model_metadata is not None:
+                    self._apply_run_hyperparams(run_config.model_metadata.model_dump())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"Run config refresh failed (retrying in {interval}s): {exc}")
+
     async def _start_p2p(self, timeout: float = 30.0) -> None:
         """Initialize and start the P2P stack (receiver subprocess + sender)."""
         self.p2p = P2PStack(
             cache_ttl=float(miner_settings.P2P_ACTIVATION_CACHE_TTL),
-            max_cache_size=miner_settings.MAX_ACTIVATION_CACHE_SIZE,
+            max_cache_size=common_settings.MAX_ACTIVATION_CACHE_SIZE,
             max_sender_connections=P2P_MAX_SENDER_CONNECTIONS,
         )
+        # Bench gate for inbound forwards: NACK pushes while we're not training.
+        self.p2p.miner_status_getter = lambda: self.miner_status
         # The set_on_sender_restarted / _on_sender_restarted callback hook
         # that lived here under the subprocess-RPC architecture is gone:
         # the iota_sdk-backed Sender is native Rust with no subprocess to
@@ -436,7 +495,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             forward_queue_size=len(queue._forward_queue),
             backward_queue_size=len(queue._backward_queue),
             cache_size=len(self.training_phase._cache),
-            cache_capacity=miner_settings.MAX_ACTIVATION_CACHE_SIZE,
+            cache_capacity=common_settings.MAX_ACTIVATION_CACHE_SIZE,
             uptime_seconds=time.time() - self._start_time,
             layer_phase=self.miner_api_client.layer_state.value,
             miner_status=self.miner_status,
@@ -537,10 +596,40 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             await self.register_set_status(status=status)
         except Exception as exc:
             logger.warning(f"register_set_status({status!r}) failed: {exc}")
+        # Mirror into our own registry entry so peers that pull the registry
+        # (rather than receiving the UNI broadcast) also see the new status.
+        if self.elastic_device_mesh is not None:
+            try:
+                await self.elastic_device_mesh.set_own_status(status)
+            except Exception as exc:
+                logger.debug(f"Registry status update for {status!r} failed: {exc}")
         try:
             await self._broadcast_peer_status()
         except Exception as exc:
             logger.debug(f"Immediate peer-status broadcast for {status!r} failed: {exc}")
+
+    async def _announce_training_status(self) -> None:
+        """Announce 'training' before entering the training loop, so
+        adjacent-layer peers stop excluding us in peer_selection within one
+        broadcast round-trip.
+
+        Exception: while the orchestrator holds us in a non-working state
+        (e.g. benched until the next epoch after a mid-epoch re-registration),
+        broadcast "initializing" so fail-closed peer selection excludes us as
+        a push target. The heartbeat refreshes db_miner_status, so the
+        un-bench at the epoch flip lifts the gate within one heartbeat.
+        A None db_miner_status (older orchestrator) gates nothing.
+        """
+        if self.miner_api_client.db_miner_status in ("initializing", "frozen"):
+            if self.miner_status != "initializing":
+                logger.info(
+                    f"Miner {self.hotkey[:8]} is held in "
+                    f"'{self.miner_api_client.db_miner_status}' by the orchestrator; "
+                    "broadcasting 'initializing' to peers until it clears"
+                )
+                await self._transition_miner_status("initializing")
+        elif self.miner_status != "training":
+            await self._transition_miner_status("training")
 
     async def _peer_status_broadcast_loop(self) -> None:
         """Background task: broadcast peer status to adjacent-layer miners
@@ -933,11 +1022,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                     )
                     raise MinerResetException("Training aborted: model not synced to global weights this session")
 
-                # Announce we're accepting activations again BEFORE entering the
-                # training loop, so adjacent-layer peers stop excluding us in
-                # peer_selection within one broadcast round-trip.
-                if self.miner_status != "training":
-                    await self._transition_miner_status("training")
+                await self._announce_training_status()
 
                 await self.training_phase.run()
 
@@ -1011,6 +1096,7 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
     async def training_loop(self):
         """Main training loop delegating to tick with existing error handling."""
         broadcast_task = asyncio.create_task(self._peer_status_broadcast_loop())
+        run_config_task = asyncio.create_task(self._run_config_refresh_loop())
         try:
             while True:
                 try:
@@ -1117,11 +1203,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 except Exception:
                     raise
         finally:
-            broadcast_task.cancel()
-            try:
-                await broadcast_task
-            except asyncio.CancelledError:
-                pass
+            for task in (broadcast_task, run_config_task):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def run(self):
         self._start_visualization_server_process(port=self.visualization_port)
@@ -1195,6 +1282,17 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         self.model_manager.model_metadata = model_metadata
         self.model_manager.epoch_on_registration = current_epoch
 
+        # Apply run-level training hyperparameters process-wide so all consumers see the run's
+        # values rather than module-level defaults (kept fresh afterwards by _run_config_refresh_loop).
+        self._apply_run_hyperparams(model_metadata)
+        logger.info(
+            f"Run hyperparameters for miner {self.hotkey[:8]}: "
+            f"mini_batch_size={common_settings.MINI_BATCH_SIZE}, "
+            f"mini_batch_accumulation_count={common_settings.MINI_BATCH_ACCUMULATION_COUNT}, "
+            f"max_activation_cache_size={common_settings.MAX_ACTIVATION_CACHE_SIZE}, "
+            f"sequence_length={common_settings.SEQUENCE_LENGTH}"
+        )
+
         layer_groups = ["all", f"layer-{assigned_layer}"]
         self._own_compute_node = self._own_compute_node.model_copy(update={"groups": layer_groups})
 
@@ -1231,6 +1329,24 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
             raise
         logger.info(f"Registered with P2P node ID: {(self.p2p.node_id or 'n/a')[:16]}...")
         logger.debug(f"Updated node registry groups: {layer_groups}")
+
+        # After the registry entry is pushed: seed the assigned status so a
+        # bench applied at (re-)registration reaches peer routing immediately.
+        await self._seed_status_from_registration(response.status)
+
+    async def _seed_status_from_registration(self, response_status: str | None) -> None:
+        """Seed the orchestrator-reported status from the registration response.
+
+        In-process re-registration never runs the startup registry seeding, and
+        the first heartbeat may be a long way out — without this, a miner
+        benched at registration keeps broadcasting 'training' and peers push it
+        work for the rest of the epoch. None (older orchestrator) seeds nothing.
+        """
+        if response_status is None:
+            return
+        self.miner_api_client.db_miner_status = response_status
+        if response_status in ("initializing", "frozen"):
+            await self._transition_miner_status("initializing")
 
     async def _clear_stale_p2p_state(self) -> None:
         """Drain P2P queues, clear shared-memory cache, and reset input hashes.
@@ -1367,7 +1483,13 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 f"📍 Location event queued for telemetry: {self._node_location.city}, {self._node_location.country}"
             )
 
-        return response.model_cfg.model_dump(), response.model_metadata.model_dump()
+        model_cfg = response.model_cfg.model_dump()
+        seq_len = common_settings.SEQUENCE_LENGTH
+        if seq_len > model_cfg.get("context_length", 0):
+            # ponytail: keep orig_context_length == context_length so rescale_theta doesn't fire
+            model_cfg["context_length"] = seq_len
+            model_cfg["orig_context_length"] = seq_len
+        return model_cfg, response.model_metadata.model_dump()
 
     async def register_loop(self) -> tuple[dict, dict]:
         """
@@ -1904,6 +2026,11 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
 
         logger.success("✅ Successfully setup local model")
 
+        # Model + optimizer are loaded but the global merge hasn't been pulled yet, so this
+        # probe runs against disposable seed weights — safe to populate .grad against.
+        if self.training_phase is not None:
+            await self.training_phase.calibrate_local_batch_size()
+
     def _recover_fallback_weights(self, *, is_same_layer: bool) -> tuple[torch.Tensor | None, dict | None]:
         """Pick the best weights to seed the model with after a reset.
 
@@ -1953,24 +2080,6 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
         )
         return disk_weights, disk_optimizer_state
 
-    async def get_old_partition_for_partition_batch(
-        self, batch_partitions: list[MergingPartition]
-    ) -> list[MergingPartition]:
-        previous_partitions = await self.miner_api_client.get_previous_partitions(
-            partition_indices=[partition.new_partition.chunk_number for partition in batch_partitions]
-        )
-        for partition in batch_partitions:
-            previous_partition = [
-                p for p in previous_partitions if p.chunk_number == partition.new_partition.chunk_number
-            ]
-            if not previous_partition:
-                logger.warning(f"No previous partition found for partition {partition.new_partition.chunk_number}")
-                partition.old_partition = None
-            else:
-                partition.old_partition = previous_partition[0]
-        logger.debug(f"{len(batch_partitions)} batch partitions got old partition")
-        return batch_partitions
-
     async def merge_partitions(
         self, weight_path_per_layer: list[SubmittedWeightsAndOptimizerPresigned], partitions: list[MinerPartition]
     ) -> list[MinerPartition]:
@@ -2016,6 +2125,29 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 f"{total_s3_uploads} blob S3 uploads + {n_batches} API submit calls"
             )
 
+            # One API call for the whole phase (previously one per batch): map
+            # chunk_number -> previous partition, consumed by download_batch.
+            previous_partitions = await self.miner_api_client.get_previous_partitions(
+                partition_indices=[partition.chunk_number for partition in partitions]
+            )
+            previous_partition_by_chunk = {p.chunk_number: p for p in previous_partitions}
+
+            # The merge math runs on flat chunk slices (see merge_partition_batch),
+            # so load the previous-epoch flat weight vector once for the whole
+            # phase — no per-batch model deepcopy / vector_to_parameters round trip.
+            old_weights = load_model_weights(
+                hotkey=self.hotkey, run_id=self.state_manager.run_id, layer_idx=self.state_manager.layer
+            )
+            if old_weights is None:
+                raise Exception(f"Previous weights are None for miner {self.hotkey[:8]}")
+            old_weights = old_weights.to(torch.bfloat16)
+
+            current_global_epoch = self.model_manager.current_epoch
+            if current_global_epoch is None:
+                current_global_epoch = await self.miner_api_client.get_run_epoch(
+                    run_id=self.state_manager.run_id, hotkey=self.wallet.hotkey
+                )
+
             async def submit_batch(final_partitions: list[MinerPartition]) -> None:
                 attestation_payload = await self._collect_attestation_payload(action="merged_partitions")
                 await self.miner_api_client.submit_merged_partitions(
@@ -2024,22 +2156,20 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 )
                 logger.debug(f"{len(final_partitions)} batch partitions submitted")
 
-            submission_tasks: list[asyncio.Task] = []
-            # Grab a batch of partitions to download the weights for
-            for batch in range(n_batches):
-                logger.debug(f"Merging batch {batch} of {n_batches}")
-                # Baseline RAM at start of this batch. With the end-of-batch trim
-                # below, this should stay roughly flat across iterations.
-                self._log_resources(f"merge_batch_{batch}_start")
+            async def download_batch(batch_index: int) -> tuple[list[MergingPartition], list]:
+                """Network phase for one batch: pseudograds + old partitions + optimizer state.
 
+                Returns the (filtered) merging partitions and the surviving source
+                miner list; the latter is positionally aligned with each
+                partition.pseudograds and is reused for weighted averaging.
+                All downloaded tensors land in CPU RAM."""
                 # Grab a batch of partitions to merge (no downloading yet)
-                batch_partitions: list[MergingPartition] = get_partition_batch(batch_index=batch, partitions=partitions)
+                batch_partitions: list[MergingPartition] = get_partition_batch(
+                    batch_index=batch_index, partitions=partitions
+                )
                 logger.debug(f"{len(batch_partitions)} batch partitions grabbed")
 
-                # Download the weights for the batch. Returns the (filtered) source
-                # miner list whose trailer fetch succeeded; this is positionally
-                # aligned with each partition.pseudograds, and is reused below for
-                # weighted averaging.
+                # Download the weights for the batch.
                 merging_partitions, valid_sources = await download_pseudograds_for_partition_batch(
                     batch_partitions=batch_partitions,
                     submitted_weights_list=weight_path_per_layer,
@@ -2047,92 +2177,100 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 )
                 logger.debug(f"{len(merging_partitions)} batch partitions downloaded successfully")
 
-                # Gets the old partition for the batch (which point us to the previous optimizer state)
-                merging_partitions = await self.get_old_partition_for_partition_batch(merging_partitions)
+                # Point each partition at its previous optimizer state (prefetched once above)
+                for partition in merging_partitions:
+                    partition.old_partition = previous_partition_by_chunk.get(partition.new_partition.chunk_number)
+                    if partition.old_partition is None:
+                        logger.warning(
+                            f"No previous partition found for partition {partition.new_partition.chunk_number}"
+                        )
                 logger.debug(f"{len(merging_partitions)} batch partitions got old partition")
 
                 # Download the previous optimizer state for the batch (fills partitions.old_optimizer_state with the previous optimizer state)
                 merging_partitions = await download_previous_optimizer_state_for_partition_batch(merging_partitions)
                 logger.debug(f"{len(merging_partitions)} batch partitions downloaded previous optimizer state")
+                return merging_partitions, valid_sources
 
-                # Determine if we have enough memory in the GPU to merge the partitions on GPU or CPU.
-                device = self.device
-                if device != "cpu":
-                    gpu_device.synchronize()
-                    gpu_device.empty_cache()
-                    avail_memory = gpu_device.available_memory()
-
-                    # TODO: @cassova: correct this calculation - 100x is just to push it to cpu for now
-                    need_to_merge_on_gpu = (
-                        100
-                        * torch.nn.utils.parameters_to_vector(self.model_manager.model.parameters()).numel()
-                        * len(merging_partitions)
-                    )
-
-                    if need_to_merge_on_gpu > avail_memory:
-                        logger.warning(
-                            "Not enough memory available to merge partitions on GPU"
-                            f" - needed {need_to_merge_on_gpu / 1024**3:.2f}GB, available {avail_memory / 1024**3:.2f}GB"
-                        )
-                        device = "cpu"
-                    else:
-                        logger.debug(
-                            "Merging partitions on GPU"
-                            f" - needed {need_to_merge_on_gpu / 1024**3:.2f}GB, available {avail_memory / 1024**3:.2f}GB"
-                            f" ({len(merging_partitions)} partition(s))"
-                        )
-
-                # Load old weights into model
-                if device == "cpu":
-                    old_model = copy.deepcopy(self.model_manager.model).cpu()
-                else:
-                    old_model = copy.deepcopy(self.model_manager.model)
-                    log_gpu_memory_usage(note="after copying old model")
-
-                torch.nn.utils.vector_to_parameters(
-                    load_model_weights(
-                        hotkey=self.hotkey, run_id=self.state_manager.run_id, layer_idx=self.state_manager.layer
-                    ),
-                    old_model.parameters(),
-                )
-
-                # Do the actual merging (apply the optimizer state to the weights)
-                weights_length = sum([p.numel() for p in old_model.parameters()])
-
-                current_global_epoch = self.model_manager.current_epoch
-                if current_global_epoch is None:
-                    current_global_epoch = await self.miner_api_client.get_run_epoch(
-                        run_id=self.state_manager.run_id, hotkey=self.wallet.hotkey
-                    )
-
-                merged_partitions = await merge_partition_batch(
-                    partition_batch=merging_partitions,
-                    submitted_weights_list=valid_sources,
-                    old_model=old_model,
-                    weights_length=weights_length,
-                    num_partitions=self.num_partitions,
-                    device=device,
-                    run_flags=self.run_flags,
-                    epoch=current_global_epoch,
-                )
-                logger.debug(f"{len(merged_partitions)} batch partitions merged")
-                log_gpu_memory_usage(note=f"after merging partitions on {device}")
-
-                # Upload the merged partitions to S3 and fire off submission in the background
+            async def upload_and_submit_batch(merged: list[MergingPartition]) -> None:
                 final_partitions = await upload_partition_batch(
-                    merged_partitions=merged_partitions,
+                    merged_partitions=merged,
                     hotkey=self.wallet.hotkey,
                     miner_api_client=self.miner_api_client,
                     run_flags=self.run_flags,
                 )
                 logger.debug(f"{len(final_partitions)} batch partitions uploaded")
-                submission_tasks.append(asyncio.create_task(submit_batch(final_partitions)))
+                await submit_batch(final_partitions)
 
-                self.model_manager.model = self.model_manager.model.to(self.device)
+            # Software pipeline over the batch loop: while batch N merges, batch
+            # N+1's downloads (pure aiohttp, tensors land in CPU RAM) run as a
+            # background task, and batch N's upload + submit runs as a background
+            # task while batch N+1 downloads/merges. Memory bound: at most 2
+            # batches of downloaded pseudograds/optimizer state are resident at
+            # once (current + prefetched) — pending uploads only pin the compact
+            # chunk-sized merge outputs because we strip pseudograds/old state
+            # before backgrounding the upload. We only prefetch when available
+            # RAM exceeds 4x the current batch's downloaded footprint
+            # (conservative headroom for the merge's transient fp32 averaging
+            # buffers); otherwise that iteration falls back to
+            # the old serial download path. Upload/submit failures still abort
+            # merge_partitions via the gather at the end — partition submissions
+            # must never be silently lost.
+            upload_tasks: list[asyncio.Task] = []
+            prefetch_task: asyncio.Task | None = None
+            for batch in range(n_batches):
+                logger.debug(f"Merging batch {batch} of {n_batches}")
+                # Baseline RAM at start of this batch. With the end-of-batch trim
+                # below, this should stay roughly flat across iterations.
+                self._log_resources(f"merge_batch_{batch}_start")
 
-                del old_model
-                del merged_partitions  # TODO: @cassova: do a better job of cleaning this up
-                del final_partitions
+                if prefetch_task is not None:
+                    merging_partitions, valid_sources = await prefetch_task
+                    prefetch_task = None
+                else:
+                    merging_partitions, valid_sources = await download_batch(batch)
+
+                # Prefetch next batch's downloads while this batch merges, if the
+                # RAM guard passes (estimate next batch's footprint from this
+                # batch's actual downloaded tensors).
+                if batch + 1 < n_batches:
+                    batch_bytes = sum(
+                        t.numel() * t.element_size()
+                        for p in merging_partitions
+                        for t in [*(p.pseudograds or []), p.old_optimizer_state]
+                        if t is not None
+                    )
+                    if psutil.virtual_memory().available > 4 * batch_bytes:
+                        prefetch_task = asyncio.create_task(download_batch(batch + 1))
+                    else:
+                        logger.warning(
+                            f"Skipping prefetch of merge batch {batch + 1}: available RAM "
+                            f"{psutil.virtual_memory().available / 1024**3:.2f}GB < 4x batch "
+                            f"footprint {batch_bytes / 1024**3:.2f}GB — falling back to serial download"
+                        )
+
+                # Merge on flat chunk slices — CPU-only, O(chunk) compute and
+                # memory per partition (see merge_partition_batch).
+                merged_partitions = await merge_partition_batch(
+                    partition_batch=merging_partitions,
+                    submitted_weights_list=valid_sources,
+                    old_weights=old_weights,
+                    num_partitions=self.num_partitions,
+                    run_flags=self.run_flags,
+                    epoch=current_global_epoch,
+                )
+                logger.debug(f"{len(merged_partitions)} batch partitions merged")
+
+                # Strip the merge inputs so the background upload task only pins
+                # the compact chunk-sized outputs, not this batch's downloaded
+                # pseudograds/old optimizer state.
+                for partition in merged_partitions:
+                    partition.pseudograds = None
+                    partition.old_optimizer_state = None
+
+                # Upload the merged partitions to S3 and submit them in the background
+                upload_tasks.append(asyncio.create_task(upload_and_submit_batch(merged_partitions)))
+
+                del merged_partitions
 
                 # End-of-batch cleanup: explicitly drop the partition-batch holders
                 # (each MergingPartition pins ~340 MB pseudograds + ~340 MB old/new
@@ -2140,15 +2278,12 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 # iteration's tensors stay alive in the function frame until the
                 # next iteration's downloads rebind the variable — i.e. peak
                 # memory is briefly ~2× during the rebind.
-                del batch_partitions, merging_partitions
+                del merging_partitions
 
                 # Trim glibc's heap so pages from this batch's transient fp32
-                # buffers (per-partition averaging, optimizer-state slicing,
-                # serialization) get returned to the OS before the next batch.
-                # Without this the heap inflated ~50 GB across 32 batches and
-                # OOM-killed the process when the post-merge download tried to
-                # allocate its target tensor. Mirrors the cleanup in
-                # submit_weights's `finally` block.
+                # buffers (per-partition averaging, download buffers) get
+                # returned to the OS before the next batch. Mirrors the cleanup
+                # in submit_weights's `finally` block.
                 gc.collect()
                 try:
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -2158,6 +2293,8 @@ class Miner(BaseNeuron, HealthServerMixin, NodeControlMixin):
                 log_gpu_memory_usage(note="after merging partitions")
                 self._log_resources(f"merge_batch_{batch}_end_after_trim")
 
-            # Wait for all background submission tasks to complete
-            await asyncio.gather(*submission_tasks)
-            logger.debug(f"All {len(submission_tasks)} batch submission tasks completed")
+            # Wait for all background upload+submission tasks to complete; gather
+            # raises on the first failure so a lost submission aborts loudly (the
+            # scheduler counts submitted partitions to end the merge phase).
+            await asyncio.gather(*upload_tasks)
+            logger.debug(f"All {len(upload_tasks)} batch upload/submission tasks completed")

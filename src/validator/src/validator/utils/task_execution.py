@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from common import settings as common_settings
 from common.models.api_models import ValidationTaskResponse, ValidatorTask
 from loguru import logger
 
@@ -88,6 +89,10 @@ async def execute_task(task: ValidatorTask, validator_code_dir: str):
 
     logger.info(f"Executing task: {task.model_dump()}")
     logger.info(f"Validator code directory: {validator_code_dir}")
+
+    # Reshape activations to the task's run mini batch size (matches what miners produced).
+    # Safe as a process-wide set: execute_task runs one task at a time.
+    common_settings.set_mini_batch_size(task.mini_batch_size)
 
     # Load functions from the validator_code_dir if not already loaded
     if not available_functions:

@@ -399,7 +399,14 @@ class ModelManager:
 
         # Ensure that both model weights and optimizer state are provided.
         if model_weights is not None:
-            torch.nn.utils.vector_to_parameters(model_weights, self.model.parameters())  # inplace operation.
+            # vector_to_parameters re-points param.data at views of the vector, so a
+            # CPU/other-dtype vector would silently migrate the model off-device and
+            # orphan the GPU-resident optimizer state (optimizer.step() then fails with
+            # "Tensors of the same index must be on the same device and the same dtype").
+            param = next(self.model.parameters())
+            torch.nn.utils.vector_to_parameters(
+                model_weights.to(device=param.device, dtype=param.dtype), self.model.parameters()
+            )
         else:
             logger.info("No model weights provided, keeping random weights! 🎲")
         if optimizer_state is not None:
@@ -551,7 +558,14 @@ class ModelManager:
                                 f"disk snapshot contains NaN/Inf ({e}). Keeping current parameters."
                             )
                         else:
-                            torch.nn.utils.vector_to_parameters(loaded_weights, self.model.parameters())
+                            # load_model_weights returns a CPU (mmap'd) tensor; cast to the
+                            # params' device/dtype before applying — vector_to_parameters
+                            # re-points param.data at the vector, so applying it raw would
+                            # move the model to CPU and orphan the GPU optimizer state.
+                            torch.nn.utils.vector_to_parameters(
+                                loaded_weights.to(device=current_params.device, dtype=current_params.dtype),
+                                self.model.parameters(),
+                            )
 
             logger.info(f"{self.logger_attributes['hotkey'][:8]} completed local optimization step")
             log_gpu_memory_usage(note="after local optimization step")

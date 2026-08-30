@@ -1,5 +1,4 @@
 import asyncio
-import copy
 from bittensor_wallet import Keypair
 from common import settings as common_settings
 from common.models.api_models import SubmittedWeightsAndOptimizerPresigned
@@ -15,14 +14,7 @@ from common.models.run_flags import RUN_FLAGS, RunFlags
 from miner.utils.utils import upload_partition_blob
 
 from subnet.miner_api_client import MinerAPIClient
-from subnet.model.utils import log_gpu_memory_usage
 from subnet.utils.partition_utils import MergingPartition, download_partition_optimizer
-from subnet.utils.vector_utils import (
-    add_artificial_gradients,
-    extract_optimizer_state_section,
-    get_optimizer_tensor_shapes,
-    reconstruct_optimizer_state,
-)
 import torch
 
 
@@ -55,18 +47,6 @@ async def get_weight_partition_info(
     return weight_path_per_layer, [MinerPartition(**p) for p in partitions]
 
 
-def get_total_optimizer_state_size(optimizer):
-    state_dict = optimizer.state_dict()
-    total_size = 0
-    for group in state_dict["state"].values():
-        for k, v in group.items():
-            if k == "step":
-                continue
-            if isinstance(v, torch.Tensor):
-                total_size += v.numel()
-    return total_size
-
-
 def get_outer_optimizer_warmup_momentum(epoch: int) -> float:
     """Compute outer optimizer momentum with linear warmup.
 
@@ -83,113 +63,36 @@ def get_outer_optimizer_warmup_momentum(epoch: int) -> float:
     return start + (end - start) * progress
 
 
-def create_outer_optimizer(model: torch.nn.Module, device: str | torch.device, epoch: int = 0):
-    """Create an outer optimizer that will be used to reconstruct the optimizer state dict from a partition."""
-    momentum = get_outer_optimizer_warmup_momentum(epoch)
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=common_settings.NESTEROV_LEARNING_RATE,
-        momentum=momentum,
-        nesterov=True,
-    )
-
-    logger.debug(
-        f"Creating outer optimizer with learning rate: {common_settings.NESTEROV_LEARNING_RATE} "
-        f"and momentum: {momentum} (epoch {epoch}, target {common_settings.NESTEROV_MOMENTUM})"
-    )
-    add_artificial_gradients(model=model, device=device)
-    optimizer.step()
-
-    total_states = get_total_optimizer_state_size(optimizer)
-    optimizer.zero_grad()
-    return optimizer, total_states
-
-
-def load_grads_from_flat_vector(model: torch.nn.Module, grad_vector: torch.Tensor):
-    """
-    Load a flat gradient vector into model's .grad attributes.
-    grad_vector: torch.Tensor (same ordering as parameters_to_vector(model.parameters()))
-    """
-    # Ensure it's on the right device and dtype
-    grad_vector = grad_vector.to(next(model.parameters()).device)
-
-    # Create placeholder grads in case the model .grad is not initialized
-    for p in model.parameters():
-        if p.grad is None:
-            p.grad = torch.zeros_like(p, dtype=grad_vector.dtype, device=grad_vector.device)
-
-    # Assign gradients using vector_to_parameters
-    torch.nn.utils.vector_to_parameters(grad_vector, (p.grad for p in model.parameters()))
-
-
-def reconstruct_outer_optimizer_from_partial_state(
-    old_optimizer_state: torch.Tensor,
-    start_idx: int,
-    end_idx: int,
-    optim_state_shapes: list[torch.Tensor],
-    total_states: int,
-    optimizer: torch.optim.Optimizer,
-) -> torch.optim.Optimizer:
-    """Reconstruct optimizer state dict from a partition of a flattened tensor."""
-
-    # Log this operation
-    logger.debug("Reconstructing outer optimizer state from partition")
-
-    # Construct a flat vector of infs everywhere except for the partition
-    # The dtype is the one in the model config
-    logger.debug(f"total_states: {total_states}, start_idx: {start_idx}, end_idx: {end_idx}")
-    full_flat_vector = torch.full((total_states,), float("inf"), dtype=torch.bfloat16)
-    full_flat_vector[start_idx:end_idx] = old_optimizer_state
-
-    # Reconstruct the optimizer state dict from the flat vector
-    optimizer_state_dict = reconstruct_optimizer_state(
-        flat_tensor=full_flat_vector,
-        tensor_shapes=optim_state_shapes,
-        state_dict=optimizer.state_dict(),
-    )
-    optimizer.load_state_dict(optimizer_state_dict)
-    return optimizer
-
-
-def reconstruct_full_grads_from_partition(
-    grads_partition: torch.Tensor,
-    start_idx: int,
-    end_idx: int,
-    pseudograds_length: int,
-    model: torch.nn.Module,
-    device: str,
-):
-    """Reconstruct the full grads (.grads) of a model from a partition of grads tensor."""
-
-    # Log this operation
-    logger.debug("Reconstructing full grads from partition")
-
-    full_flat_vector = torch.full((pseudograds_length,), float("inf"), dtype=torch.bfloat16, device=device)
-    full_flat_vector[start_idx:end_idx] = grads_partition
-    load_grads_from_flat_vector(model=model, grad_vector=full_flat_vector)
-
-
 async def merge_partition_batch(
     partition_batch: list[MergingPartition],
     submitted_weights_list: list[SubmittedWeightsAndOptimizerPresigned],
-    old_model: torch.nn.Module,
+    old_weights: torch.Tensor,
     num_partitions: int,
-    weights_length: int,
-    device: str,
     run_flags: RunFlags = RUN_FLAGS,
     epoch: int = 0,
-) -> dict[int, tuple[torch.Tensor, torch.Tensor, MinerPartition]]:
-    optimizer_shapes = None
+) -> list[MergingPartition]:
+    """Merge each partition's averaged pseudograds into the old weights.
+
+    The outer optimizer (SGD + Nesterov momentum, no weight decay/dampening) is
+    elementwise, so we run the exact op sequence torch.optim.SGD uses directly
+    on the chunk slice instead of rebuilding a full model copy + optimizer per
+    partition (which cost O(model size) per chunk):
+
+        buf   = momentum * old_buf + grad          # buf.mul_(momentum).add_(grad)
+        new_w = old_w - lr * (grad + momentum*buf) # nesterov update
+
+    `old_weights` is the full flat bf16 weight vector; everything else here is
+    chunk-sized and stays on CPU.
+    """
+    momentum = get_outer_optimizer_warmup_momentum(epoch)
+    lr = common_settings.NESTEROV_LEARNING_RATE
     valid_partitions = []
 
     for partition in partition_batch:
-        old_model_copy = None
-        weight_average = None
-        outer_optimizer = None
-        flat_optimizer_state = None
         try:
             logger.debug(f"merging partition {partition.new_partition.chunk_number}")
 
+            weight_average = None
             weight_counter = 0
 
             for source, weights in zip(submitted_weights_list, partition.pseudograds):
@@ -219,96 +122,27 @@ async def merge_partition_batch(
             # Average the weights
             weight_average /= weight_counter
             weight_average = weight_average.to(torch.bfloat16)
-            log_gpu_memory_usage(
-                note=f"after averaging partition weights on chunk {partition.new_partition.chunk_number}"
-            )
 
-            old_model_copy = copy.deepcopy(old_model).to(torch.bfloat16)
-            outer_optimizer, total_states = create_outer_optimizer(model=old_model_copy, device=device, epoch=epoch)
-
-            if optimizer_shapes is None:
-                optimizer_shapes = get_optimizer_tensor_shapes(outer_optimizer)
-
-            optimizer_start_idx, optimizer_end_idx = await get_start_and_end_indices(
-                tensor_length=total_states,
-                num_sections=num_partitions,
-                target_section=partition.new_partition.chunk_number,
-            )
-            weight_start_idx, weight_end_idx = await get_start_and_end_indices(
-                tensor_length=weights_length,
+            start_idx, end_idx = await get_start_and_end_indices(
+                tensor_length=old_weights.numel(),
                 num_sections=num_partitions,
                 target_section=partition.new_partition.chunk_number,
             )
 
-            logger.debug(f"weight_start_idx: {weight_start_idx}, weight_end_idx: {weight_end_idx}")
-            logger.debug(f"optimizer_start_idx: {optimizer_start_idx}, optimizer_end_idx: {optimizer_end_idx}")
-            log_gpu_memory_usage(
-                note=f"after getting start and end indices for partition {partition.new_partition.chunk_number}"
-            )
-
-            # This should only happen after the first epoch.
             if partition.old_optimizer_state is not None:
-                outer_optimizer = reconstruct_outer_optimizer_from_partial_state(
-                    old_optimizer_state=partition.old_optimizer_state,
-                    start_idx=optimizer_start_idx,
-                    end_idx=optimizer_end_idx,
-                    optim_state_shapes=optimizer_shapes,
-                    total_states=total_states,
-                    optimizer=outer_optimizer,
-                )
-                log_gpu_memory_usage(
-                    note=f"after reconstructing outer optimizer state for partition {partition.new_partition.chunk_number}"
-                )
+                buf = partition.old_optimizer_state.to(torch.bfloat16).clone().mul_(momentum).add_(weight_average)
             else:
+                # First epoch: SGD seeds the momentum buffer with the gradient.
                 logger.warning(f"No old optimizer state found for partition {partition.new_partition.chunk_number}")
+                buf = weight_average.clone()
 
-            # Reconstruct the full pseudograds vector from the partition and load it into the model
-            reconstruct_full_grads_from_partition(
-                grads_partition=weight_average,
-                start_idx=weight_start_idx,
-                end_idx=weight_end_idx,
-                pseudograds_length=total_states,
-                model=old_model_copy,
-                device=device,
-            )
-            log_gpu_memory_usage(
-                note=f"after reconstructing full grads for partition {partition.new_partition.chunk_number}"
-            )
-
-            # If the model has no gradients, this doesn't do anything.
-            outer_optimizer.step()
-
-            partition.new_weights = torch.nn.utils.parameters_to_vector(old_model_copy.parameters())[
-                weight_start_idx:weight_end_idx
-            ]
-            partition.new_optimizer_state = extract_optimizer_state_section(
-                outer_optimizer, optimizer_start_idx, optimizer_end_idx
-            )
-            log_gpu_memory_usage(
-                note=f"after setting up new optimizer state for partition {partition.new_partition.chunk_number}"
-            )
-
-            # Check if the weights and optimizer state are valid and add to the list of valid partitions
-            if partition.new_weights is None or partition.new_optimizer_state is None:
-                logger.warning(
-                    f"No weights or optimizer state found for partition {partition.new_partition.chunk_number}"
-                )
-                logger.warning(f"Partition: {partition}")
-                continue
+            update = weight_average.add(buf, alpha=momentum)
+            partition.new_weights = old_weights[start_idx:end_idx].add(update, alpha=-lr)
+            partition.new_optimizer_state = buf
             valid_partitions.append(partition)
-            log_gpu_memory_usage(note=f"after fininhing the merge of partition {partition.new_partition.chunk_number}")
 
         except Exception as e:
-            logger.exception(f"Failed to get partition {partition.new_partition.chunk_number}: {e}")
-        finally:
-            if old_model_copy is not None:
-                del old_model_copy
-            if weight_average is not None:
-                del weight_average
-            if outer_optimizer is not None:
-                del outer_optimizer
-            if flat_optimizer_state is not None:
-                del flat_optimizer_state
+            logger.exception(f"Failed to merge partition {partition.new_partition.chunk_number}: {e}")
 
     logger.debug(f"Number of valid partitions: {len(valid_partitions)}")
     logger.debug(f"Number of invalid partitions: {len(partition_batch) - len(valid_partitions)}")

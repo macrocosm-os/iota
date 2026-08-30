@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from subnet.model import gpu_device
 from miner import settings as miner_settings
+from common import settings as common_settings
 from common.utils.exceptions import LayerStateException, MinerNotRegisteredException
 
 
@@ -34,6 +35,10 @@ class ActivationData(BaseModel):
         arbitrary_types_allowed = True
 
 
+# Seconds between slow-cadence allocator flushes in cleanup().
+_EMPTY_CACHE_INTERVAL_SEC = 300.0
+
+
 class ActivationCache:
     """
     The ActivationCache is responsible for storing the forward activations that are currently in-process
@@ -48,6 +53,7 @@ class ActivationCache:
 
         # Tasks to monitor for exceptions upon reset
         self._removal_tasks: list[asyncio.Task] = []
+        self._last_empty_cache: float = time.time()
 
         # auto_max_cache state: warmup allows unbounded growth; frozen_max_size caps it once set
         self._warmup_active: bool = False
@@ -88,7 +94,11 @@ class ActivationCache:
                     del activation_data.output_activations
                 del self._cache[activation_id]
 
-                gpu_device.empty_cache()
+                # NOTE: no gpu_device.empty_cache() here. It forces a full GPU sync
+                # (~10-50 ms) per removal — once per activation on the hot path — and
+                # ran while holding self._lock, stalling every concurrent cache access.
+                # The torch allocator reuses freed blocks without it; a slow-cadence
+                # empty_cache in cleanup() guards against long-run fragmentation.
             except Exception as e:
                 logger.error(f"Error removing activation {activation_id} from cache: {e}")
                 raise
@@ -102,19 +112,16 @@ class ActivationCache:
         """
         if self._warmup_active:
             return len(self._cache) + miner_settings.MAX_FORWARD_ACTIVATIONS_IN_QUEUE
-        return self._frozen_max_size if self._frozen_max_size is not None else miner_settings.MAX_ACTIVATION_CACHE_SIZE
+        return self._frozen_max_size if self._frozen_max_size is not None else common_settings.MAX_ACTIVATION_CACHE_SIZE
 
     def is_full(self) -> bool:
         """Check if the cache is full."""
         if self._warmup_active:
             return False
         effective_max = (
-            self._frozen_max_size if self._frozen_max_size is not None else miner_settings.MAX_ACTIVATION_CACHE_SIZE
+            self._frozen_max_size if self._frozen_max_size is not None else common_settings.MAX_ACTIVATION_CACHE_SIZE
         )
         if len(self._cache) >= effective_max:
-            logger.info(
-                f"Miner {self._hotkey[:8]} cache full with {len(self._cache)} activations: {self._cache.keys()}"
-            )
             self.cleanup()
             return True
         return False
@@ -125,6 +132,12 @@ class ActivationCache:
             if activation_data.upload_time < time.time() - self._cache_timeout_sec:
                 logger.info(f"🗑️ Removing timed-out activation from cache: {activation_id}")
                 del self[activation_id]
+        # Slow-cadence allocator flush: keeps long runs defragmented without paying
+        # a forced GPU sync per activation removal (see remove()).
+        now = time.time()
+        if now - self._last_empty_cache > _EMPTY_CACHE_INTERVAL_SEC:
+            self._last_empty_cache = now
+            gpu_device.empty_cache()
 
     async def reset(self):
         """Reset the cache."""
