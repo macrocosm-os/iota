@@ -33,6 +33,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from miner.new_miner import Miner
 
+# Push-based fetcher (layer > 0) state-check cadence. The slow interval applies while
+# everything looks normal; the fast one kicks in as soon as there is a hint that the
+# layer is leaving TRAINING (another API call hit a LayerStateError, or the all-layers
+# gate closed), so the miner reaches submit_weights before the upload window closes.
+PUSH_STATE_CHECK_INTERVAL_SEC = 30.0
+PUSH_STATE_CHECK_FAST_INTERVAL_SEC = 2.0
+
 
 class DownloadedData(BaseModel):
     activation_response: ActivationResponse
@@ -874,13 +881,23 @@ class ActivationQueue:
 
         A lightweight orchestrator heartbeat runs every 30 s to detect layer-state
         changes (which raises :class:`LayerStateException` and resets training).
+        Unlike layer 0, nothing here polls the orchestrator on the hot path, so the
+        heartbeat is tightened to a few seconds whenever a state change is suspected:
+        LayerStateErrors raised elsewhere (submit_activation, report_loss) are swallowed
+        by the publisher but still recorded in ``miner_api_client.layer_state``.
         """
         last_state_check = time.time()
         while True:
             # ── Periodic layer-state check ────────────────────────────────────
-            if time.time() - last_state_check >= 30.0:
+            state_change_suspected = (
+                self._miner_api_client.layer_state != LayerPhase.TRAINING or not self._all_layers_training_cached
+            )
+            interval = PUSH_STATE_CHECK_FAST_INTERVAL_SEC if state_change_suspected else PUSH_STATE_CHECK_INTERVAL_SEC
+            if time.time() - last_state_check >= interval:
                 try:
                     await self._miner_api_client.heartbeat(expected_phase=LayerPhase.TRAINING)
+                    # Heartbeat confirmed TRAINING: drop any stale hint so we fall back to the slow cadence.
+                    self._miner_api_client.layer_state = LayerPhase.TRAINING
                     # Re-evaluate the bench gate mid-phase (see layer-0 fetcher).
                     if self._miner is not None:
                         await self._miner._announce_training_status()
