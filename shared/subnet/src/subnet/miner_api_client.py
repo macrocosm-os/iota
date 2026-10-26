@@ -52,6 +52,7 @@ from common.utils.s3_utils import upload_parts
 from common.utils.shared_states import LayerPhase
 from loguru import logger
 from subnet.common_api_client import CommonAPIClient
+from subnet.utils import registration_queue_store
 from bittensor_wallet import Keypair
 
 
@@ -105,6 +106,17 @@ class MinerAPIClient(CommonAPIClient):
         queue_state_callback: RegistrationQueueStateCallback | None = None,
     ) -> MinerRegistrationResponse | dict:
         try:
+            resumed = await self._resume_saved_registration_queue(register_miner_request.p2p_node_id)
+            if isinstance(resumed, MinerRegistrationResponse):
+                return resumed
+            if resumed is not None:
+                return await self._wait_for_registration_queue(
+                    resumed,
+                    confirmation_attestation_factory=confirmation_attestation_factory,
+                    queue_state_callback=queue_state_callback,
+                    p2p_node_id=register_miner_request.p2p_node_id,
+                )
+
             response = await CommonAPIClient.orchestrator_request(
                 method="POST",
                 path="/miner/register",
@@ -125,11 +137,42 @@ class MinerAPIClient(CommonAPIClient):
                     queue_response,
                     confirmation_attestation_factory=confirmation_attestation_factory,
                     queue_state_callback=queue_state_callback,
+                    p2p_node_id=register_miner_request.p2p_node_id,
                 )
             return MinerRegistrationResponse.model_validate(parsed_response)
         except Exception as e:
             logger.error(f"Error registering miner: {e}")
             raise
+
+    def _hotkey_address(self) -> str | None:
+        return getattr(self.hotkey, "ss58_address", None)
+
+    async def _resume_saved_registration_queue(
+        self, p2p_node_id: str | None
+    ) -> MinerRegistrationResponse | MinerRegistrationQueueStatusResponse | None:
+        """Pick up the queue entry saved before a restart instead of joining at the back.
+
+        Returns None when there is nothing to resume, so the caller registers normally.
+        """
+        hotkey = self._hotkey_address()
+        queue_id = registration_queue_store.load_queue_id(hotkey, p2p_node_id)
+        if not queue_id:
+            return None
+        try:
+            status = await self._registration_queue_status_request(queue_id)
+        except Exception as e:
+            logger.info(f"Saved registration queue entry {queue_id} is no longer available ({e}); rejoining queue")
+            registration_queue_store.clear_queue_id(hotkey)
+            return None
+        if isinstance(status, MinerRegistrationQueueStatusResponse) and status.status in ("failed", "expired"):
+            logger.info(f"Saved registration queue entry {queue_id} is {status.status}; rejoining queue")
+            registration_queue_store.clear_queue_id(hotkey)
+            return None
+        if isinstance(status, MinerRegistrationResponse):
+            registration_queue_store.clear_queue_id(hotkey)
+        else:
+            logger.info(f"Resuming registration queue entry {queue_id} at position {status.position}")
+        return status
 
     async def _wait_for_registration_queue(
         self,
@@ -137,16 +180,22 @@ class MinerAPIClient(CommonAPIClient):
         *,
         confirmation_attestation_factory: RegistrationAttestationFactory | None = None,
         queue_state_callback: RegistrationQueueStateCallback | None = None,
+        p2p_node_id: str | None = None,
     ) -> MinerRegistrationResponse:
+        hotkey = self._hotkey_address()
         while True:
             if queue_state_callback is not None:
                 await queue_state_callback(queue_response)
 
             if queue_response.response is not None:
+                registration_queue_store.clear_queue_id(hotkey)
                 return queue_response.response
 
             if queue_response.status in ("failed", "expired"):
+                registration_queue_store.clear_queue_id(hotkey)
                 raise RuntimeError(queue_response.error or queue_response.detail or "Registration queue failed")
+
+            registration_queue_store.save_queue_id(hotkey, queue_response.queue_id, p2p_node_id)
 
             if queue_response.confirmation_required:
                 attestation = None
@@ -158,6 +207,7 @@ class MinerAPIClient(CommonAPIClient):
             await asyncio.sleep(registration_queue_poll_sleep_seconds(queue_response.poll_after_seconds))
             status_response = await self._registration_queue_status_request(queue_response.queue_id)
             if isinstance(status_response, MinerRegistrationResponse):
+                registration_queue_store.clear_queue_id(hotkey)
                 return status_response
             queue_response = status_response
 
