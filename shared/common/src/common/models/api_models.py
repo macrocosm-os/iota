@@ -384,10 +384,6 @@ class RegisterMinerConfirmationRequest(BaseModel):
     enclave_payload: EnclaveGetKeyIdResponse | None = None
 
 
-class PayoutColdkeyRequest(BaseModel):
-    payout_coldkey: str
-
-
 class RunInfo(BaseModel):
     run_id: str
     is_default: bool
