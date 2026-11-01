@@ -194,22 +194,6 @@ class MinerAPIClient(CommonAPIClient):
         parsed_response = self.parse_response(response)
         return MinerRegistrationQueueStatusResponse.model_validate(parsed_response)
 
-    async def change_payout_coldkey_request(self, payout_coldkey: str) -> dict:
-        try:
-            response = await CommonAPIClient.orchestrator_request(
-                method="POST",
-                path="/miner/payout_coldkey",
-                hotkey=self.hotkey,
-                body={"payout_coldkey": payout_coldkey},
-                is_mounted=self.is_mounted,
-                electron_version=self.electron_version,
-            )
-            parsed_response = self.parse_response(response)
-            return parsed_response
-        except Exception as e:
-            logger.error(f"Error changing payout coldkey: {e}")
-            raise
-
     async def get_layer_state_request(self) -> LayerPhase | dict:
         try:
             response = await CommonAPIClient.orchestrator_request(
